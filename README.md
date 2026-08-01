@@ -17,6 +17,16 @@ No implementation code yet, by design. Current deliverables live in [docs/spec/]
 | `recon-manifest.md` | Pinned commits and method — every spec claim is reproducible |
 | `reference-issues.md` | Doc-vs-code disagreements and bugs found in the family during recon |
 
+## Toolchain
+
+Nothing is installed on the host. Every tool runs in a pinned container against the bind-mounted repo, so builds are reproducible and the workstation stays clean:
+
+```bash
+./scripts/toolchain.sh go build ./...
+```
+
+Requires Docker (WSL2 on Windows). Module and build caches live in named volumes, so only source crosses the bind mount.
+
 ## Family
 
 | Repo | Role |
