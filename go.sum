@@ -1,3 +1,5 @@
+github.com/aws/aws-lambda-go v1.54.0 h1:EGYpdyRGF88xszqlGcBewz811mJeRS+maNlLZXFheII=
+github.com/aws/aws-lambda-go v1.54.0/go.mod h1:dpMpZgvWx5vuQJfBt0zqBha60q7Dd7RfgJv23DymV8A=
 github.com/nik2208/awesome-go-auth v0.0.0-20260511072355-4b2fc5c11cb4 h1:ysEqtpD+8wNG0DWDdaY5YgSEwE5eQ8wo/G9Yy+4GkLM=
 github.com/nik2208/awesome-go-auth v0.0.0-20260511072355-4b2fc5c11cb4/go.mod h1:33cV8r5NLMTr2BT+dhGF87tpUBvaQ5BMvdHJGQ+PJ8c=
 golang.org/x/crypto v0.51.0 h1:IBPXwPfKxY7cWQZ38ZCIRPI50YLeevDLlLnyC5wRGTI=
