@@ -1,0 +1,210 @@
+package config
+
+import (
+	"reflect"
+	"sort"
+	"strings"
+)
+
+// A domain is one top-level block of the schema, paired with the phase that
+// wires it up. The whole schema is defined and validated from P1 onwards, but
+// only part of it is connected to anything, and a knob that validates cleanly
+// and then does nothing is worse than one that does not exist: the operator has
+// no way to tell the difference from the outside.
+//
+// So every domain that is not yet wired is enumerated here, and configuring it
+// refuses the deployment with the phase it lands in. That is the whole mechanism:
+// there is no code path in which a configured-but-inert block is silently
+// accepted.
+type domain struct {
+	// path is the top-level dotted key, e.g. "idProvider".
+	path string
+
+	// phase names the phase that wires the domain, for the error message.
+	phase string
+
+	// get selects the domain's sub-tree out of a Config, so a configured domain
+	// can be detected by comparing it against the same sub-tree of Defaults.
+	get func(*Config) any
+
+	// secretPrefix, when set, also treats a resolved secret under that dotted
+	// prefix as evidence the domain was configured. Needed because a secret
+	// supplied through its documented environment variable leaves no trace in
+	// the Config tree.
+	secretPrefix string
+}
+
+// unwiredDomains lists every domain whose types and validation exist but whose
+// behaviour does not, as of P1.
+//
+// P1 wires: schemaVersion, deployment, security.jwt secrets and TTLs,
+// security.password, security.csrf, tokens, cookies, sessions,
+// email.verification.mode, stores, http. Everything below is defined, validated
+// and refused.
+func unwiredDomains() []domain {
+	return []domain{
+		{
+			path:  "security.jwt.extraClaims",
+			phase: "P3 (token claims)",
+			get:   func(c *Config) any { return c.Security.JWT.ExtraClaims },
+		},
+		{
+			path:  "security.jwt.claimsWebhook",
+			phase: "P3 (token claims)",
+			get:   func(c *Config) any { return c.Security.JWT.ClaimsWebhook },
+		},
+		{
+			// email.verification.mode is wired in P1; the transport is not, so
+			// the mailer, the template seeding and the delivery webhook are
+			// refused while the verification mode is honoured.
+			path:         "email.mailer",
+			phase:        "P2 (email flows)",
+			get:          func(c *Config) any { return c.Email.Mailer },
+			secretPrefix: "email.mailer.",
+		},
+		{
+			path:  "email.siteUrls",
+			phase: "P2 (email flows)",
+			get:   func(c *Config) any { return c.Email.SiteURLs },
+		},
+		{
+			path:  "email.templatesDir",
+			phase: "P2 (email flows)",
+			get:   func(c *Config) any { return c.Email.TemplatesDir },
+		},
+		{
+			path:  "email.deliveryWebhook",
+			phase: "P2 (email flows)",
+			get:   func(c *Config) any { return c.Email.DeliveryWebhook },
+		},
+		{
+			path:         "sms",
+			phase:        "P3 (SMS and 2FA)",
+			get:          func(c *Config) any { return c.SMS },
+			secretPrefix: "sms.",
+		},
+		{
+			path:         "oauth",
+			phase:        "P4 (OAuth and account linking)",
+			get:          func(c *Config) any { return c.OAuth },
+			secretPrefix: "oauth.",
+		},
+		{
+			path:  "twoFactor",
+			phase: "P3 (SMS and 2FA)",
+			get:   func(c *Config) any { return c.TwoFactor },
+		},
+		{
+			path:         "idProvider",
+			phase:        "P5 (identity provider and JWKS)",
+			get:          func(c *Config) any { return c.IDProvider },
+			secretPrefix: "idProvider.",
+		},
+		{
+			path:  "resourceServer",
+			phase: "P5 (identity provider and JWKS)",
+			get:   func(c *Config) any { return c.ResourceServer },
+		},
+		{
+			path:  "ui",
+			phase: "P6 (hosted UI)",
+			get:   func(c *Config) any { return c.UI },
+		},
+		{
+			path:         "admin",
+			phase:        "P6 (admin surface)",
+			get:          func(c *Config) any { return c.Admin },
+			secretPrefix: "admin.",
+		},
+		{
+			path:         "tools",
+			phase:        "P7 (tools, telemetry, SSE, webhooks)",
+			get:          func(c *Config) any { return c.Tools },
+			secretPrefix: "tools.",
+		},
+		{
+			path:  "rateLimit",
+			phase: "P7 (rate limiting)",
+			get:   func(c *Config) any { return c.RateLimit },
+		},
+		{
+			path:  "docs",
+			phase: "P6 (OpenAPI surface)",
+			get:   func(c *Config) any { return c.Docs },
+		},
+		{
+			path:  "runtimeSettings",
+			phase: "P6 (runtime settings store)",
+			get:   func(c *Config) any { return c.RuntimeSettings },
+		},
+	}
+}
+
+// UnwiredDomains returns the dotted paths of the domains this build validates but
+// does not act on, with the phase that wires each. Exported so the deployment
+// tooling can warn about them before an upload rather than after a rollback.
+func UnwiredDomains() map[string]string {
+	out := make(map[string]string)
+	for _, dom := range unwiredDomains() {
+		out[dom.path] = dom.phase
+	}
+	return out
+}
+
+// checkPhaseGaps reports every unwired domain the operator has actually
+// configured. allow downgrades the report to a warning, for tests that need to
+// exercise a later phase's validation and for a staged rollout where the operator
+// has accepted the gap.
+func checkPhaseGaps(c *Config, allow bool, d *diagnostics) {
+	defaults := Defaults()
+	// derive() has already run on the real Config, so the baseline has to go
+	// through it too or every derived value would read as operator intent. It
+	// also inherits the wired http block, because docs.basePath derives from
+	// http.apiPrefix: without this, customising the api prefix — which P1 does
+	// wire — would report the docs domain as configured.
+	defaults.HTTP = c.HTTP
+	derive(defaults)
+
+	for _, dom := range unwiredDomains() {
+		if !domainConfigured(c, defaults, dom) {
+			continue
+		}
+		problem := "this block is validated but not yet wired to anything, so configuring it has no effect at runtime"
+		remedy := "remove it until " + dom.phase + " lands; it is accepted by the schema so that a document written today keeps working"
+		if allow {
+			c.warn(dom.path, problem, remedy)
+			continue
+		}
+		d.errf(RuleUnimplemented, dom.path, problem, remedy+", or set AllowUnimplemented to accept the gap deliberately")
+	}
+}
+
+// domainConfigured reports whether the operator moved a domain away from its
+// defaults, through the document, an environment override or a secret.
+//
+// Comparing sub-trees rather than tracking per-knob writes means a knob added to
+// a domain in future is covered without anyone remembering to update this file.
+func domainConfigured(c, defaults *Config, dom domain) bool {
+	if !reflect.DeepEqual(dom.get(c), dom.get(defaults)) {
+		return true
+	}
+	if dom.secretPrefix == "" {
+		return false
+	}
+	for path, resolved := range c.secrets {
+		if strings.HasPrefix(path, dom.secretPrefix) && resolved.value != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedDomains is used by the tests to keep their expectations stable.
+func sortedDomainPaths() []string {
+	out := make([]string, 0, len(unwiredDomains()))
+	for _, dom := range unwiredDomains() {
+		out = append(out, dom.path)
+	}
+	sort.Strings(out)
+	return out
+}
