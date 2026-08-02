@@ -261,6 +261,118 @@ func TestSecretDiagnosticNamesItsOrigin(t *testing.T) {
 	}
 }
 
+// TestSecretRefFromTheEnvironment: the deployment that most needs Secrets
+// Manager is a CloudFormation stack with no configuration document, and a
+// template can only reach a knob through the environment. The reference
+// variables are what let it pass an ARN where it used to have to pass the
+// secret itself.
+func TestSecretRefFromTheEnvironment(t *testing.T) {
+	const fromSM, fromSSM = "secrets-manager-value-padded-to-32-chars", "ssm-secure-string-value-padded-to-32ch"
+
+	cases := []struct {
+		name       string
+		env        map[string]string
+		doc        map[string]any
+		wantValue  string
+		wantSource string
+		wantOrigin string
+	}{
+		{
+			name:       "secrets manager reference",
+			env:        map[string]string{"AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER": "auth/access"},
+			wantValue:  fromSM,
+			wantSource: ResolverSecretsManager,
+			wantOrigin: "auth/access",
+		},
+		{
+			name:       "ssm reference",
+			env:        map[string]string{"AWESOME_AUTH_JWT_ACCESS_SECRET_SSM_PARAMETER": "/auth/access"},
+			wantValue:  fromSSM,
+			wantSource: ResolverSSM,
+			wantOrigin: "/auth/access",
+		},
+		{
+			name:       "both, in the documented order",
+			env:        map[string]string{"AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER": "auth/access", "AWESOME_AUTH_JWT_ACCESS_SECRET_SSM_PARAMETER": "/auth/access"},
+			wantValue:  fromSM,
+			wantSource: ResolverSecretsManager,
+			wantOrigin: "auth/access",
+		},
+		{
+			// Same precedence as every other knob: the environment layers over
+			// the document, so an operator can repoint one stack at one secret
+			// without editing the shared document.
+			name:       "the environment overrides a document reference",
+			doc:        map[string]any{"ssmParameter": "/auth/access"},
+			env:        map[string]string{"AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER": "auth/access"},
+			wantValue:  fromSM,
+			wantSource: ResolverSecretsManager,
+			wantOrigin: "auth/access",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			if tc.doc != nil {
+				set(doc, "security.jwt.accessTokenSecret", tc.doc)
+			}
+			env := baseEnv()
+			// The value variable stays set, and must lose: a reference is the
+			// whole point, and silently preferring the plaintext one would leave
+			// every migrated stack exactly as exposed as before.
+			for k, v := range tc.env {
+				env[k] = v
+			}
+
+			cfg, err := Load(t.Context(), Options{
+				Document: doc,
+				Getenv:   getenvFrom(env),
+				Secrets: Resolvers{
+					SecretsManager: fakeResolver{ResolverSecretsManager, map[string]string{"auth/access": fromSM}},
+					SSM:            fakeResolver{ResolverSSM, map[string]string{"/auth/access": fromSSM}},
+				},
+			})
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if got := cfg.AccessTokenSecret(); got != tc.wantValue {
+				t.Errorf("resolved value = %q, want %q", got, tc.wantValue)
+			}
+			if got := cfg.SecretSource("security.jwt.accessTokenSecret"); got != tc.wantSource {
+				t.Errorf("source = %q, want %q", got, tc.wantSource)
+			}
+			if got := cfg.Source("security.jwt.accessTokenSecret"); !strings.Contains(got, tc.wantOrigin) {
+				t.Errorf("origin = %q, want it to name %q", got, tc.wantOrigin)
+			}
+		})
+	}
+}
+
+// TestSecretRefEnvNamesAreDistinct guards the two suffixes against colliding
+// with each other or with the value variables — a variable bound twice is a
+// silent precedence bug.
+func TestSecretRefEnvNamesAreDistinct(t *testing.T) {
+	seen := map[string]string{}
+	for _, s := range SecretEnvNames() {
+		seen[s.Env] = s.Path
+	}
+	for _, s := range SecretRefEnvNames() {
+		if !strings.HasPrefix(s.Env, "AWESOME_AUTH_") {
+			t.Errorf("%s does not use the AWESOME_AUTH_ prefix", s.Env)
+		}
+		if prev, dup := seen[s.Env]; dup {
+			t.Errorf("%s is used twice, for %s and %s", s.Env, prev, s.Path)
+		}
+		seen[s.Env] = s.Path
+	}
+	for _, b := range envBindings() {
+		if path, dup := seen[b.env]; dup {
+			t.Errorf("secret reference variable %s is also an ordinary binding for %s", b.env, path)
+		}
+	}
+}
+
 func TestSecretEnvNamesFollowTheConvention(t *testing.T) {
 	for _, s := range SecretEnvNames() {
 		if !strings.HasPrefix(s.Env, "AWESOME_AUTH_") {

@@ -55,6 +55,10 @@ type Options struct {
 	ReadFile func(string) ([]byte, error)
 	Logger   *slog.Logger
 	Stores   StoreFactory
+
+	// Secrets are the stores consulted for secret-valued knobs. The zero value
+	// wires the real AWS-backed resolvers; a test injects fakes.
+	Secrets config.Resolvers
 }
 
 // App is one cold start's worth of state.
@@ -111,7 +115,19 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
-	cfg, err := config.Load(ctx, config.Options{Document: doc, Getenv: getenv})
+	// The AWS-backed secret resolvers are constructed here and injected, because
+	// internal/config must not import the AWS SDK: the loader defines the
+	// SecretResolver interface and this entrypoint is the one place allowed to
+	// know which cloud the deployment runs in. Building them costs nothing —
+	// the SDK client is created on the first reference that actually needs one,
+	// so a stack whose secrets all come from the environment pays no cold-start
+	// penalty for the capability.
+	secrets := opts.Secrets
+	if secrets.SecretsManager == nil && secrets.SSM == nil {
+		secrets = awsintegration.NewSecretResolvers(awsintegration.SecretResolverOptions{})
+	}
+
+	cfg, err := config.Load(ctx, config.Options{Document: doc, Getenv: getenv, Secrets: secrets})
 	if err != nil {
 		return nil, err
 	}

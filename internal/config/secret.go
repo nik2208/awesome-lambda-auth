@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -32,6 +33,11 @@ import (
 // A bare string is accepted by the decoder and then rejected by validation with
 // the knob's dotted path, which is a far more useful error than a decode failure
 // that says only "cannot unmarshal string".
+//
+// The environment can name a store too, without a document: the knob's
+// documented AWESOME_AUTH_* variable suffixed with SecretsManagerEnvSuffix or
+// SSMParameterEnvSuffix carries a reference rather than a value. See
+// applySecretRefEnv for why that suffix exists at all.
 type Secret struct {
 	// SecretsManager is a Secrets Manager secret id or ARN. Highest priority.
 	SecretsManager string `json:"secretsManager,omitempty"`
@@ -256,14 +262,67 @@ func secretSlots(c *Config) []secretSlot {
 	return slots
 }
 
+// Suffixes that turn a secret knob's documented AWESOME_AUTH_* variable into a
+// store *reference* rather than a value.
+//
+//	AWESOME_AUTH_JWT_ACCESS_SECRET                 the value  (development only)
+//	AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER  a Secrets Manager id or ARN
+//	AWESOME_AUTH_JWT_ACCESS_SECRET_SSM_PARAMETER   an SSM SecureString name
+//
+// The suffixes mirror the document keys one-for-one, so there is nothing new to
+// learn and nothing to parse — no URI scheme, no discriminator.
+const (
+	SecretsManagerEnvSuffix = "_SECRETSMANAGER"
+	SSMParameterEnvSuffix   = "_SSM_PARAMETER"
+)
+
+// SecretRefEnvNames returns the AWESOME_AUTH_*_SECRETSMANAGER and
+// AWESOME_AUTH_*_SSM_PARAMETER variables this build honours, paired with the
+// dotted path each one points at a store for. Exported for the same reason as
+// EnvBindings and SecretEnvNames: deployment tooling validating a stack template
+// needs the whole surface, not two thirds of it.
+func SecretRefEnvNames() []struct{ Env, Path string } {
+	slots := secretSlots(Defaults())
+	out := make([]struct{ Env, Path string }, 0, 2*len(slots))
+	for _, slot := range slots {
+		out = append(out,
+			struct{ Env, Path string }{slot.env + SecretsManagerEnvSuffix, slot.path},
+			struct{ Env, Path string }{slot.env + SSMParameterEnvSuffix, slot.path})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Env < out[j].Env })
+	return out
+}
+
+// applySecretRefEnv layers a store reference from the environment over whatever
+// the document said, which is the same precedence every other knob has.
+//
+// It exists because the deployment that most needs Secrets Manager is the one
+// with no configuration document at all. A CloudFormation template can only
+// reach a knob through the environment, and until now the only secret-shaped
+// thing it could put there was the value — which is precisely the exposure this
+// mechanism removes: an environment variable is readable by anyone holding
+// lambda:GetFunction, an ARN is not worth reading.
+//
+// Setting both suffixes is allowed and means what the document form means: try
+// Secrets Manager, fall through to SSM if it has no such secret.
+func applySecretRefEnv(s Secret, slot secretSlot, getenv func(string) (string, bool)) Secret {
+	if v, ok := getenv(slot.env + SecretsManagerEnvSuffix); ok && strings.TrimSpace(v) != "" {
+		s.SecretsManager = strings.TrimSpace(v)
+	}
+	if v, ok := getenv(slot.env + SSMParameterEnvSuffix); ok && strings.TrimSpace(v) != "" {
+		s.SSMParameter = strings.TrimSpace(v)
+	}
+	return s
+}
+
 // resolveSecrets walks every secret slot in the documented order and records the
 // outcome on the Config. A reference that cannot be resolved is a diagnostic
 // naming the knob; a knob that was never configured is simply absent, and the
 // rules decide whether that is fatal.
-func resolveSecrets(ctx context.Context, c *Config, r Resolvers, d *diagnostics) {
+func resolveSecrets(ctx context.Context, c *Config, r Resolvers, getenv func(string) (string, bool), d *diagnostics) {
 	c.secrets = make(map[string]resolvedSecret)
 	for _, slot := range secretSlots(c) {
-		s := slot.get(c)
+		s := applySecretRefEnv(slot.get(c), slot, getenv)
 		if s.literal != "" {
 			// A literal is never resolved: reporting the path is the whole point.
 			d.errf(RulePlaintextSecret, slot.path,

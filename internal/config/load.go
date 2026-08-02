@@ -120,7 +120,7 @@ func Load(ctx context.Context, opts Options) (*Config, error) {
 
 	// 5. secrets. RS-1 needs the actual value's length, so this happens before
 	// the rules and after both override layers.
-	resolveSecrets(ctx, cfg, defaultedResolvers(opts.Secrets, getenv), d)
+	resolveSecrets(ctx, cfg, defaultedResolvers(opts.Secrets, getenv), getenv, d)
 
 	// 6. types, ranges and enums, then the §2 rules, then the phase gaps. All
 	// three run unconditionally: an operator fixing a broken deploy wants the

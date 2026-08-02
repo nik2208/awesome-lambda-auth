@@ -7,6 +7,8 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.43.3
 	github.com/aws/aws-sdk-go-v2/config v1.32.34
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.62.3
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.3
+	github.com/aws/aws-sdk-go-v2/service/ssm v1.73.3
 	github.com/nik2208/awesome-go-auth v0.1.1-0.20260802141639-a614094abeb9
 )
 
