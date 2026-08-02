@@ -1,0 +1,510 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+# awesome-lambda-auth — quickstart stack
+# =====================================
+#
+# One HTTP API (payload format 2.0), one Lambda running the whole auth router,
+# one DynamoDB single table, two generated signing secrets. Nothing else.
+#
+# ---------------------------------------------------------------------------
+# KNOWN LIMITATION: cookie mode needs a custom domain
+# ---------------------------------------------------------------------------
+# On a raw execute-api URL the service cannot issue hardened cookies, and the
+# runtime will REFUSE TO START in cookie mode unless you say so explicitly.
+# Two separate problems, both real:
+#
+#   1. The stage path is not "/". A named stage serves the API at
+#      https://<id>.execute-api.<region>.amazonaws.com/<stage>/..., so the
+#      browser sees a stage segment the router does not. The `__Host-` prefix
+#      requires Path=/ and no Domain, and the Path-scoped refresh cookie
+#      (cookies.refreshTokenPath, derived as <apiPrefix>/refresh) no longer
+#      matches the URL the browser actually requests. See the note on
+#      lambdahttp.Options.StagePrefix in internal/lambdahttp/lambdahttp.go:85-94:
+#      stripping the stage server-side fixes routing and does nothing for the
+#      browser. This template defaults StageName to "$default", which serves at
+#      the domain root and removes this half of the problem; a named stage
+#      brings it back, and the template then compensates by prefixing
+#      AWESOME_AUTH_COOKIES_REFRESH_PATH with the stage.
+#
+#   2. execute-api.amazonaws.com is a shared registrable domain. Every other
+#      AWS account's API lives under it, so cookie scoping and the CSRF
+#      double-submit no longer rest on a host you control. "$default" does not
+#      fix this and nothing except a custom domain will.
+#
+# The governing knob is `cookies.allowInsecureCookieMode`
+# (AWESOME_AUTH_COOKIES_ALLOW_INSECURE_COOKIE_MODE), spec config-schema.md
+# §1.2, enforced by refuse-to-start rule RS-2 (§2, internal/config/rules.go
+# checkRS2InsecureCookieMode). It defaults to "true" here so the quickstart
+# boots; for anything real, set PublicUrl to a custom domain and flip it to
+# "false". Bearer clients (X-Auth-Strategy: bearer) are unaffected either way.
+# ---------------------------------------------------------------------------
+
+Description: >-
+  awesome-lambda-auth quickstart: HTTP API + one Lambda auth router + a
+  DynamoDB single table. Self-hosted authentication in your own account.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Deployment}
+        Parameters: [DeploymentEnvironment, StageName, PublicUrl, ApiPrefix]
+      - Label: {default: Browser-facing behaviour}
+        Parameters: [AllowedOrigins, CookieDomain, CookieSameSite, AllowInsecureCookieMode]
+      - Label: {default: Storage}
+        Parameters: [TableNamePrefix, MaxReadRequestUnits, MaxWriteRequestUnits, EnableDeletionProtection]
+      - Label: {default: Function}
+        Parameters: [MemorySize, Timeout, LogRetentionDays, SessionCheckOn]
+
+Parameters:
+
+  DeploymentEnvironment:
+    Type: String
+    Default: development
+    AllowedValues: [development, production]
+    Description: >-
+      AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT. "production" turns on the strict
+      refuse-to-start rules (config-schema.md §2). The quickstart defaults to
+      development because it runs on a shared AWS domain.
+
+  StageName:
+    Type: String
+    Default: '$default'
+    AllowedPattern: '^(\$default|[A-Za-z0-9_-]{1,128})$'
+    Description: >-
+      HTTP API stage. "$default" serves at the domain root, which is what keeps
+      cookie Path scoping working (see the header comment). A named stage adds
+      a /<stage> segment to every URL.
+
+  PublicUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL — the origin clients actually reach,
+      e.g. https://auth.example.com. Empty leaves the variable unset, which is
+      correct on a raw execute-api URL: the value's only consumer is RS-2, and
+      RS-2 can only be satisfied on this stack's own domain by
+      AllowInsecureCookieMode=true, which skips the check. See the note on the
+      variable itself — defaulting it to the stack's own URL is a circular
+      dependency. A custom domain here is the only way to run cookie mode with
+      AllowInsecureCookieMode=false. Placeholder default is deliberately empty;
+      never commit a real domain.
+
+  ApiPrefix:
+    Type: String
+    Default: /auth
+    AllowedPattern: '^/[A-Za-z0-9._~/-]*$'
+    Description: AWESOME_AUTH_HTTP_API_PREFIX. Path the auth routes mount under.
+
+  AllowedOrigins:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_CORS_ORIGINS — comma-separated absolute origins, e.g.
+      https://app.example.com. Empty means no CORS middleware at all, which is
+      correct for same-origin and bearer-only clients. CORS is handled by the
+      function, not by API Gateway, so there is exactly one place it is
+      configured.
+
+  CookieDomain:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_COOKIES_DOMAIN. Empty means host-only cookies, which is the
+      safer default; setting it forfeits the __Host- prefix. Placeholder is
+      empty on purpose.
+
+  CookieSameSite:
+    Type: String
+    Default: lax
+    AllowedValues: [strict, lax, none]
+    Description: AWESOME_AUTH_COOKIES_SAMESITE. "none" requires Secure, which this stack always sets.
+
+  AllowInsecureCookieMode:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_COOKIES_ALLOW_INSECURE_COOKIE_MODE. See the header comment.
+      "true" is what lets a stack on a raw execute-api URL start at all. Set a
+      custom domain in PublicUrl and change this to "false" before you put real
+      users behind it.
+
+  TableNamePrefix:
+    Type: String
+    Default: awesome-auth
+    AllowedPattern: '^[A-Za-z0-9_.-]{1,80}$'
+    Description: Table is named <prefix>-<stack name>.
+
+  MaxReadRequestUnits:
+    Type: Number
+    Default: 200
+    MinValue: 1
+    Description: >-
+      On-demand read ceiling (data-model.md §6.1). A credential-stuffing run is
+      a DynamoDB bill before it is an outage, so the ceiling is set rather than
+      left unbounded. Raise it deliberately.
+
+  MaxWriteRequestUnits:
+    Type: Number
+    Default: 200
+    MinValue: 1
+    Description: On-demand write ceiling (data-model.md §6.1).
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      data-model.md §6.1 wants this on. It defaults to off here so the
+      quickstart can be torn down in one command; turn it on for anything
+      holding real users, and note that scripts/teardown.sh then needs
+      --disable-deletion-protection.
+
+  MemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+    Description: >-
+      Login is CPU-bound on bcrypt (cost 12). Lambda bills GB-ms, so 1024
+      roughly halves login latency at about the same cost per request — worth
+      it if p99 matters to you.
+
+  Timeout:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 29
+    Description: >-
+      Seconds. Not the 15-minute default: nothing in the auth router should
+      take longer than an API Gateway integration is willing to wait (29s).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: CloudWatch Logs retention. Never-expire is a slow-growing bill.
+
+  SessionCheckOn:
+    Type: String
+    Default: refresh
+    AllowedValues: [allcalls, refresh, none]
+    Description: >-
+      AWESOME_AUTH_SESSIONS_CHECK_ON. "allcalls" costs one strongly-consistent
+      GetItem on every authenticated request and buys immediate revocation.
+
+Conditions:
+  IsDefaultStage: !Equals [!Ref StageName, '$default']
+  HasPublicUrl: !Not [!Equals [!Ref PublicUrl, '']]
+  HasAllowedOrigins: !Not [!Equals [!Ref AllowedOrigins, '']]
+  HasCookieDomain: !Not [!Equals [!Ref CookieDomain, '']]
+  # A named stage on the raw execute-api URL puts /<stage> in front of every
+  # path the browser sees, so the Path-scoped refresh cookie has to match.
+  NeedsStagePrefixedCookiePath: !And
+    - !Not [!Condition IsDefaultStage]
+    - !Not [!Condition HasPublicUrl]
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # Signing secrets
+  #
+  # Generated by Secrets Manager, never authored by a human, never a template
+  # parameter, never in a CLI history. CloudFormation resolves them into the
+  # function's environment at deploy time because the P1 build resolves secrets
+  # in this order: Secrets Manager -> SSM SecureString -> environment variable
+  # (config-schema.md §1, internal/config/secret.go resolveOne) and the first
+  # two resolvers are UnavailableResolver until internal/integration/aws lands.
+  #
+  # Be honest about what that costs: the resolved value is visible to anyone
+  # holding lambda:GetFunction on this function. That is the documented
+  # development-grade path, and it is the one that works today. When the AWS
+  # resolvers land, these two variables become references instead of values and
+  # the function role gains secretsmanager:GetSecretValue on exactly these two
+  # ARNs — see the commented block on the function's policy below.
+  #
+  # No explicit Name: CloudFormation's deletion of a secret is a scheduled
+  # deletion with a recovery window, and a fixed name would then block
+  # re-creating the same stack for up to 30 days.
+  # ---------------------------------------------------------------------
+
+  JwtAccessSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'HS256 access-token signing secret for ${AWS::StackName}'
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  JwtRefreshSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'HS256 refresh-token signing secret for ${AWS::StackName} (must differ from the access secret — RS-1)'
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------------
+  # Single table — docs/spec/data-model.md §2
+  #
+  # PK/SK, one sparse GSI. The four access patterns that need GSI1 are
+  # ListSessionsForUser (#15), DeleteRole's assignment sweep (#33),
+  # GetTenantsForUser (#45) and LinkedAccountStore.ListForUser (#54); every
+  # other lookup is served from the main table's key space on purpose (§2.3).
+  #
+  # The GSI projection is INCLUDE of exactly _t, linkId, createdAt, matching
+  # gsi1Projection in internal/store/dynamodb/table.go. Not ALL, because that
+  # would duplicate every session item — the highest-churn entity — and not
+  # KEYS_ONLY, because ListForUser needs a link's id and creation time. Nothing
+  # secret is projected: passwordHash, totpSecret, refreshHash and every
+  # *Hash/*Exp attribute exist in exactly one physical copy (§5).
+  # ---------------------------------------------------------------------
+
+  AuthTable:
+    Type: AWS::DynamoDB::Table
+    # DeletionPolicy is left at the default (Delete) so the quickstart can be
+    # torn down cleanly. For a stack holding real users, change both of these
+    # to Retain — they take no intrinsic functions, so it is a hand edit.
+    # PITR does give you 35 days to restore a table deleted by accident.
+    Properties:
+      TableName: !Sub '${TableNamePrefix}-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      OnDemandThroughput:
+        MaxReadRequestUnits: !Ref MaxReadRequestUnits
+        MaxWriteRequestUnits: !Ref MaxWriteRequestUnits
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+        - {AttributeName: GSI1PK, AttributeType: S}
+        - {AttributeName: GSI1SK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: GSI1PK, KeyType: HASH}
+            - {AttributeName: GSI1SK, KeyType: RANGE}
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [_t, linkId, createdAt]
+          OnDemandThroughput:
+            MaxReadRequestUnits: !Ref MaxReadRequestUnits
+            MaxWriteRequestUnits: !Ref MaxWriteRequestUnits
+      TimeToLiveSpecification:
+        # §4.5. Sessions, refresh pointers, all four single-use token pointers,
+        # pending OAuth links, telemetry and rate-limit counters carry `ttl`.
+        # TTL is not a security boundary — deletion is best-effort within ~48h
+        # and every read re-checks the expiry attribute in code.
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        # §6.1: enabled from day one because turning it on later gives no
+        # history. Nothing consumes it yet, and an unconsumed stream costs
+        # nothing at rest.
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        # AWS-owned key. §6.1 recommends a customer-managed CMK for production;
+        # it is left out of the quickstart because it adds a monthly key charge
+        # and a real operational obligation (deleting the key destroys the data
+        # irrecoverably, and PITR restore and S3 export both need kms:Decrypt).
+        SSEEnabled: false
+      DeletionProtectionEnabled: !Ref EnableDeletionProtection
+
+  # ---------------------------------------------------------------------
+  # HTTP API — payload format 2.0, not REST
+  #
+  # No CorsConfiguration here on purpose: the auth router applies CORS from
+  # http.cors.origins, and configuring it in two places is how you end up with
+  # duplicate Access-Control-Allow-Origin headers and a browser that rejects
+  # both.
+  # ---------------------------------------------------------------------
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      # The default stage is created automatically; don't also auto-deploy a
+      # second one.
+      FailOnWarnings: true
+
+  AuthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-auth'
+      RetentionInDays: !Ref LogRetentionDays
+
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: AuthLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-auth'
+      Description: !Sub 'awesome-lambda-auth router for ${AWS::StackName}'
+      # Built by scripts/build-lambda.sh. `aws cloudformation package` rewrites
+      # this to an S3 URI; the path is relative to this template.
+      CodeUri: ../../dist/auth-lambda.zip
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Environment:
+        Variables:
+          # --- deployment ------------------------------------------------
+          AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT: !Ref DeploymentEnvironment
+          # Empty for a $default stage: the API is served at the root and there
+          # is no stage segment for lambdahttp to strip.
+          AWESOME_AUTH_DEPLOYMENT_STAGE: !If [IsDefaultStage, '', !Ref StageName]
+          # Set only when the operator supplies one. It CANNOT be defaulted to
+          # this stack's own execute-api URL, and the attempt is a circular
+          # dependency, not a style preference:
+          #
+          #   AuthFunction.Environment -> !Ref HttpApi   (to build the URL)
+          #   HttpApi.DefinitionBody   -> AuthFunction.Arn
+          #     (SAM generates the OpenAPI body from the function's events, and
+          #      every x-amazon-apigateway-integration uri names the function)
+          #
+          # CloudFormation rejects the changeset outright with
+          #   Circular dependency between resources:
+          #   [HttpApiStage, AuthFunctionRootPermission, HttpApi, AuthFunction,
+          #    AuthFunctionProxyPermission]
+          #
+          # Nothing is lost. deployment.publicUrl has exactly one consumer,
+          # refuse-to-start rule RS-2 (internal/config/rules.go
+          # checkRS2InsecureCookieMode), which asks whether the origin is a
+          # custom domain or a shared AWS one. On a raw execute-api URL the
+          # answer is "shared", so the only way to pass RS-2 there is
+          # AllowInsecureCookieMode=true, which short-circuits the rule before
+          # it ever reads this value. The deployment where the value decides
+          # anything is the custom-domain one — and that deployment sets
+          # PublicUrl by definition. The endpoint is still reported, in the
+          # ApiEndpoint output; an output may reference HttpApi freely because
+          # outputs are resolved after every resource exists.
+          AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL: !If [HasPublicUrl, !Ref PublicUrl, !Ref 'AWS::NoValue']
+
+          # --- store -----------------------------------------------------
+          AWESOME_AUTH_STORES_DRIVER: dynamodb
+          AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME: !Ref AuthTable
+
+          # --- http ------------------------------------------------------
+          AWESOME_AUTH_HTTP_API_PREFIX: !Ref ApiPrefix
+          AWESOME_AUTH_CORS_ORIGINS: !If [HasAllowedOrigins, !Ref AllowedOrigins, !Ref 'AWS::NoValue']
+
+          # --- cookies and CSRF ------------------------------------------
+          # Secure is unconditionally true: API Gateway only ever serves HTTPS.
+          AWESOME_AUTH_COOKIES_SECURE: 'true'
+          AWESOME_AUTH_COOKIES_SAMESITE: !Ref CookieSameSite
+          AWESOME_AUTH_COOKIES_DOMAIN: !If [HasCookieDomain, !Ref CookieDomain, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_COOKIES_REFRESH_PATH: !If
+            - NeedsStagePrefixedCookiePath
+            - !Sub '/${StageName}${ApiPrefix}/refresh'
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_COOKIES_ALLOW_INSECURE_COOKIE_MODE: !Ref AllowInsecureCookieMode
+          # RS-3: cookie delivery without a double-submit token is cross-site
+          # forgeable. Left explicit so a reader sees it is on.
+          AWESOME_AUTH_CSRF_ENABLED: 'true'
+
+          # --- sessions --------------------------------------------------
+          AWESOME_AUTH_SESSIONS_CHECK_ON: !Ref SessionCheckOn
+
+          # --- signing secrets -------------------------------------------
+          # Values, not references, for the reason given on the secrets above.
+          AWESOME_AUTH_JWT_ACCESS_SECRET: !Sub '{{resolve:secretsmanager:${JwtAccessSecret}:SecretString}}'
+          AWESOME_AUTH_JWT_REFRESH_SECRET: !Sub '{{resolve:secretsmanager:${JwtRefreshSecret}:SecretString}}'
+
+      Policies:
+        # -----------------------------------------------------------------
+        # Exactly the calls the store makes, and nothing else. The list is the
+        # API interface in internal/store/dynamodb/store.go, cross-checked
+        # against the call sites: GetItem, PutItem, UpdateItem, DeleteItem,
+        # Query, TransactWriteItems, BatchGetItem, BatchWriteItem.
+        #
+        #   * TransactWriteItems has no IAM action of its own — it is
+        #     authorised by the per-item actions of the operations inside it.
+        #   * No ConditionCheckItem. Nothing in the P1 subset puts a bare
+        #     ConditionCheck into a transaction; a Put or Update carrying a
+        #     ConditionExpression is authorised by PutItem/UpdateItem. It goes
+        #     back in with the RBAC and tenant stores, which do use one
+        #     (data-model.md #29 and #43). Granting it early would make the
+        #     first line of this comment false, which is the whole point.
+        #   * No Scan: the store never scans. No DescribeTable: New() performs
+        #     no I/O, deliberately, so a cold start does not pay for one.
+        #   * No CreateTable/UpdateTimeToLive: the helper in table.go exists for
+        #     DynamoDB Local and throwaway tables. Production tables come from
+        #     this template.
+        #   * Index ARNs only accept read actions, and the store only ever
+        #     Queries GSI1.
+        #
+        # If you copy one thing out of this template, copy this. A wildcard
+        # resource in an auth service's execution role is a bad example that
+        # propagates.
+        # -----------------------------------------------------------------
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: AuthTableItems
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+                - dynamodb:BatchWriteItem
+              Resource: !GetAtt AuthTable.Arn
+            - Sid: AuthTableIndexQuery
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${AuthTable.Arn}/index/GSI1'
+        # Not granted, because nothing calls it in this build. Uncomment when
+        # the Secrets Manager resolver lands in internal/integration/aws and the
+        # two AWESOME_AUTH_JWT_*_SECRET variables become references:
+        #
+        # - Version: '2012-10-17'
+        #   Statement:
+        #     - Effect: Allow
+        #       Action: [secretsmanager:GetSecretValue]
+        #       Resource: [!Ref JwtAccessSecret, !Ref JwtRefreshSecret]
+
+      Events:
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+            PayloadFormatVersion: '2.0'
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+            PayloadFormatVersion: '2.0'
+
+Outputs:
+
+  ApiEndpoint:
+    Description: Base URL of the auth service. Routes live under <endpoint><ApiPrefix>.
+    Value: !If
+      - IsDefaultStage
+      - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+      - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  TableName:
+    Description: DynamoDB single table backing every store.
+    Value: !Ref AuthTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+
+  FunctionName:
+    Description: Lambda function running the auth router.
+    Value: !Ref AuthFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
