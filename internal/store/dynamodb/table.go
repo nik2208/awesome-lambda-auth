@@ -24,13 +24,21 @@ type TableAPI interface {
 // Not ALL: GSI1 indexes sessions, the highest-churn entity in the table, and a
 // full projection would duplicate every session item — doubling storage and the
 // write cost of every login and rotation — to save one round trip on an
-// interactive admin read. Not KEYS_ONLY: ListForUser must return a linked
-// account's id and creation time, and neither is in the key.
+// interactive admin read.
+//
+// linkId is surplus here and deliberately left in place. Nothing reads it off an
+// index page any more: the index is authoritative for reachability but never for
+// ownership (data-model.md §5, "GSI1 projection"), so every by-owner fan-out
+// re-reads the canonical item, and a linkId taken from a stale page is as wrong as
+// the GSI1PK it came with. Narrowing the projection would mean dropping and
+// recreating the index — a migration owned by infrastructure code — and this
+// helper only ever builds a throwaway or DynamoDB Local table, so it must keep
+// producing the same shape as an already-provisioned one.
 //
 // Nothing secret is here by construction. A GSI is a second physical copy with
 // its own export, its own PITR restore and its own blast radius, so passwordHash,
 // totpSecret, refreshHash and every *Hash attribute exist in exactly one place.
-var gsi1Projection = []string{attrType, "linkId", attrCreatedAt}
+var gsi1Projection = []string{attrType, attrLinkID, attrCreatedAt}
 
 // CreateTable creates the single table and its one sparse GSI, matching
 // docs/spec/data-model.md §2. It is idempotent: an existing table is left alone.

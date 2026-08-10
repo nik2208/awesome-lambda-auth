@@ -89,31 +89,42 @@ type Options struct {
 	// MaxSessionsPerUser defaults to DefaultMaxSessionsPerUser.
 	MaxSessionsPerUser int
 
+	// MaxLinkedAccountsPerUser caps ListForUser, whose interface likewise has no
+	// cursor. Defaults to DefaultMaxLinkedAccountsPerUser.
+	MaxLinkedAccountsPerUser int
+
 	// Logger receives the once-per-process warnings this store emits. Defaults
 	// to slog.Default().
 	Logger *slog.Logger
 }
 
 // Store implements, from awesome-go-auth's store.go: UserStore,
-// UserAccountStore, UserPasswordStore, SessionStore, SessionLookupStore and
-// SessionAdminStore. The remaining optional interfaces land with their item
-// types (data-model.md §1.3-§1.5) and are deliberately absent rather than
-// stubbed, because the core discovers them by type assertion: a stub that
-// returns "not implemented" would make Service advertise a feature that fails
-// at runtime, where an absent method makes it return ErrFeatureNotSupported.
+// UserAccountStore, UserPasswordStore, SessionStore, SessionLookupStore,
+// SessionAdminStore, MagicLinkStore, SMSStore, EmailVerificationStore,
+// EmailChangeStore and TOTPStore. The two OAuth stores of oauth.go are reached
+// through Store.LinkedAccounts() and Store.PendingLinks(), because their
+// interfaces both declare Save and Delete and no single type can satisfy both.
+//
+// The remaining optional interfaces land with their item types (data-model.md
+// §1.4-§1.5) and are deliberately absent rather than stubbed, because the core
+// discovers them by type assertion: a stub that returns "not implemented" would
+// make Service advertise a feature that fails at runtime, where an absent method
+// makes it return ErrFeatureNotSupported.
 type Store struct {
 	api   API
 	table string
 	index string
 	now   func() time.Time
 
-	multiTenant   bool
-	consumeOnRead bool
-	ttlGrace      time.Duration
-	maxSessions   int
+	multiTenant       bool
+	consumeOnRead     bool
+	ttlGrace          time.Duration
+	maxSessions       int
+	maxLinkedAccounts int
 
-	log          *slog.Logger
-	degradedOnce sync.Once
+	log                  *slog.Logger
+	degradedOnce         sync.Once
+	unknownNamespaceOnce sync.Once
 }
 
 // New validates opts and returns a Store. It performs no I/O: the table is
@@ -127,15 +138,16 @@ func New(api API, opts Options) (*Store, error) {
 		return nil, errors.New("dynamodb: table name is required")
 	}
 	s := &Store{
-		api:           api,
-		table:         opts.TableName,
-		index:         opts.IndexName,
-		now:           opts.Now,
-		multiTenant:   opts.MultiTenant,
-		consumeOnRead: !opts.NonAtomicSingleUseTokens,
-		ttlGrace:      opts.SessionTTLGrace,
-		maxSessions:   opts.MaxSessionsPerUser,
-		log:           opts.Logger,
+		api:               api,
+		table:             opts.TableName,
+		index:             opts.IndexName,
+		now:               opts.Now,
+		multiTenant:       opts.MultiTenant,
+		consumeOnRead:     !opts.NonAtomicSingleUseTokens,
+		ttlGrace:          opts.SessionTTLGrace,
+		maxSessions:       opts.MaxSessionsPerUser,
+		maxLinkedAccounts: opts.MaxLinkedAccountsPerUser,
+		log:               opts.Logger,
 	}
 	if s.index == "" {
 		s.index = DefaultIndexName
@@ -148,6 +160,9 @@ func New(api API, opts Options) (*Store, error) {
 	}
 	if s.maxSessions == 0 {
 		s.maxSessions = DefaultMaxSessionsPerUser
+	}
+	if s.maxLinkedAccounts == 0 {
+		s.maxLinkedAccounts = DefaultMaxLinkedAccountsPerUser
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -163,11 +178,17 @@ func (s *Store) CompatibilityNotes() []string {
 		"POST /sessions/cleanup always reports deleted:0 — expiry is DynamoDB TTL, which produces no count (data-model.md §4.5).",
 		"GET /sessions returns sessions oldest-first by creation time; the reference returns them in unspecified map order (data-model.md §5).",
 		"Revoking an already-revoked session keeps the first revocation's timestamp and reason instead of overwriting them (data-model.md §4.4).",
+		"POST /change-email/confirm fails rather than applying an empty address when no email change is pending; the reference would overwrite the address (data-model.md §4.1).",
+		"POST /change-email/confirm fails if the pending address changed between reading the token and applying it, instead of applying the address it read (data-model.md §1.3 #22).",
+		"GET /linked-accounts returns bindings ordered by provider then provider account id; the reference returns them in insertion order (data-model.md §1.5 #54).",
+		"Re-linking a provider account that is already linked moves the binding and deletes the previous link id; the reference leaves the old id resolvable and still listed under its old owner (upstream nik2208/awesome-go-auth#37).",
+		"POST /link-verify answers INVALID_LINK_TOKEN for an expired account-link token, where the reference answers LINK_TOKEN_EXPIRED: the store refuses to return an entry past its deadline, so the route's own expiry branch is never reached (data-model.md §4.5).",
 	}
 	if s.consumeOnRead {
 		notes = append(notes,
-			"Single-use tokens are consumed by the lookup itself, so a failure in the step that follows burns the token and the user must request a new one (data-model.md §4.1).",
+			"Single-use tokens and SMS codes are consumed by the lookup itself, so a failure in the step that follows burns them and the user must request a new one (data-model.md §4.1). A code that does not match burns nothing.",
 			"A replayed refresh token revokes the whole session, not just that token (data-model.md §4.3).",
+			"An OAuth state nonce and an account-link token are consumed by PendingLinkStore.Get, so two callers racing on one link produce exactly one winner and the loser sees an invalid token (data-model.md §1.5 #57).",
 		)
 	}
 	return notes
@@ -215,6 +236,29 @@ func (s *Store) transactWrite(ctx context.Context, in *awsddb.TransactWriteItems
 			return sleepErr
 		}
 	}
+}
+
+// warnUnknownPendingLinkNamespace reports a PendingLinkStore key whose namespace
+// this build does not recognise.
+//
+// It exists because the single-use classification in keys.go is a coupling to key
+// builders the auth core does not export, so a core upgrade that adds a namespace
+// cannot fail to compile and — since the unrecognised case is treated as
+// re-readable — would not fail a test either. If the new namespace turns out to
+// carry a credential, it is replayable, and this line is the only thing that says
+// so. Once per process, like the rotation warning: it is a deployment-shaped
+// problem, not a per-request one.
+//
+// Only the namespace is logged, never the rest of the key: see
+// pendingLinkNamespace.
+func (s *Store) warnUnknownPendingLinkNamespace(state string) {
+	s.unknownNamespaceOnce.Do(func() {
+		s.log.Warn("dynamodb: pending-link key in an unrecognised namespace, treated as re-readable; "+
+			"if the auth core now issues a single-use credential under it, that credential can be replayed. "+
+			"Add the prefix to pendingLinkSingleUsePrefixes (single-use) or "+
+			"pendingLinkReReadablePrefixes (a stash entry) to silence this.",
+			slog.String("namespace", pendingLinkNamespace(state)))
+	})
 }
 
 func (s *Store) warnDegradedRotation() {

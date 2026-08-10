@@ -13,6 +13,17 @@ import (
 // cannot.
 var ErrUserNotFound = errors.New("user not found")
 
+// ErrNoPendingEmailChange means ApplyEmailChange was called with no pending
+// address on the profile. It is a fault rather than an authentication outcome:
+// the core only calls it after consuming an email-change token, and issuing that
+// token writes the address in the same conditional update, so reaching it means
+// the two got out of step.
+//
+// The reference has no counterpart — MemoryUserStore promotes the empty string
+// and orphans the uniqueness item (memory_store.go:376) — so this is a
+// deliberate divergence in favour of refusing.
+var ErrNoPendingEmailChange = errors.New("dynamodb: no pending email change to apply")
+
 // ErrResultTooLarge means a list method's result exceeded its cap. The
 // interfaces it applies to take no cursor (data-model.md §8.6), so the store's
 // only honest options are to refuse or to truncate silently; it refuses.

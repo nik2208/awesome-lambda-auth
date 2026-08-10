@@ -32,6 +32,17 @@ const (
 	attrCreatedAt     = "createdAt"
 	attrUpdatedAt     = "updatedAt"
 
+	// OAuth linked-account and pending-link attributes. They live on their own
+	// item types, not on the profile, but the names belong in one place with the
+	// rest so a codec and a condition cannot disagree about one.
+	attrLinkID        = "linkId"
+	attrProvider      = "provider"
+	attrProviderID    = "providerId"
+	attrName          = "name"
+	attrPicture       = "picture"
+	attrRedirectURL   = "redirectUrl"
+	attrMetaExpiresAt = "metaExpiresAt"
+
 	attrMagicHash  = "magicHash"
 	attrMagicExp   = "magicExp"
 	attrVerifyHash = "verifyHash"
@@ -72,11 +83,13 @@ func profileItem(u auth.User) item {
 		t(attrCreatedAt, u.CreatedAt).
 		t(attrUpdatedAt, u.UpdatedAt)
 
+	// Addressed through the families rather than the bare constants, so the codec
+	// and the conditional writes can never disagree about an attribute name.
 	it.s(familyReset.hashAttr, u.ResetTokenHash).tp(familyReset.expAttr, u.ResetTokenExpiresAt)
-	it.s(attrMagicHash, u.MagicLinkTokenHash).tp(attrMagicExp, u.MagicLinkTokenExpiresAt)
-	it.s(attrVerifyHash, u.EmailVerificationTokenHash).tp(attrVerifyExp, u.EmailVerificationTokenExpiry)
-	it.s(attrEchgHash, u.EmailChangeTokenHash).tp(attrEchgExp, u.EmailChangeTokenExpiry)
-	it.s(attrSMSHash, u.SMSCodeHash).tp(attrSMSExp, u.SMSCodeExpiresAt)
+	it.s(familyMagic.hashAttr, u.MagicLinkTokenHash).tp(familyMagic.expAttr, u.MagicLinkTokenExpiresAt)
+	it.s(familyVerify.hashAttr, u.EmailVerificationTokenHash).tp(familyVerify.expAttr, u.EmailVerificationTokenExpiry)
+	it.s(familyEchg.hashAttr, u.EmailChangeTokenHash).tp(familyEchg.expAttr, u.EmailChangeTokenExpiry)
+	it.s(familySMS.hashAttr, u.SMSCodeHash).tp(familySMS.expAttr, u.SMSCodeExpiresAt)
 	return it
 }
 
@@ -103,10 +116,10 @@ func userFromItem(m map[string]types.AttributeValue) (auth.User, error) {
 		PendingEmail:    getS(m, attrPendingEmail),
 
 		ResetTokenHash:             getS(m, familyReset.hashAttr),
-		MagicLinkTokenHash:         getS(m, attrMagicHash),
-		EmailVerificationTokenHash: getS(m, attrVerifyHash),
-		EmailChangeTokenHash:       getS(m, attrEchgHash),
-		SMSCodeHash:                getS(m, attrSMSHash),
+		MagicLinkTokenHash:         getS(m, familyMagic.hashAttr),
+		EmailVerificationTokenHash: getS(m, familyVerify.hashAttr),
+		EmailChangeTokenHash:       getS(m, familyEchg.hashAttr),
+		SMSCodeHash:                getS(m, familySMS.hashAttr),
 	}
 
 	var err error
@@ -121,10 +134,10 @@ func userFromItem(m map[string]types.AttributeValue) (auth.User, error) {
 		dst  **time.Time
 	}{
 		{familyReset.expAttr, &u.ResetTokenExpiresAt},
-		{attrMagicExp, &u.MagicLinkTokenExpiresAt},
-		{attrVerifyExp, &u.EmailVerificationTokenExpiry},
-		{attrEchgExp, &u.EmailChangeTokenExpiry},
-		{attrSMSExp, &u.SMSCodeExpiresAt},
+		{familyMagic.expAttr, &u.MagicLinkTokenExpiresAt},
+		{familyVerify.expAttr, &u.EmailVerificationTokenExpiry},
+		{familyEchg.expAttr, &u.EmailChangeTokenExpiry},
+		{familySMS.expAttr, &u.SMSCodeExpiresAt},
 	} {
 		if *f.dst, err = getTimePtr(m, f.attr); err != nil {
 			return auth.User{}, err
@@ -362,14 +375,11 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 	// Drop the single-use pointers the profile still names. They would expire on
 	// their own, but the reference deletes them (memory_store.go:99-110) and a
 	// pointer outliving its user is needless garbage.
-	for _, f := range []struct{ prefix, hash string }{
-		{familyReset.pkPrefix, getS(profile, familyReset.hashAttr)},
-		{"MAGIC" + keySep, getS(profile, attrMagicHash)},
-		{"VERIFY" + keySep, getS(profile, attrVerifyHash)},
-		{"ECHG" + keySep, getS(profile, attrEchgHash)},
-	} {
-		if f.hash != "" {
-			keys = append(keys, key(f.prefix+f.hash, skToken))
+	// Driven off pointerFamilies rather than a hand-written list, so a family
+	// added later cannot leave its pointers behind.
+	for _, f := range pointerFamilies {
+		if hash := getS(profile, f.hashAttr); hash != "" {
+			keys = append(keys, key(f.pk(hash), skToken))
 		}
 	}
 
@@ -378,6 +388,21 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 		return err
 	}
 	keys = append(keys, sessionKeys...)
+
+	// The OAuth bindings and their by-id pointers (data-model.md #6, "links").
+	// Swept whether or not this deployment wired the LinkedAccountStore: the items
+	// outlive the interface that wrote them, and a binding left behind would keep
+	// resolving FindByProvider to a user who no longer exists — which
+	// HandleCallback answers with ErrInvalidCredentials rather than by creating a
+	// fresh account, so the provider identity would be stranded. Like the session
+	// sweep this goes through GSI1 and is therefore eventually consistent; a link
+	// written microseconds earlier can be missed, and is harmless for the same
+	// reason.
+	linkKeys, err := s.linkKeysForUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	keys = append(keys, linkKeys...)
 
 	if err := s.deleteKeys(ctx, keys); err != nil {
 		return wrap("delete user", err)
