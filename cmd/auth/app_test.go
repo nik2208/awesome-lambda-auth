@@ -377,12 +377,13 @@ func TestNoInventedAuthRoutes(t *testing.T) {
 	t.Parallel()
 	app := newTestApp(t, baseEnv())
 
+	// Deliberately NOT a list of the adapter's routes: the adapter's surface grows
+	// upstream, and a test that enumerates it fails on every upstream release
+	// without finding a real defect. What must stay pinned is the direction of
+	// ownership — the auth surface comes from the adapter, and this binary adds
+	// only /healthz. So: sample what the adapter mounts to catch a wiring
+	// regression, and assert 404 on paths the adapter is known not to mount.
 	mounted := []string{"/auth/register", "/auth/login", "/auth/refresh", "/auth/logout", "/auth/me"}
-	notMounted := []string{
-		"/auth/forgot-password", "/auth/reset-password", "/auth/verify-email",
-		"/auth/magic-link/send", "/auth/sms/send", "/auth/2fa/verify", "/auth/sessions",
-	}
-
 	for _, path := range mounted {
 		method := http.MethodPost
 		if path == "/auth/me" {
@@ -393,11 +394,46 @@ func TestNoInventedAuthRoutes(t *testing.T) {
 			t.Errorf("%s %s is not mounted, but the adapter mounts it", method, path)
 		}
 	}
-	for _, path := range notMounted {
+
+	// The admin and tools routers are not implemented upstream, and the nonsense
+	// path can never become real, so a non-404 here means this binary invented a
+	// route or the mux is matching too broadly.
+	neverMounted := []string{
+		"/auth/admin/api/users",
+		"/auth/tools/stream",
+		"/auth/definitely-not-a-route",
+	}
+	for _, path := range neverMounted {
 		resp := invoke(t, app, http.MethodPost, path, jsonHeaders(), nil, "{}")
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("POST %s answered %d; this binary must not add auth routes the adapter does not mount",
 				path, resp.StatusCode)
+		}
+	}
+}
+
+// TestAdapterSurfaceIsReachable checks the routes the adapter gained in
+// awesome-go-auth v0.2.0 are actually served by this binary. A 405 counts as
+// mounted (wrong method), and 401/403 counts as mounted (needs credentials);
+// only 404 means the route never reached the mux. Without this, a dependency
+// bump that failed to widen the surface would look identical to a successful one.
+func TestAdapterSurfaceIsReachable(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t, baseEnv())
+
+	for _, path := range []string{
+		"/auth/forgot-password", "/auth/reset-password", "/auth/change-password",
+		"/auth/send-verification-email", "/auth/verify-email",
+		"/auth/change-email/request", "/auth/change-email/confirm",
+		"/auth/magic-link/send", "/auth/magic-link/verify",
+		"/auth/sms/send", "/auth/sms/verify",
+		"/auth/2fa/setup", "/auth/2fa/verify-setup", "/auth/2fa/verify", "/auth/2fa/disable",
+		"/auth/sessions", "/auth/sessions/cleanup", "/auth/profile", "/auth/add-phone",
+		"/auth/account", "/auth/linked-accounts", "/auth/link-request", "/auth/link-verify",
+	} {
+		resp := invoke(t, app, http.MethodPost, path, jsonHeaders(), nil, "{}")
+		if resp.StatusCode == http.StatusNotFound {
+			t.Errorf("POST %s answered 404; the adapter mounts it, so this binary is not serving the full surface", path)
 		}
 	}
 }
