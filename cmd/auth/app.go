@@ -158,7 +158,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
-	core, err := auth.New(coreOptions(cfg, users, sessions, log)...)
+	core, err := auth.New(append(coreOptions(cfg, users, sessions, log), oauthOptions(cfg, users, log)...)...)
 	if err != nil {
 		return nil, fmt.Errorf("auth core: %w", err)
 	}
@@ -286,6 +286,68 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 	}
 }
 
+// oauthStoreProvider is what this binary needs from a store to back the
+// account-linking routes.
+//
+// It is a structural assertion on the user store rather than a wider
+// StoreFactory signature, because these two are the only optional stores the auth
+// core does *not* discover by type assertion: LinkedAccountStore and
+// PendingLinkStore both declare Save and Delete, so no single type can implement
+// both, and the core takes them as explicit members of auth.OAuthWiring
+// (awesome-go-auth oauth_wire.go:170-179). Something has to hand them over, and
+// the composition root is the only place that knows which driver is in play.
+type oauthStoreProvider interface {
+	LinkedAccounts() auth.LinkedAccountStore
+	PendingLinks() auth.PendingLinkStore
+}
+
+// oauthOptions wires the two OAuth stores when the driver has them and the
+// operator asked for them.
+//
+// Each is gated on its own stores.enable key, which is the mechanism the schema
+// already defines for exactly this: "a disabled store makes its feature routes and
+// admin tabs absent, exactly as an absent injected store does in the reference"
+// (config.StoreEnable). With a key off, its routes answer NOT_IMPLEMENTED, which
+// is the truth rather than a silent 500.
+//
+// OAuthWiring.Service stays nil on purpose. The provider registry comes from the
+// oauth.* configuration block, which internal/config/phases.go still refuses as a
+// P4 domain, so GET /oauth/{provider} keeps answering the reference's
+// "<Provider> OAuth not configured" stub — a configuration gap, not a store one.
+// The four account-linking routes need no provider registry and work as soon as
+// the stores are here.
+func oauthOptions(cfg *config.Config, users auth.UserStore, log *slog.Logger) []auth.Option {
+	provider, ok := users.(oauthStoreProvider)
+	if !ok {
+		return nil
+	}
+	wiring := auth.OAuthWiring{
+		// The redirect allowlist and the fallback origin the emailed link points
+		// at. Both come from blocks P1 already wires, so neither drags the oauth
+		// domain in.
+		AllowedOrigins: cfg.HTTP.CORS.Origins,
+		SiteURL:        cfg.Deployment.PublicURL,
+	}
+	if cfg.Stores.Enable.LinkedAccounts {
+		wiring.LinkedAccounts = provider.LinkedAccounts()
+	}
+	if cfg.Stores.Enable.PendingLinks {
+		wiring.PendingLinks = provider.PendingLinks()
+	}
+	if wiring.LinkedAccounts == nil && wiring.PendingLinks == nil {
+		return nil
+	}
+	// DeliverLinkToken is deliberately absent: mail transport is a separate
+	// effort. POST /link-request therefore persists and answers success without
+	// mailing anything, which is what the reference does with no transport
+	// configured — so it is logged rather than left to be discovered.
+	log.Info("oauth account-linking stores wired",
+		slog.Bool("linkedAccounts", wiring.LinkedAccounts != nil),
+		slog.Bool("pendingLinks", wiring.PendingLinks != nil),
+		slog.String("linkTokenDelivery", "none — POST /link-request stores the token and answers success without sending mail"))
+	return []auth.Option{auth.WithOAuth(wiring)}
+}
+
 // httpConfig maps the cookie, CSRF and prefix knobs onto the shared wire layer.
 //
 // Cookie Max-Age is deliberately left at zero: HTTPConfig.resolve derives it
@@ -349,13 +411,34 @@ func defaultStoreFactory(ctx context.Context, cfg *config.Config, log *slog.Logg
 		// concurrent execution environments do not share one.
 		log.Warn("using the in-memory store: state is per execution environment and is lost on every cold start",
 			slog.String("path", "stores.driver"))
-		return auth.NewMemoryUserStore(), auth.NewMemorySessionStore(), nil
+		return memoryStoreBundle{
+			MemoryUserStore: auth.NewMemoryUserStore(),
+			links:           auth.NewMemoryLinkedAccounts(),
+			pending:         auth.NewMemoryPendingLinks(),
+		}, auth.NewMemorySessionStore(), nil
 
 	default:
 		return nil, nil, fmt.Errorf("stores.driver: %q is not implemented in this build; use %q or %q",
 			cfg.Stores.Driver, config.StoreDriverDynamoDB, config.StoreDriverMemory)
 	}
 }
+
+// memoryStoreBundle is the in-memory user store plus the two OAuth stores the
+// core cannot find by type assertion, so that the development driver reaches the
+// account-linking routes the same way the DynamoDB one does.
+//
+// The embedded pointer is what keeps the rest working: every optional interface
+// the core *does* discover on the user store — MagicLinkStore, SMSStore,
+// TOTPStore and the rest — is satisfied by method promotion, so wrapping it
+// cannot quietly narrow the feature set.
+type memoryStoreBundle struct {
+	*auth.MemoryUserStore
+	links   auth.LinkedAccountStore
+	pending auth.PendingLinkStore
+}
+
+func (m memoryStoreBundle) LinkedAccounts() auth.LinkedAccountStore { return m.links }
+func (m memoryStoreBundle) PendingLinks() auth.PendingLinkStore     { return m.pending }
 
 // driverStores lists the stores.enable.<store> keys each driver can actually
 // back. A key that is enabled and absent from its driver's set is a knob that
@@ -365,12 +448,21 @@ func driverStores(driver string) (map[string]bool, bool) {
 	switch driver {
 	case config.StoreDriverDynamoDB:
 		// internal/store/dynamodb implements UserStore, UserAccountStore,
-		// UserPasswordStore, SessionStore, SessionLookupStore and
-		// SessionAdminStore. Everything else is deliberately absent — see that
+		// UserPasswordStore, SessionStore, SessionLookupStore, SessionAdminStore,
+		// the four single-use token stores, TOTPStore, LinkedAccountStore and
+		// PendingLinkStore. Everything else is deliberately absent — see that
 		// package's interfaces.go.
-		return map[string]bool{"users": true, "sessions": true, "tokens": true}, true
+		return map[string]bool{
+			"users": true, "sessions": true, "tokens": true,
+			"linkedAccounts": true, "pendingLinks": true,
+		}, true
 	case config.StoreDriverMemory:
-		return map[string]bool{"users": true, "sessions": true, "tokens": true}, true
+		// awesome-go-auth ships MemoryLinkedAccounts and MemoryPendingLinks, so the
+		// development driver backs the same two keys.
+		return map[string]bool{
+			"users": true, "sessions": true, "tokens": true,
+			"linkedAccounts": true, "pendingLinks": true,
+		}, true
 	default:
 		return nil, false
 	}

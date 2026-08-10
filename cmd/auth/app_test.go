@@ -62,11 +62,20 @@ func with(base map[string]string, kv ...string) map[string]string {
 
 func discardLogger() *slog.Logger { return newLogger(io.Discard, slog.LevelError) }
 
-// memoryStores is the unit-test persistence layer. No test in this package
-// talks to AWS: the point of the store factory being injectable is that the
-// composition can be proved without an account.
+// memoryStores is the unit-test persistence layer. Most tests in this package
+// talk to no store backend at all: the point of the store factory being
+// injectable is that the composition can be proved without an account.
+//
+// It returns the same bundle defaultStoreFactory does for the memory driver, so
+// the OAuth stores the core cannot discover by type assertion reach the wiring
+// here too — otherwise every test in this file would be exercising a narrower
+// composition than the binary builds.
 func memoryStores(_ context.Context, _ *config.Config, _ *slog.Logger) (auth.UserStore, auth.SessionStore, error) {
-	return auth.NewMemoryUserStore(), auth.NewMemorySessionStore(), nil
+	return memoryStoreBundle{
+		MemoryUserStore: auth.NewMemoryUserStore(),
+		links:           auth.NewMemoryLinkedAccounts(),
+		pending:         auth.NewMemoryPendingLinks(),
+	}, auth.NewMemorySessionStore(), nil
 }
 
 func newTestApp(t *testing.T, env map[string]string) *App {
@@ -83,18 +92,25 @@ func newTestApp(t *testing.T, env map[string]string) *App {
 }
 
 // v2Event builds a synthetic API Gateway HTTP API payload format 2.0 event.
+//
+// A query string may be written inline in path, the way a caller thinks of a URL;
+// it is split out into RawQueryString because that is where API Gateway puts it
+// and where internal/lambdahttp reads it from. Leaving it in the path would make
+// the mux see "/auth/verify-email?token=x" as a path and answer 404.
 func v2Event(method, path string, headers map[string]string, cookies []string, body string) json.RawMessage {
 	h := map[string]string{"host": "auth.example.test"}
 	for k, v := range headers {
 		h[strings.ToLower(k)] = v
 	}
+	path, rawQuery, _ := strings.Cut(path, "?")
 	evt := events.APIGatewayV2HTTPRequest{
-		Version:  "2.0",
-		RouteKey: "$default",
-		RawPath:  path,
-		Headers:  h,
-		Cookies:  cookies,
-		Body:     body,
+		Version:        "2.0",
+		RouteKey:       "$default",
+		RawPath:        path,
+		RawQueryString: rawQuery,
+		Headers:        h,
+		Cookies:        cookies,
+		Body:           body,
 		RequestContext: events.APIGatewayV2HTTPRequestContext{
 			Stage:      "$default",
 			DomainName: "auth.example.test",
