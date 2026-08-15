@@ -19,10 +19,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		{"security.jwt.claimsWebhook", func(doc Document) {
 			set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
 		}},
-		{"email.mailer", func(doc Document) {
-			set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
-			set(doc, "email.mailer.from", "no-reply@example.com")
-		}},
 		{"email.siteUrls", func(doc Document) {
 			set(doc, "email.siteUrls", []any{"https://app.example.com"})
 		}},
@@ -31,9 +27,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		}},
 		{"email.deliveryWebhook", func(doc Document) {
 			set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook")
-		}},
-		{"sms", func(doc Document) {
-			set(doc, "sms.endpoint", "https://sms.example.com/send")
 		}},
 		{"oauth", func(doc Document) {
 			set(doc, "oauth.provisioning.autoCreate", true)
@@ -151,6 +144,78 @@ func TestWiredDomainsAreNotFlagged(t *testing.T) {
 	}
 	if cfg.Email.Verification.Mode != EmailVerificationStrict {
 		t.Errorf("email.verification.mode = %q, want strict", cfg.Email.Verification.Mode)
+	}
+}
+
+// TestDeliveryDomainsAreWired is the other side of the refusal table: the two
+// blocks that select a credential transport must now load, because a deployment
+// that configures them gets mail and text messages rather than a phase error.
+//
+// Both are written the way the schema requires them — email.mailer needs an
+// endpoint and a from address together, sms needs an endpoint — so this also
+// pins that un-gating did not quietly relax the block's own validation. What
+// the AWS transports then do with the endpoint is cmd/auth's unwiredKnobs
+// problem, not this package's.
+func TestDeliveryDomainsAreWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+	}{
+		{"email.mailer", func(doc Document) {
+			set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
+			set(doc, "email.mailer.from", "no-reply@example.com")
+			set(doc, "email.mailer.fromName", "Example")
+			set(doc, "email.mailer.defaultLang", "it")
+		}},
+		{"sms", func(doc Document) {
+			set(doc, "sms.endpoint", "https://sms.example.com/send")
+			set(doc, "sms.codeTtlMinutes", 5)
+		}},
+		{"both together", func(doc Document) {
+			set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
+			set(doc, "email.mailer.from", "no-reply@example.com")
+			set(doc, "sms.endpoint", "https://sms.example.com/send")
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+			if err != nil {
+				t.Fatalf("the delivery blocks are wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if (w.Path == "email.mailer" || w.Path == "sms") && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("%s is still reported as an unwired domain: %s", w.Path, w.Problem)
+				}
+			}
+		})
+	}
+}
+
+// TestDeliverySecretsNoLongerTripThePhaseGap: a secret supplied through its
+// documented environment variable leaves no trace in the Config tree, so the
+// phase check looks at resolved secrets too. Both delivery blocks had a
+// secretPrefix, and removing the domains has to remove that half as well —
+// otherwise an operator who puts the SMS credentials in Secrets Manager gets a
+// refusal for a block that works.
+func TestDeliverySecretsNoLongerTripThePhaseGap(t *testing.T) {
+	env := baseEnv()
+	env["AWESOME_AUTH_MAILER_API_KEY"] = "mailer-api-key-value"
+	env["AWESOME_AUTH_SMS_API_KEY"] = "sms-api-key-value"
+	env["AWESOME_AUTH_SMS_USERNAME"] = "sms-user"
+	env["AWESOME_AUTH_SMS_PASSWORD"] = "sms-pass"
+
+	doc := baseDoc()
+	set(doc, "email.mailer.endpoint", "https://mail.example.com/send")
+	set(doc, "email.mailer.from", "no-reply@example.com")
+	set(doc, "sms.endpoint", "https://sms.example.com/send")
+
+	if _, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)}); err != nil {
+		t.Fatalf("delivery secrets must not reopen the phase gap:\n%v", err)
 	}
 }
 

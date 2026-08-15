@@ -35,12 +35,27 @@ type domain struct {
 }
 
 // unwiredDomains lists every domain whose types and validation exist but whose
-// behaviour does not, as of P1.
+// behaviour does not.
 //
 // P1 wires: schemaVersion, deployment, security.jwt secrets and TTLs,
 // security.password, security.csrf, tokens, cookies, sessions,
-// email.verification.mode, stores, http. Everything below is defined, validated
-// and refused.
+// email.verification.mode, stores, http.
+//
+// Credential delivery adds two more. `email.mailer` and `sms` are now wired —
+// they select and configure the transports the five credential-minting routes
+// send through (cmd/auth delivery.go, internal/integration/aws ses.go and
+// sns.go) — so neither is refused any more. Note what did *not* move with them:
+// email.siteUrls, email.templatesDir and email.deliveryWebhook are still inert
+// and still refused, because a transport is not a redirect allowlist, a
+// template store or a webhook. Configuring the mailer therefore starts; asking
+// it to load your own templates still does not.
+//
+// A knob inside a wired domain that the imported core cannot honour is a
+// different thing again, and is reported by cmd/auth's unwiredKnobs at cold
+// start rather than refused here — which is where the mailer's endpoint and API
+// key end up, since SES is reached by API and not by URL.
+//
+// Everything below is defined, validated and refused.
 func unwiredDomains() []domain {
 	return []domain{
 		{
@@ -52,15 +67,6 @@ func unwiredDomains() []domain {
 			path:  "security.jwt.claimsWebhook",
 			phase: "P3 (token claims)",
 			get:   func(c *Config) any { return c.Security.JWT.ClaimsWebhook },
-		},
-		{
-			// email.verification.mode is wired in P1; the transport is not, so
-			// the mailer, the template seeding and the delivery webhook are
-			// refused while the verification mode is honoured.
-			path:         "email.mailer",
-			phase:        "P2 (email flows)",
-			get:          func(c *Config) any { return c.Email.Mailer },
-			secretPrefix: "email.mailer.",
 		},
 		{
 			path:  "email.siteUrls",
@@ -76,12 +82,6 @@ func unwiredDomains() []domain {
 			path:  "email.deliveryWebhook",
 			phase: "P2 (email flows)",
 			get:   func(c *Config) any { return c.Email.DeliveryWebhook },
-		},
-		{
-			path:         "sms",
-			phase:        "P3 (SMS and 2FA)",
-			get:          func(c *Config) any { return c.SMS },
-			secretPrefix: "sms.",
 		},
 		{
 			path:         "oauth",

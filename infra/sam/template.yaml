@@ -54,6 +54,8 @@ Metadata:
         Parameters: [AllowedOrigins, CookieDomain, CookieSameSite, AllowInsecureCookieMode]
       - Label: {default: Signing secrets}
         Parameters: [JwtAccessSecretArn, JwtRefreshSecretArn]
+      - Label: {default: Credential delivery}
+        Parameters: [MailerFromAddress, MailerFromName, MailerIdentity, MailerDefaultLang, EnableSmsDelivery]
       - Label: {default: Storage}
         Parameters: [TableNamePrefix, MaxReadRequestUnits, MaxWriteRequestUnits, EnableDeletionProtection]
       - Label: {default: Function}
@@ -178,6 +180,80 @@ Parameters:
       signing secret. Empty generates one. RS-1 requires it to differ from the
       access secret. Also accepts a #<jsonKey> selector.
 
+  # -----------------------------------------------------------------------
+  # Credential delivery — five routes mint something that has to be mailed or
+  # texted, and this is where they get a transport.
+  #
+  # Mail goes through Amazon SES v2, text messages through an SNS publish
+  # straight to the recipient's number. Neither has an endpoint or an API key:
+  # both are called through the AWS API and authorised by the execution role's
+  # policy below, which is why there is no MailerEndpoint parameter here even
+  # though config-schema.md §1.5 lists `email.mailer.endpoint` as required.
+  #
+  # The binary reconciles that: it treats a `from` address as "a mailer is
+  # configured", supplies the endpoint the schema insists on with a placeholder
+  # of its own (below), and reports the endpoint and API key as knobs it cannot
+  # honour in the cold-start log — see unwiredKnobs in cmd/auth/app.go. Nothing
+  # is silently ignored and nothing has to be invented by the operator.
+  #
+  # LEAVE MailerFromAddress EMPTY and no mail is sent at all. That is not a
+  # broken stack: POST /magic-link/send answers 500 EMAIL_NOT_CONFIGURED, and
+  # /forgot-password, /send-verification-email and /change-email/request answer
+  # 200 and mail nothing, which is exactly what the reference does with no email
+  # block. Bearer clients that never touch those routes are unaffected.
+  # -----------------------------------------------------------------------
+
+  MailerFromAddress:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: >-
+      AWESOME_AUTH_MAILER_FROM — the address every auth mail is sent from. It
+      MUST be a verified SES identity in this region, or an address under a
+      verified domain, because SES rejects anything else. Empty (the default)
+      wires no mail transport at all. Placeholder is deliberately empty; never
+      commit a real domain.
+
+  MailerFromName:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_MAILER_FROM_NAME — the display name on the From header, and
+      the application name the built-in templates greet with and prefix every
+      subject with. Empty falls back to the sender address's domain.
+
+  MailerIdentity:
+    Type: String
+    Default: ''
+    Description: >-
+      The SES identity the ses:SendEmail grant is scoped to: a verified domain
+      ("example.com") or a single verified address
+      ("no-reply@example.com"). Empty defaults to the domain of
+      MailerFromAddress, which is the common case. Set it explicitly when the
+      verified identity is the address rather than the domain, or the send is
+      denied. This is an IAM resource name, not a knob the function reads.
+
+  MailerDefaultLang:
+    Type: String
+    Default: en
+    AllowedValues: [en, it]
+    Description: >-
+      AWESOME_AUTH_MAILER_DEFAULT_LANG — which built-in template set renders the
+      four mails. Only the OAuth link-token mail can override it per request.
+
+  EnableSmsDelivery:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Wires SMS one-time codes through SNS publish-to-phone-number. "false"
+      leaves POST /sms/send answering 500 SMS_NOT_CONFIGURED, which is the
+      reference's behaviour with no sms block, and grants no sns:Publish at all.
+      Turning it on has real prerequisites outside this stack: a new account is
+      in the SMS sandbox and can only text numbers it has verified, spend limits
+      are per-region, and several countries require a registered origination
+      identity. Stored numbers must be E.164 — SNS routes nothing else.
+
   TableNamePrefix:
     Type: String
     Default: awesome-auth
@@ -250,6 +326,10 @@ Conditions:
   # only one of the two ARNs still works and still generates only what is
   # missing.
   GenerateSigningSecrets: !Or [!Condition GenerateJwtAccessSecret, !Condition GenerateJwtRefreshSecret]
+  HasMailer: !Not [!Equals [!Ref MailerFromAddress, '']]
+  HasMailerFromName: !Not [!Equals [!Ref MailerFromName, '']]
+  HasExplicitMailerIdentity: !Not [!Equals [!Ref MailerIdentity, '']]
+  SmsEnabled: !Equals [!Ref EnableSmsDelivery, 'true']
   HasPublicUrl: !Not [!Equals [!Ref PublicUrl, '']]
   HasAllowedOrigins: !Not [!Equals [!Ref AllowedOrigins, '']]
   HasCookieDomain: !Not [!Equals [!Ref CookieDomain, '']]
@@ -520,6 +600,36 @@ Resources:
           # --- sessions --------------------------------------------------
           AWESOME_AUTH_SESSIONS_CHECK_ON: !Ref SessionCheckOn
 
+          # --- credential delivery ---------------------------------------
+          # Set as a group or not at all: internal/config refuses a mailer
+          # block that has a from address and no endpoint, and refuses one that
+          # has an endpoint and no from address.
+          #
+          # The endpoint below is a placeholder and is never contacted. SES is
+          # reached through the AWS API, so there is nothing to point it at; it
+          # exists because config-schema.md §1.5 marks it required, and the
+          # function reports it as an unhonoured knob in the cold-start log so
+          # that nobody has to work that out from behaviour. Do NOT set it to a
+          # real mail gateway expecting traffic — none is sent.
+          #
+          # No AWESOME_AUTH_MAILER_API_KEY, and no reference to one: SES
+          # authorises the send with the execution role, so there is no key to
+          # store, rotate or leak.
+          AWESOME_AUTH_MAILER_ENDPOINT: !If [HasMailer, 'https://ses.invalid/unused-see-template-comment', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_MAILER_FROM: !If [HasMailer, !Ref MailerFromAddress, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_MAILER_FROM_NAME: !If [HasMailerFromName, !Ref MailerFromName, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_MAILER_DEFAULT_LANG: !If [HasMailer, !Ref MailerDefaultLang, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_MAILER_PROVIDER: !If [HasMailer, 'ses', !Ref 'AWS::NoValue']
+
+          # The sms block has no AWS-shaped knob at all — every key in it
+          # describes the reference's HTTP gateway — so its required endpoint is
+          # what says "wire SMS delivery", and it is likewise a placeholder that
+          # is never contacted. sms.apiKey, sms.username and sms.password are
+          # deliberately absent: SNS authorises the publish with the execution
+          # role, which retires the credentials-in-URL hazard config-schema.md
+          # §1.6 records for them along with the credentials themselves.
+          AWESOME_AUTH_SMS_ENDPOINT: !If [SmsEnabled, 'https://sns.invalid/unused-see-template-comment', !Ref 'AWS::NoValue']
+
           # --- signing secrets -------------------------------------------
           # REFERENCES, not values. The _SECRETSMANAGER suffix on a secret
           # knob's documented variable means "this names a Secrets Manager
@@ -644,6 +754,72 @@ Resources:
                 - !If [GenerateSigningSecrets, !Ref JwtSigningSecrets, !Ref 'AWS::NoValue']
                 - !If [GenerateJwtAccessSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtAccessSecretArn]]]
                 - !If [GenerateJwtRefreshSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtRefreshSecretArn]]]
+
+        # -----------------------------------------------------------------
+        # Credential delivery. Two statements, each present only when its half
+        # is configured, and each as narrow as its service allows.
+        #
+        # ---- mail --------------------------------------------------------
+        # One action. SES v2's SendEmail is authorised by `ses:SendEmail` — the
+        # v2 API kept the v1 IAM prefix — and the resource is the identity being
+        # sent *from*, which is the only ARN in play: a recipient is not an AWS
+        # resource and cannot be scoped. Scoped to one identity, this role can
+        # send as no-reply@yourdomain and as nothing else in the account.
+        #
+        # MailerIdentity defaults to the domain of MailerFromAddress, since a
+        # verified domain covers every address under it. When the verified
+        # identity is the single address rather than the domain, set
+        # MailerIdentity to that address or SES denies the send — the identity
+        # ARN has to name what was actually verified.
+        #
+        # No ses:SendRawEmail (the transport sends simple content only), no
+        # ses:SendTemplatedEmail (templates are rendered in-process, by the
+        # imported core), no ses:GetAccount or ses:ListIdentities: nothing reads
+        # SES configuration at runtime, and a role that can enumerate a verified
+        # domain list is a role that can help someone map the account.
+        #
+        # ---- SMS ---------------------------------------------------------
+        # NotResource, and it is not a wildcard in disguise. sns:Publish to a
+        # phone number has no resource ARN — the destination is a phone number,
+        # which AWS does not model as a resource — so `Resource: '*'` is the
+        # only Resource form that grants it, and that same statement would also
+        # let this role publish to every SNS topic in the account. The
+        # documented way to grant one without the other is to allow the action
+        # against everything that is NOT an SNS ARN, which is exactly this: SMS
+        # to a handset is permitted, publishing to any topic — including a
+        # topic feeding a Lambda, a queue or a webhook — is not.
+        #
+        # No sns:SetSMSAttributes and no sns:SetSMSAttributes-adjacent action:
+        # the transport sets AWS.SNS.SMS.SMSType per message, which needs no
+        # permission, and changing the account's SMS defaults is a deployment
+        # decision rather than something an auth router should be able to do.
+        # -----------------------------------------------------------------
+        - !If
+          - HasMailer
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: SendAuthMailFromTheVerifiedIdentity
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${Identity}'
+                  - Identity: !If
+                      - HasExplicitMailerIdentity
+                      - !Ref MailerIdentity
+                      - !Select [1, !Split ['@', !Ref MailerFromAddress]]
+          - !Ref 'AWS::NoValue'
+
+        - !If
+          - SmsEnabled
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: PublishSmsToHandsetsOnly
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                NotResource: !Sub 'arn:${AWS::Partition}:sns:*:*:*'
+          - !Ref 'AWS::NoValue'
 
       Events:
         Root:

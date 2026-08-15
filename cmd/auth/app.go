@@ -59,6 +59,17 @@ type Options struct {
 	// Secrets are the stores consulted for secret-valued knobs. The zero value
 	// wires the real AWS-backed resolvers; a test injects fakes.
 	Secrets config.Resolvers
+
+	// Mail and SMS inject the credential-delivery transports, for the same
+	// reason Stores is injectable: the composition has to be provable without an
+	// AWS account. Nil — the zero value — builds the real SES and SNS transports.
+	//
+	// Injecting one does NOT switch delivery on. Whether a sender is wired at
+	// all stays a question about the configuration (see mailConfigured and
+	// smsConfigured in delivery.go), so a test cannot accidentally exercise a
+	// composition the binary would never build.
+	Mail auth.MailerTransport
+	SMS  auth.SMSTransport
 }
 
 // App is one cold start's worth of state.
@@ -158,7 +169,19 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
-	core, err := auth.New(append(coreOptions(cfg, users, sessions, log), oauthOptions(cfg, users, log)...)...)
+	// Credential delivery. Built before the core because every sender option is
+	// derived from it, and it performs no I/O: both AWS clients are deferred to
+	// the first message actually sent (delivery.go).
+	deliver, err := newDelivery(cfg, opts.Mail, opts.SMS, log)
+	if err != nil {
+		return nil, err
+	}
+
+	coreOpts := coreOptions(cfg, users, sessions, log)
+	coreOpts = append(coreOpts, deliveryOptions(deliver, log)...)
+	coreOpts = append(coreOpts, oauthOptions(cfg, users, deliver, log)...)
+
+	core, err := auth.New(coreOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("auth core: %w", err)
 	}
@@ -316,7 +339,7 @@ type oauthStoreProvider interface {
 // "<Provider> OAuth not configured" stub — a configuration gap, not a store one.
 // The four account-linking routes need no provider registry and work as soon as
 // the stores are here.
-func oauthOptions(cfg *config.Config, users auth.UserStore, log *slog.Logger) []auth.Option {
+func oauthOptions(cfg *config.Config, users auth.UserStore, deliver *delivery, log *slog.Logger) []auth.Option {
 	provider, ok := users.(oauthStoreProvider)
 	if !ok {
 		return nil
@@ -337,14 +360,22 @@ func oauthOptions(cfg *config.Config, users auth.UserStore, log *slog.Logger) []
 	if wiring.LinkedAccounts == nil && wiring.PendingLinks == nil {
 		return nil
 	}
-	// DeliverLinkToken is deliberately absent: mail transport is a separate
-	// effort. POST /link-request therefore persists and answers success without
-	// mailing anything, which is what the reference does with no transport
-	// configured — so it is logged rather than left to be discovered.
+	// DeliverLinkToken used to be unconditionally absent, and the log line here
+	// said so. It is wired now whenever a mail transport exists, so POST
+	// /link-request sends the verification mail instead of storing a token
+	// nobody receives. With no mailer it is still nil, and the route still
+	// answers success without sending anything — which is what the reference
+	// does with no transport configured, so the fallback is not a degradation
+	// but the unconfigured behaviour.
+	delivery := "none — POST /link-request stores the token and answers success without sending mail"
+	if deliver != nil && deliver.mail != nil {
+		wiring.DeliverLinkToken = deliver.deliverLinkToken
+		delivery = "ses"
+	}
 	log.Info("oauth account-linking stores wired",
 		slog.Bool("linkedAccounts", wiring.LinkedAccounts != nil),
 		slog.Bool("pendingLinks", wiring.PendingLinks != nil),
-		slog.String("linkTokenDelivery", "none — POST /link-request stores the token and answers success without sending mail"))
+		slog.String("linkTokenDelivery", delivery))
 	return []auth.Option{auth.WithOAuth(wiring)}
 }
 
@@ -613,7 +644,138 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 		})
 	}
 
+	gaps = append(gaps, deliveryKnobGaps(cfg)...)
+
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
+	return gaps
+}
+
+// deliveryKnobGaps reports the knobs of email.mailer and sms that this build's
+// transports cannot honour.
+//
+// Both blocks describe the reference's transports, which are HTTP gateways: a
+// mailer is an endpoint you POST to with an X-API-Key, and an SMS gateway is a
+// URL you GET with the credentials in the query string. This port sends through
+// SES and SNS instead, which are reached by AWS API and authorised by the
+// execution role, so those knobs address nothing and authenticate nothing.
+//
+// They are reported rather than refused, and rather than ignored. Refusing
+// would make a document that is valid for every other port in the family
+// unstartable here, for knobs that are required by the schema. Ignoring them is
+// the failure mode this whole mechanism exists to prevent — an operator who
+// rotates an SMS gateway password and sees nothing change has no way to learn
+// from the outside that the password was never used. So each one is named, with
+// its path, in the cold-start log.
+//
+// Note in particular what happens to sms.username and sms.password. The schema
+// models them as secrets and its own comment says the transport "must move them
+// off the URL" because the reference appends them as query parameters on a GET,
+// writing credentials into every access log between here and the gateway. An
+// SNS sender does not move them off the URL — it has no URL. The credentials-in-
+// URL hazard is gone, and so is any use for the credentials.
+//
+// The gaps are reported whether or not the block they belong to is switched on,
+// and the second case is the one that needs saying out loud. A credential is the
+// part of these blocks that lives in Secrets Manager, so it is the part an
+// operator sets first and the part a stack template carries; the switch — a from
+// address for mail, an endpoint for SMS — is the part that is easy to forget.
+// Set the credential alone and internal/config sees nothing to validate (a
+// Secret resolved from its plain environment variable leaves no reference in the
+// tree for validateSMS's `configured` to find), mailConfigured and smsConfigured
+// are both false, and delivery is off. Before this port wired the two blocks
+// that combination was refused outright by the phase gap, whose secretPrefix
+// covered exactly these paths. Removing the domains removed that cover too, so
+// the report has to replace it, or an SMS gateway password in the environment
+// buys total silence: no mail, no text, no warning, and a 500 on the first
+// /sms/send that nothing in the log accounts for.
+func deliveryKnobGaps(cfg *config.Config) []knobGap {
+	var gaps []knobGap
+
+	// The credentials, reported wherever they appear. Each one names the switch
+	// its block is missing when the block is off, because "this key is unused"
+	// and "no mail is sent at all" are different things for an operator to read.
+	mailOn, smsOn := mailConfigured(cfg), smsConfigured(cfg)
+	const (
+		portable = "leave it set if the same document is deployed to another port in the family; nothing in this build reads it. "
+		// The hazard config-schema.md §1.6 records against the SMS gateway
+		// credentials: the reference appends them as query parameters on a GET,
+		// writing them into every access log on the way. An SNS publish has no URL
+		// to move them off, so the hazard retires with the credential.
+		smsHazard = " — which also retires the credentials-in-URL hazard the schema records for it, since there is no URL"
+	)
+	smsOff := "sms.endpoint is unset, so no SMS transport is wired at all and POST /sms/send answers 500 SMS_NOT_CONFIGURED: set it to turn SMS delivery on, or delete the credential"
+	for _, row := range []struct{ path, service, action, hazard, on, off string }{
+		{
+			path: "email.mailer.apiKey", service: "SES", action: "ses:SendEmail",
+			on:  "Deleting the secret it points at costs nothing here, and removes one credential from the blast radius",
+			off: "email.mailer.from is unset, so no mail transport is wired at all and no mail is sent: set it to turn mail delivery on, or delete the key",
+		},
+		{
+			path: "sms.apiKey", service: "SNS", action: "sns:Publish", hazard: smsHazard,
+			on:  "Retiring the gateway credential removes it from the blast radius entirely",
+			off: smsOff,
+		},
+		{
+			path: "sms.username", service: "SNS", action: "sns:Publish", hazard: smsHazard,
+			on:  "Retiring the gateway credential removes it from the blast radius entirely",
+			off: smsOff,
+		},
+		{
+			path: "sms.password", service: "SNS", action: "sns:Publish", hazard: smsHazard,
+			on:  "Retiring the gateway credential removes it from the blast radius entirely",
+			off: smsOff,
+		},
+	} {
+		if cfg.SecretValue(row.path) == "" {
+			continue
+		}
+		blockOn := smsOn
+		if strings.HasPrefix(row.path, "email.") {
+			blockOn = mailOn
+		}
+		problem := fmt.Sprintf(
+			"%s authorises the call with the Lambda execution role's %s permission, so this credential is never presented to anything",
+			row.service, row.action) + row.hazard
+		remedy := portable + row.on
+		if !blockOn {
+			problem += ", and this deployment sends nothing through that half at all"
+			remedy = row.off
+		}
+		gaps = append(gaps, knobGap{Path: row.path, Problem: problem, Remedy: remedy})
+	}
+
+	if mailOn {
+		const sesRemedy = "leave it set if the same document is deployed to another port in the family; nothing in this build reads it"
+
+		// Always present when the mailer is on: validate.go requires an endpoint
+		// for any configured mailer block, and SES never has one.
+		gaps = append(gaps, knobGap{
+			Path:    "email.mailer.endpoint",
+			Problem: "this build delivers mail through Amazon SES, which is called through the AWS API and not by posting to a URL, so no request is ever made to this endpoint",
+			Remedy:  sesRemedy + ". The schema requires it, which is why configuring a mailer at all means configuring one",
+		})
+		// provider is free-form in the schema and the reference passes it to its
+		// gateway to select a backend. Naming ses is honoured — it is what this
+		// build does — so only a different value is a gap.
+		if p := strings.TrimSpace(cfg.Email.Mailer.Provider); p != "" && !strings.EqualFold(p, "ses") {
+			gaps = append(gaps, knobGap{
+				Path:    "email.mailer.provider",
+				Problem: fmt.Sprintf("mail is delivered through Amazon SES and there is no second transport to select, so the configured provider %q selects nothing", p),
+				Remedy:  `set it to "ses" to describe what is actually deployed, or remove it`,
+			})
+		}
+	}
+
+	if smsOn {
+		const snsRemedy = "leave it set if the same document is deployed to another port in the family; nothing in this build reads it"
+
+		gaps = append(gaps, knobGap{
+			Path:    "sms.endpoint",
+			Problem: "this build sends text messages with an SNS Publish to the recipient's number, so no request is ever made to this gateway; the knob's only remaining job is to say that SMS delivery should be wired at all",
+			Remedy:  snsRemedy + ", and keep it set: an empty sms block leaves POST /sms/send answering 500 SMS_NOT_CONFIGURED",
+		})
+	}
+
 	return gaps
 }
 

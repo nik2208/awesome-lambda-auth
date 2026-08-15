@@ -185,6 +185,89 @@ radius for nothing. No `kms:Decrypt`, because the AWS-managed
 `aws/secretsmanager` key needs no grant on the caller; a customer-managed key
 does.
 
+The delivery statements hold the line where their services allow it, and say so
+where they do not:
+
+* **`ses:SendEmail`** is scoped to one identity ARN — the verified domain or
+  address the mail is sent *from*. A recipient is not an AWS resource, so the
+  sender identity is the only thing there is to scope, and scoped to it this
+  role can send as `no-reply@yourdomain` and as nothing else in the account.
+  One action: no `SendRawEmail` (the transport sends simple content),
+  no `SendTemplatedEmail` (templates render in-process), no `ListIdentities`.
+* **`sns:Publish`** cannot be scoped by `Resource` at all. Publishing to a phone
+  number has no ARN, so `Resource: "*"` is the only Resource form that grants it
+  — and that same statement would let the function publish to every SNS topic in
+  the account, including topics that feed a Lambda, a queue or a webhook. The
+  policy therefore uses `NotResource: arn:aws:sns:*:*:*`, which allows the action
+  against everything that is not an SNS topic: text messages to a handset, yes;
+  anything with a topic ARN, no.
+
+Both statements are absent from the role entirely unless their half is
+configured — `MailerFromAddress` for mail, `EnableSmsDelivery` for SMS.
+
+## Credential delivery
+
+Five routes mint something that has to reach a person: `/magic-link/send`,
+`/forgot-password`, `/send-verification-email`, `/change-email/request` and
+`/sms/send`. Mail goes through **Amazon SES v2**, text messages through an
+**SNS publish straight to the recipient's number**.
+
+| Parameter | Effect |
+|---|---|
+| `MailerFromAddress` | The `From` address, and the switch: empty wires no mail transport. It must be a verified SES identity in this region, or an address under a verified domain. |
+| `MailerFromName` | Display name on the `From` header, and the application name the built-in templates greet with. Empty falls back to the sender's domain. |
+| `MailerIdentity` | Which SES identity the IAM grant names. Defaults to the domain of `MailerFromAddress`. Set it when the *address* is what was verified rather than the domain. |
+| `MailerDefaultLang` | `en` or `it`; selects the built-in template set. |
+| `EnableSmsDelivery` | `true` wires SNS and grants `sns:Publish`. Off by default. |
+
+**Configure neither and nothing breaks.** `/magic-link/send` answers 500
+`EMAIL_NOT_CONFIGURED` and `/sms/send` answers 500 `SMS_NOT_CONFIGURED`, because
+neither can put the credential in its response body; the other three answer 200
+and mail nothing. That is what the reference does with no email block, and a
+deployment serving bearer clients that never touch those routes is unaffected.
+
+Two things about SMS are outside this stack and will bite otherwise: a new
+account is in the **SNS SMS sandbox** and can only text numbers it has verified,
+and stored numbers must be **E.164** (`+<country><number>`) — SNS routes nothing
+else, and the transport refuses a number without a `+` rather than letting SNS
+answer with a generic `InvalidParameter`.
+
+### Why the mailer endpoint in the environment is a placeholder
+
+`config-schema.md` §1.5 marks `email.mailer.endpoint` required, because in the
+reference a mailer *is* an HTTP endpoint you POST to with an `X-API-Key`. SES is
+neither: it is called through the AWS API and authorised by the execution role.
+So the template sets the required knob to a deliberately unreachable placeholder
+and the function reports it — along with `email.mailer.apiKey`, `sms.endpoint`,
+`sms.apiKey`, `sms.username` and `sms.password` — as a configured knob it cannot
+honour, by dotted path, in the cold-start log:
+
+```
+{"level":"WARN","msg":"configured knob is not wired to the auth core",
+ "path":"email.mailer.endpoint",
+ "problem":"this build delivers mail through Amazon SES, which is called through the AWS API and not by posting to a URL, …"}
+```
+
+Nothing is silently ignored, and no credential has to be invented: there is no
+mailer API key and no SMS gateway password in this stack, which also retires the
+credentials-in-URL hazard `config-schema.md` §1.6 records for the SMS gateway —
+there is no URL.
+
+The report also covers the case where a credential is set and its block is *not*.
+`email.mailer.apiKey`, `sms.apiKey`, `sms.username` and `sms.password` are the
+knobs that live in Secrets Manager, so they are the ones a hand-written
+environment carries; `email.mailer.from` and `sms.endpoint` are the switches, and
+they are the ones that get forgotten. Set a credential without its switch and
+delivery is simply off — so the log names the missing switch rather than only
+calling the credential unused:
+
+```
+{"level":"WARN","msg":"configured knob is not wired to the auth core",
+ "path":"sms.password",
+ "problem":"SNS authorises the call with the Lambda execution role's sns:Publish permission, …, and this deployment sends nothing through that half at all",
+ "remedy":"sms.endpoint is unset, so no SMS transport is wired at all and POST /sms/send answers 500 SMS_NOT_CONFIGURED: set it to turn SMS delivery on, or delete the credential"}
+```
+
 ## Cost at rest
 
 Idle, with no traffic and an empty table, this stack costs roughly **$0.80 a
