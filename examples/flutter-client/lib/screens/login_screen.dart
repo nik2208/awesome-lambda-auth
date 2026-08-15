@@ -1,7 +1,9 @@
 import 'package:awesome_node_auth_flutter/awesome_node_auth_flutter.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import '../config.dart';
+import '../open_url.dart';
 import 'register_screen.dart';
 
 /// Login con la sfida di secondo fattore.
@@ -126,12 +128,20 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
             child: const Text('Crea un account'),
           ),
-          if (DemoConfig.hasApk) ...[
+          // Qui e non solo a sessione aperta: chi vuole provare il ramo bearer
+          // deve poter prendere l'APK prima di autenticarsi, non dopo.
+          if (DemoConfig.hasApk && kIsWeb) ...[
             const Divider(height: 32),
             Text(
-              'Per provare il ramo bearer serve il build nativo: '
-              'l\'APK e\' scaricabile dalla pagina web del demo.',
+              'Il ramo bearer si prova col build nativo: stesso demo, stesso '
+              'backend, token al posto dei cookie.',
               style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () => openUrl(DemoConfig.apkUrl),
+              icon: const Icon(Icons.android),
+              label: const Text('Scarica l\'APK Android'),
             ),
           ],
           _errorText(),

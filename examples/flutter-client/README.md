@@ -29,6 +29,19 @@ L'APK lo costruisce [`.github/workflows/flutter-demo-apk.yml`](../../.github/wor
 
 Non è in Amplify perché l'immagine di build predefinita non ha l'SDK Android, e personalizzarla allungherebbe *ogni* build del web per un artefatto che cambia di rado.
 
+### Dove vive l'APK servito
+
+Il file sta **accanto al sito**, su `/app-release.apk` della stessa origin, non su un host esterno. Due motivi:
+
+- La richiesta era «scaricabile dalla pagina web stessa», e same-origin è letteralmente questo — nessun salto verso un altro dominio.
+- La regola di fallback SPA esclude già `.apk` fra le estensioni, quindi il file viene servito com'è (`application/vnd.android.package-archive`) invece di essere riscritto su `index.html`. **Se si tocca quella regola, va tenuta l'esclusione**, altrimenti il download restituisce silenziosamente HTML.
+
+Il workflow resta il percorso di build riproducibile e versionato; il file servito è una copia dello stesso artefatto.
+
+### Il permesso INTERNET
+
+`main/AndroidManifest.xml` dichiara `android.permission.INTERNET` a mano. Il template di Flutter lo mette solo nei manifest di debug e profile: un APK di release generato così com'è **non raggiungerebbe la rete**, e ogni chiamata di auth fallirebbe senza che sia ovvio il perché.
+
 ## Due difetti del client che questo demo ha fatto emergere
 
 Entrambi sono della stessa famiglia del campo `sub` mancante chiuso da [awesome-go-auth#46](https://github.com/nik2208/awesome-go-auth/pull/46): **un cast non-nullable su un campo che non arriva non degrada un client, lo termina.** Il demo li intercetta e li mostra, invece di morire.

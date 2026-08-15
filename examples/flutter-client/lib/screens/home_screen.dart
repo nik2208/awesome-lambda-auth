@@ -1,7 +1,9 @@
 import 'package:awesome_node_auth_flutter/awesome_node_auth_flutter.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import '../config.dart';
+import '../open_url.dart';
 
 /// Profilo, sessioni e iscrizione TOTP.
 ///
@@ -159,16 +161,21 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ),
-          if (DemoConfig.hasApk) ...[
+          // Il link compare solo sul web: su Android l'app *e'* gia' l'APK.
+          if (DemoConfig.hasApk && kIsWeb) ...[
             const SizedBox(height: 16),
             Card(
               child: ListTile(
                 leading: const Icon(Icons.android),
-                title: const Text('APK Android'),
+                title: const Text('Scarica l\'APK Android'),
                 subtitle: Text(
-                  'Stesso demo, trasporto bearer invece del cookie.',
+                  'Stesso demo, stesso backend, trasporto bearer invece del '
+                  'cookie. Serve consentire l\'installazione da origini '
+                  'sconosciute.',
                   style: small,
                 ),
+                trailing: const Icon(Icons.download),
+                onTap: () => openUrl(DemoConfig.apkUrl),
               ),
             ),
           ],
