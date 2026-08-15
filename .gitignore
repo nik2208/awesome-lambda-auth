@@ -1,7 +1,23 @@
-# Build artifacts (none yet — Phase 0 is docs-only)
+# Build artifacts
 dist/
 bin/
 *.zip
+
+# Esempi web: dipendenze e output di build, mai versionati.
+node_modules/
+.angular/
+out-tsc/
+.dart_tool/
+build/
+examples/flutter-client/.flutter-plugins-dependencies
+
+# I lockfile INVECE si versionano: sono progetti applicativi, non librerie, e
+# `amplify.yml` usa `npm ci`, che senza package-lock.json fallisce e basta.
+# Versionarli e' anche cio' che rende sensata l'affermazione "libreria
+# ufficiale non modificata": senza, la build risolve di nuovo il range e puo'
+# prendere una versione diversa da quella verificata.
+!examples/angular-client/package-lock.json
+!examples/flutter-client/pubspec.lock
 
 # Local env
 .env

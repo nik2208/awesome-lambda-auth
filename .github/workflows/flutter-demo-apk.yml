@@ -1,0 +1,100 @@
+# Costruisce l'APK Android del demo Flutter e lo pubblica come release asset.
+#
+# Perche' qui e non nella pipeline di Amplify: l'immagine di build predefinita
+# di Amplify non ha l'SDK Android, e personalizzarla allungherebbe *ogni* build
+# del web per un artefatto che cambia molto piu' di rado. Qui l'APK si
+# ricostruisce solo quando si tagga.
+#
+# L'APK e' il modo per esercitare il ramo **bearer** della libreria: fuori dal
+# browser non ci sono cookie, quindi il client manda `X-Auth-Strategy: bearer`
+# e tiene i token in `TokenStorage`. La scelta la fa un conditional import
+# dentro la libreria, non il codice del demo.
+name: flutter demo apk
+
+on:
+  push:
+    tags:
+      - 'flutter-demo-v*'
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: >-
+          Origin dello stack, senza barra finale (es. https://demo.esempio.it).
+          Se vuoto si usa la variabile di repository DEMO_BASE_URL.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/flutter-client
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Risolvi l'origin dello stack
+        id: origin
+        working-directory: .
+        env:
+          # Mai un dominio reale nel repo: arriva da una variabile di
+          # repository o dall'input manuale.
+          FROM_INPUT: ${{ inputs.base_url }}
+          FROM_VARS: ${{ vars.DEMO_BASE_URL }}
+        run: |
+          BASE="${FROM_INPUT:-$FROM_VARS}"
+          if [ -z "$BASE" ]; then
+            echo "::error::nessuna origin: imposta la variabile di repository DEMO_BASE_URL o passa base_url" >&2
+            exit 1
+          fi
+          BASE="${BASE%/}"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Origin: $BASE"
+
+      - run: flutter pub get
+
+      - run: flutter analyze
+
+      # Il prefisso e' ASSOLUTO, al contrario del build web: su nativo non c'e'
+      # una pagina da cui derivare un'origin, e il ramo bearer non ha comunque
+      # bisogno che sia la stessa del sito.
+      - name: Costruisci l'APK
+        run: |
+          flutter build apk --release \
+            --dart-define=AUTH_API_PREFIX='${{ steps.origin.outputs.base }}/auth'
+
+      - name: Pubblica come release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: examples/flutter-client/build/app/outputs/flutter-apk/app-release.apk
+          body: |
+            APK del demo Flutter, costruito contro `${{ steps.origin.outputs.base }}`.
+
+            Usa il trasporto **bearer**: fuori dal browser non ci sono cookie, quindi
+            il client manda `X-Auth-Strategy: bearer` e tiene i token in `TokenStorage`.
+            La versione web dello stesso demo usa invece il cookie di sessione.
+
+            Non firmato per la distribuzione: per installarlo va abilitata
+            l'installazione da origini sconosciute.
+
+      - name: Conserva l'APK anche senza tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: examples/flutter-client/build/app/outputs/flutter-apk/app-release.apk

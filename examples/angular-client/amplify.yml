@@ -1,0 +1,24 @@
+# Build spec per AWS Amplify Hosting, quando l'app e' collegata a un repo.
+# I deploy manuali (zip di dist/browser) non passano di qui, ma questo file e'
+# la definizione autorevole di come si costruisce il demo.
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        # `npm ci` e non `npm install`: la build deve usare le versioni
+        # bloccate, non risolvere di nuovo il range e prendere una libreria
+        # diversa da quella verificata.
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    # Il builder `application` di Angular mette gli asset del browser in
+    # dist/browser, non in dist.
+    baseDirectory: dist/browser
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*

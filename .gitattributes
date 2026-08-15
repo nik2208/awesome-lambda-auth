@@ -10,4 +10,9 @@ Dockerfile* text eol=lf
 *.yaml text eol=lf
 go.mod text eol=lf
 go.sum text eol=lf
+
+# Il wrapper Gradle del build Android e' uno script di shell eseguito dal
+# runner Linux della CI: con CRLF non parte.
+gradlew text eol=lf
+*.gradle text eol=lf
 *.go text eol=lf

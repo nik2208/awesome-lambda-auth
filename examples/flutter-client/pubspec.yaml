@@ -1,0 +1,24 @@
+name: awesome_lambda_auth_flutter_client
+description: >-
+  Demo che consuma il client Flutter ufficiale, non modificato, contro uno
+  stack awesome-lambda-auth. Su web usa il cookie di sessione, su Android il
+  bearer token: la scelta la fa la libreria, non questo codice.
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: '>=3.22.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Il pacchetto pubblicato, non un path locale: il senso del demo e' provare
+  # cio' che un utente scaricherebbe davvero.
+  awesome_node_auth_flutter: ^1.10.0
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
