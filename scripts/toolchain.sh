@@ -27,6 +27,9 @@ run_in_go_image() {
     -w /src \
     -e GOFLAGS \
     -e GOPROXY \
+    -e AWESOME_AUTH_CONTRACT_BASE_URL \
+    -e AWESOME_AUTH_CONTRACT_API_PREFIX \
+    -e AWESOME_AUTH_CONTRACT_REQUIRE \
     "$@"
 }
 
