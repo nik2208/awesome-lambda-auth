@@ -158,10 +158,20 @@ func init() {
 
 		Case{
 			Name: "forgot-password/unknown-address-is-a-plain-success",
-			Doc:  "§2 (forgot-password) — always 200 {\"success\":true}, whether or not the address exists, mailer or no mailer: explicit anti-enumeration",
+			Doc:  "§2 (forgot-password) — always 200 {\"success\":true}, whether or not the address exists, mailer or no mailer: explicit anti-enumeration; the optional emailLang body field is accepted and changes nothing on the wire",
 			Run: func(t *testing.T, e *Env) {
 				unknown := randomAccount()
 				e.NewClient().POST(t, "/forgot-password", body{"email": unknown.Email}).
+					mustSuccessOnly(t)
+
+				// emailLang is the optional field every mail route's body
+				// carries (§2, "Request body: {email, emailLang?}"); the
+				// served auth.js never sends it, the Angular and Flutter
+				// clients may. Accepted means the same plain success — not a
+				// validation error, not a different body — and it is asked
+				// about the same unknown address, so a deployment with a live
+				// sender still has nothing to send.
+				e.NewClient().POST(t, "/forgot-password", body{"email": unknown.Email, "emailLang": "it"}).
 					mustSuccessOnly(t)
 			},
 		},

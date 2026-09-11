@@ -142,6 +142,32 @@ cookie name-prefix rule, restated so it needs no configuration: a cookie that is
 bare. That is the same rule on every deployment, which is why the identical
 assertion holds on a hardened stack and on the demo over plain http.
 
+**The email flows need no mailer, and `…_REQUIRE` has no capability for one.**
+`cases_email_test.go` covers what a suite with no mailbox can see: the gates and
+shapes decided before a message would leave. They are deployment-dependent in
+the sense above — the answers hold whether or not the operator wired mail — but
+not forked: the reference's three token routes (`/forgot-password`,
+`/send-verification-email`, `/change-email/request`) check nothing about
+delivery and answer `200 {"success":true}` with or without a sender (§2, "Mailer
+dispatch order"), so there is no mailer branch to accept and nothing a mailer's
+absence could switch off. A `500` on those routes is a transport that failed
+after the token was stored — a fault, and the suite reports it as one. Only
+`/magic-link/send` and `/sms/send` refuse up front, and they keep their coded
+`…_NOT_CONFIGURED` branches in `cases_deployment_dependent_test.go`.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `verify-email/get-always-json` | `GET /verify-email?token=<never issued>` is `400 {"error":"Invalid verification token"}` with no `code`, as JSON for `Accept: application/json` *and* `Accept: text/html`; never a redirect, never markup (the static UI page fetches this route and renders the JSON) | — |
+| `change-email/request-requires-auth-and-csrf` | bare request → `403 {"error":"No access token provided"}` (no `code`); cookie session without `X-CSRF-Token` → `403 CSRF_INVALID`; both → `200 {"success":true}`, against a fresh address so the route's deliberate `409` oracle cannot fire | `csrf` |
+| `send-verification-email/requires-auth` | bare, body-less request → `403 {"error":"No access token provided"}` (no `code`), the way the Flutter client and the served `auth.js` call it | — |
+| `forgot-password/unknown-address-is-a-plain-success` | (extended) the optional `emailLang` body field is accepted: `{"email":…,"emailLang":"it"}` is the same plain `200 {"success":true}` | — |
+
+`me/known-gaps-against-the-reference` changed with awesome-go-auth v0.4.0: the
+profile now carries `loginProvider` unconditionally (`"local"` for a password
+account, the reference's `?? 'local'`), and the case that used to record its
+absence now fails on its absence. `role` stays presence-optional, as it is in
+the reference.
+
 ## Adding a case
 
 Adding a route to the covered surface is adding a `Case`, never editing the
@@ -177,12 +203,16 @@ and nothing here can be imported by it.
 ## Scope
 
 Covered: the contract hard points — cookie vs bearer mode, cookie names and
-attributes, CSRF double-submit, unwrapped `/me`, empty-body refresh, the
-`{sessions:[…]}` and `{linkedAccounts:[…]}` wrappers, `SESSION_REVOKED`, the
-TOTP round trip end to end, and the documented error shapes including the paths
-that carry no `code`.
+attributes, CSRF double-submit, unwrapped `/me` (with `loginProvider`),
+empty-body refresh, the `{sessions:[…]}` and `{linkedAccounts:[…]}` wrappers,
+`SESSION_REVOKED`, the TOTP round trip end to end, the documented error shapes
+including the paths that carry no `code`, and the mailbox-free half of the email
+flows: the auth and CSRF gates on `/change-email/request` and
+`/send-verification-email`, `GET /verify-email` answering JSON and never
+redirecting, `/forgot-password` accepting `emailLang`.
 
 Not covered: OAuth provider flows (they need a provider), the admin router, the
-tools/SSE router, and the email/SMS token round trips (the suite has no mailbox).
+tools/SSE router, and the email/SMS token round trips — a token minted by one
+route and spent by another — because the suite has no mailbox to read it from.
 Nothing stops a case being added for them the day the deployment has what they
 need.

@@ -81,7 +81,7 @@ func init() {
 
 		Case{
 			Name: "me/known-gaps-against-the-reference",
-			Doc:  "§3.4 — two documented profile fields this port does not send; asserted as they are so the gap cannot widen unnoticed, and so closing one fails here and prompts updating the register",
+			Doc:  "§3.4 — the profile fields whose presence this port once diverged on, asserted as they stand so a gap cannot widen or reopen unnoticed: `role` only when set (the reference drops an undefined role from the JSON too), `loginProvider` always, \"local\" for a password account — closed by awesome-go-auth v0.4.0, which this case recorded as absent until then",
 			Run: func(t *testing.T, e *Env) {
 				c, _ := e.LoginCookie(t)
 				r := c.GET(t, "/me")
@@ -99,12 +99,23 @@ func init() {
 					}
 				}
 
-				// `loginProvider` has no counterpart in the core's User model,
-				// so it is never sent. Both clients read it as `String?`, so
-				// this costs them nothing — but it is a real gap against the
-				// reference and stays visible here until a model field exists.
-				if _, ok := m["loginProvider"]; ok {
-					t.Errorf("profile now carries loginProvider — the gap this case records is closed, so update it and the deviation register\n  %s", r.where())
+				// `loginProvider` was the recorded gap: the core's User model
+				// had no such field, so the profile never carried it. Since
+				// awesome-go-auth v0.4.0 it is always emitted, defaulting to
+				// "local" exactly as the reference's `user.loginProvider ??
+				// 'local'` does (auth.router.ts:379, :666-668), and this
+				// suite provisions password accounts, so "local" is the only
+				// right answer here. Both clients read it as `String?`, so
+				// its absence never broke them — which is why it took a
+				// tripwire, not a bug report, to notice it was missing.
+				v, ok := m["loginProvider"]
+				if !ok {
+					t.Errorf("profile has no loginProvider; awesome-go-auth v0.4.0 emits it unconditionally, so its absence is a regression, got %v\n  %s",
+						keysOf(m), r.where())
+				} else if s, isString := v.(string); !isString {
+					t.Errorf("profile loginProvider = %#v, want a string\n  %s", v, r.where())
+				} else if s != "local" {
+					t.Errorf("profile loginProvider = %q for a password account, want \"local\" (the reference's `?? 'local'` default)\n  %s", s, r.where())
 				}
 			},
 		},

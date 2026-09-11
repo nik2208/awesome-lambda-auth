@@ -15,7 +15,7 @@ The stack deploys and the two official clients, unmodified, register, log in, re
 | Stores (`internal/store/dynamodb`) | users, sessions with refresh-token families, single-use tokens, TOTP, linked accounts, pending links, on one table with TTL |
 | Credential delivery (`internal/integration/aws`) | SES for mail, SNS for SMS, behind the core's sender seams; or a signed delivery webhook that takes every credential seam instead |
 | Email flows (`cmd/auth/email.go`) | `email.siteUrls` resolves every emailed link per request against the allowlist it forms with `http.cors.origins`; `email.templatesDir` seeds the template store from the artifact without ever overwriting a runtime edit — on the `memory` driver only, since the DynamoDB store has no template store yet |
-| Auth surface | every route `awesome-go-auth` mounts: register, login, refresh, logout, me, sessions, password and email flows, magic link, SMS OTP, TOTP, account linking |
+| Auth surface | every route `awesome-go-auth` mounts: register, login, refresh, logout, me (now carrying `loginProvider`), sessions, password and email flows, magic link, SMS OTP, TOTP, account linking |
 | Infrastructure (`infra/sam`) | HTTP API + Lambda (`provided.al2023`, arm64) + DynamoDB + Secrets Manager, deployed with the plain AWS CLI |
 | Contract suite (`test/contract`) | black-box, parametrised on a base URL, runs against this stack or the reference Express app |
 | Examples | `examples/angular-client` (ng-awesome-node-auth from npm) and `examples/flutter-client` (awesome_node_auth_flutter from pub.dev), unmodified |
