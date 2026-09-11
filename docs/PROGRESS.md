@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-P2-U … P5-U — upstream merged today: #47 .gitattributes, #48 parity table, #49 gateway mailer (1.4), #52 site URLs (1.1), #51 reserved claims + loginProvider (2.2), #50 delivery webhook (1.3), #53 AuthCodeStore (4.3), #54 wiretest conditional sets (4.0), #55 OAuth provider parity (3.1); main at `0b8b9c0`. Run interrupted by the API session limit at ~11:50 (four implementation agents died at start); resumed with a Workflow (`upstream-p2-p5-batch`, run `wf_de4aeaed-b8a`) that implements 1.2 template store, 2.3 claims helpers, 4.1 IdP signer, 3.2 profileMap and the TOTP-skew deviation for 2.1, each followed by an adversarial review and a fix pass. Next: commit/rebase/PR/merge each, tag v0.4.0 (after 1.2) and v0.5.0 (after 2.1, 2.3), then the P2-D product block.
+Upstream main `3d889c8`: eleven PRs merged today (#47–#57): line endings, parity table, gateway mailer (1.4), site URLs (1.1), reserved claims + loginProvider (2.2), delivery webhook (1.3), AuthCodeStore (4.3), wiretest conditional sets (4.0), OAuth provider parity (3.1), TwoFactorAppName + TOTP constants with two registered deviations (2.1), profileMap grammar + MapProfile (3.2). Workflow `upstream-batch-2` running: template store (1.2), claims helpers + webhook + Authenticate (2.3), adversarial review of the IdP signer (4.1). Then: tags v0.4.0 (after 1.2) and v0.5.0 (after 2.3), product P2-D block.
 
 ## Blocks
 
