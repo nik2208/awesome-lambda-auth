@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Upstream main `3d889c8`: eleven PRs merged today (#47–#57): line endings, parity table, gateway mailer (1.4), site URLs (1.1), reserved claims + loginProvider (2.2), delivery webhook (1.3), AuthCodeStore (4.3), wiretest conditional sets (4.0), OAuth provider parity (3.1), TwoFactorAppName + TOTP constants with two registered deviations (2.1), profileMap grammar + MapProfile (3.2). Workflow `upstream-batch-2` running: template store (1.2), claims helpers + webhook + Authenticate (2.3), adversarial review of the IdP signer (4.1). Then: tags v0.4.0 (after 1.2) and v0.5.0 (after 2.3), product P2-D block.
+Upstream: **v0.4.0** (email flows: #49, #50, #52, #58) and **v0.5.0** (claims and IdP signer: #51, #56, #59, #60) tagged 2026-09-11; main `719f812`. Batch 3 running as workflow `upstream-batch-3` (OAuth provisioning 3.3, JWKS well-known route 4.2, resource-server verifier 4.4, settings store 5.1). Product: pinned to v0.4.0 (`2e4bca8`, local); P2-D running as workflow `product-p2-email-flows` on worktrees `wt/lambda-email` (wiring + delivery tests adapted to the reference subjects), `wt/lambda-templates` (DynamoDB template store), `wt/lambda-contract` (contract cases, docs, loginProvider tripwire). Lesson recorded: a rebase can drop a CHANGELOG hunk into a released section when the context matches; check the [Unreleased] section after every rebase (fixed for 0.5.0 in `719f812`).
 
 ## Blocks
 
