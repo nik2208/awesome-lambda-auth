@@ -56,6 +56,11 @@ The ids below are `auth.CompatibilityNotes().KnownDeviations`; the full text of 
 - `cookie-max-age-follows-configured-ttl` — cookie `Max-Age` derives from the configured token TTLs instead of fixed values.
 - `totp-issuer-defaults-to-config-issuer` — the TOTP issuer label defaults to `Config.Issuer` (the reference falls back to the literal `awesome-node-auth`); `WithTwoFactorAppName` matches the reference exactly.
 - `totp-accepts-one-step-of-skew` — a TOTP code from the previous or next 30-second step is accepted; the reference (otplib `epochTolerance` 0) accepts the current step only. No knob exists to match it.
+- `config-require2fa-is-a-system-policy-term` — `Config.Require2FA` counts as a system policy alongside the settings store's `require2FA`, so `/2fa/disable` refuses on either; the reference reads the store alone.
+- `oauth-provisioning-is-a-policy-not-a-function` — provisioning is declared (`OAuthProvisioning`) rather than supplied as the reference's abstract `findOrCreateUser`, so the library decides create, link, refuse or conflict instead of delegating the whole question to the host.
+- `jwks-cors-wildcard-string-form` — `JWKSCORSOrigins` of exactly `[]string{"*"}` is the wildcard, where the reference treats any array as an allowlist and only the bare string `'*'` as the wildcard. The empty slice spells the reference's `['*']`.
+- `resource-server-gates-all-credential-routes` — resource-server mode unmounts the whole credential surface; the reference unmounts two routes and leaves the rest mounted to fail at runtime (`reference-issues.md` N26).
+- `jwks-unknown-kid-refetch-is-rate-limited` — an unknown `kid` triggers at most one JWKS refetch per `MinRefreshInterval`, so a token flood cannot turn the verifier into a client of its own issuer; the reference refetches on every unknown `kid`.
 
 ## Recording a new deviation
 
