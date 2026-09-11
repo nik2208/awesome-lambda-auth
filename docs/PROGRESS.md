@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-P2-U — upstream: #49 gateway mailer (1.4) merged `474b2b5`; #50 delivery webhook (1.3) and #51 reserved claims + loginProvider (2.2) open, CI running; 1.1 site URLs, 4.0 wiretest conditional sets and 4.3 AuthCodeStore in progress on worktrees `wt/goauth-*`; 1.2 template store queued behind 1.1. Note for 2.3: `/me` nests hook claims under `customClaims` while the reference spreads them top-level (unregistered difference).
+P2-U — upstream: merged #49 gateway mailer (1.4) `474b2b5`, #52 site URLs (1.1) `22705df`, #51 reserved claims + loginProvider (2.2) `04f7554`. Open: #50 delivery webhook (1.3), #53 AuthCodeStore (4.3), #54 wiretest conditional sets (4.0) — rebased on main, CI running. In progress on worktrees: 1.2 template store, 2.3 claims helpers + webhook + Service.Authenticate, 2.1 TwoFactorAppName, 3.1 OAuth provider parity. Note for 2.3/deviations: `/me` nests hook claims under `customClaims` while the reference spreads them top-level (unregistered difference).
 
 ## Blocks
 
