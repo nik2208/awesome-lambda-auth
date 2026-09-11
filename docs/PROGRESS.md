@@ -13,7 +13,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 - [x] H5 upstream PR #47 merged (`f332082`): `.gitattributes`, LF for container-read files
 - [x] H6 `.github/workflows/go.yml` + `scripts/check-artifact-size.sh`
 - [x] H7 README rewrite, this ledger, `spec/decisions.md`, product deviation register (`5e77c84`)
-- [~] H8 F1 re-check of the wire contract against the private `node-auth` line
+- [x] H8 F1 re-check done 2026-09-11: dev line `node-auth@e8af923` pinned, 7 wire-visible deltas noted in place, event emission map recorded (wire-contract §6 8), F1 closed, N41–N43 added
 - [x] H9 baseline: 41 contract cases green against the live stack, `REQUIRE=register,csrf,secure-cookies,sessions,totp`, 0 skips
 - [x] H10 upstream PR #48 merged (`a8b8e26`): truthful README parity table and roadmap
 
@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-H8 — spec re-check from the F1 delta (branch `docs/f1-recheck`). P2 upstream PRs 1.1, 1.3, 1.4 in progress on worktrees `wt/goauth-*`.
+P2-U — upstream: #49 gateway mailer (1.4) merged `474b2b5`; #50 delivery webhook (1.3) and #51 reserved claims + loginProvider (2.2) open, CI running; 1.1 site URLs, 4.0 wiretest conditional sets and 4.3 AuthCodeStore in progress on worktrees `wt/goauth-*`; 1.2 template store queued behind 1.1. Note for 2.3: `/me` nests hook claims under `customClaims` while the reference spreads them top-level (unregistered difference).
 
 ## Blocks
 
