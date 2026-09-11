@@ -137,8 +137,40 @@ func validateEmail(c *Config, d *diagnostics) {
 			emailAddress(d, "email.mailer.from", c.Email.Mailer.From)
 		}
 	}
-	if u := c.Email.DeliveryWebhook.URL; u != "" {
-		absoluteURL(d, "email.deliveryWebhook.url", u, true)
+	validateDeliveryWebhook(c, d)
+}
+
+// validateDeliveryWebhook: a delivery webhook is a url and a signing secret,
+// together or not at all.
+//
+// The body of every request it receives is a credential, so the secret is not
+// optional the way the reference's outbound-webhook secret is: an unsigned
+// receiver has no way to tell a replayed or forged delivery from a real one, and
+// would mint sessions for whoever posts to it. The check runs after the secrets
+// resolved, so it sees the value rather than the reference — a Secrets Manager
+// entry that exists but is empty is refused too.
+func validateDeliveryWebhook(c *Config, d *diagnostics) {
+	const secretPath = "email.deliveryWebhook.secret"
+	u := strings.TrimSpace(c.Email.DeliveryWebhook.URL)
+	if u == "" {
+		if c.Email.DeliveryWebhook.Secret.configured() {
+			d.errf("", "email.deliveryWebhook.url",
+				"email.deliveryWebhook.secret references a signing secret but no url is set, so nothing would ever be signed",
+				"set email.deliveryWebhook.url to the https receiver, or remove the secret reference")
+		}
+		return
+	}
+	// The origin-only variant, not the generic one: see absoluteURLOrigin.
+	absoluteURLOrigin(d, "email.deliveryWebhook.url", u, true)
+	positive(d, "email.deliveryWebhook.timeoutMs", c.Email.DeliveryWebhook.TimeoutMs)
+	if c.secretFailed(secretPath) {
+		// The resolution failure is already reported against the knob.
+		return
+	}
+	if c.SecretValue(secretPath) == "" {
+		d.errf("", secretPath,
+			"the delivery webhook has no signing secret, and every request to it carries a credential that an unsigned receiver cannot tell from a replay",
+			"reference it from a store -- "+secretPath+": {secretsManager: <id>} -- or set "+envNameFor(secretPath)+" for development")
 	}
 }
 
@@ -471,6 +503,33 @@ func absoluteURL(d *diagnostics, path, got string, requireHTTPS bool) {
 	if requireHTTPS && u.Scheme != "https" {
 		d.errf("", path,
 			fmt.Sprintf("%q does not use https", got),
+			"use an https URL; this value carries credentials or token material")
+	}
+}
+
+// absoluteURLOrigin is absoluteURL for a knob whose value must not be echoed
+// whole into a diagnostic.
+//
+// A cold-start failure is written to CloudWatch, and email.deliveryWebhook.url
+// is the one URL knob in the schema whose *path* may itself be a secret: a
+// receiver that cannot verify an HMAC signature is told to carry a capability
+// token in the path instead, which is why cmd/auth logs only the origin of it
+// (webhookOrigin, delivery.go). A refusal that printed the whole value would
+// undo that for exactly the deployments most likely to hit it. So https is
+// reported against the origin, and a value too malformed to have an origin is
+// reported without quoting it at all — there is nothing safe to quote and the
+// path already says which knob to look at.
+func absoluteURLOrigin(d *diagnostics, path, got string, requireHTTPS bool) {
+	u, err := url.Parse(got)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		d.errf("", path,
+			"the configured value is not an absolute URL (it is not repeated here: this knob's path may carry a capability token)",
+			"use a full URL including the scheme, e.g. https://hooks.example.com/auth-delivery")
+		return
+	}
+	if requireHTTPS && u.Scheme != "https" {
+		d.errf("", path,
+			fmt.Sprintf("%s does not use https", u.Scheme+"://"+u.Host),
 			"use an https URL; this value carries credentials or token material")
 	}
 }

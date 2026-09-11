@@ -52,7 +52,9 @@ Fails closed: a webhook error or timeout fails token issuance with `500 CLAIMS_W
 
 ## D-11 — Delivery webhook
 
-Synchronous within the request, bounded by `timeoutMs`, never fails the route. Moves to the SQS queue once the P7 event plane exists. Reversal cost: trivial.
+Synchronous within the request, bounded by `timeoutMs`. Moves to the SQS queue once the P7 event plane exists. Reversal cost: trivial.
+
+Amended when it was wired (P2): the failure contract is each seam's own rather than "never fails the route", because the seams do not agree and the webhook must not make them. `POST /forgot-password` answers 200 whatever the receiver does, as it does with every other sender; the other four surface the reference's generic 500 and leave the minted token stored. The webhook also takes *all five* credential seams when its url is set — SES and SNS are not called for those routes at all — and `email.deliveryWebhook.secret` is required alongside the url (config-schema.md §1.5 addendum).
 
 ## D-12 — `first-user` admin policy
 
@@ -73,3 +75,7 @@ Out of scope: absent from the reference, the specs and the clients. Reversal cos
 ## D-16 — Event plane
 
 The core `Service` publishes to the in-process bus; the tools facade subscribes to `*` and performs the reference's fan-out order (telemetry → bus → SSE → webhooks). The product plugs EventBridge or SNS as the transport and SQS as the webhook deliverer. Reversal cost: low.
+
+## D-17 — Templates from the artifact (2026-09-11)
+
+`email.templatesDir` is read once, at cold start, and seeds only the ids and UI pages the template store does not already hold; a template saved through the store wins over the file of the same id, on this and on every later cold start. A Lambda has no writable filesystem and no deploy step that runs code, so the artifact is the only place a shipped template can live and cold start the only moment it can be read — and a runtime edit has to survive the next redeploy, or the admin API would be undone by every cold start. A directory that is missing or unreadable refuses to start in production, where the artifact is supposed to contain what the document names, and warns in development. Registered as the product deviation `templates-dir-only-seeds-absent-ids`. Reversal cost: low — "the directory always wins" is one branch in `seedTemplates`, but it would make a runtime edit unstable, which is why it is not the default.

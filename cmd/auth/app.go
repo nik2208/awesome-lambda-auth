@@ -70,6 +70,13 @@ type Options struct {
 	// composition the binary would never build.
 	Mail auth.MailerTransport
 	SMS  auth.SMSTransport
+
+	// HTTPClient issues every outbound HTTP request this binary makes on a
+	// route's behalf — today the delivery webhook. Nil, the zero value, is
+	// http.DefaultClient. Injected so a test can point the webhook at a TLS
+	// httptest server it trusts; like Mail and SMS, injecting it switches
+	// nothing on.
+	HTTPClient *http.Client
 }
 
 // App is one cold start's worth of state.
@@ -172,13 +179,22 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// Credential delivery. Built before the core because every sender option is
 	// derived from it, and it performs no I/O: both AWS clients are deferred to
 	// the first message actually sent (delivery.go).
-	deliver, err := newDelivery(cfg, opts.Mail, opts.SMS, log)
+	deliver, err := newDelivery(cfg, opts.Mail, opts.SMS, opts.HTTPClient, log)
 	if err != nil {
 		return nil, err
 	}
 
 	coreOpts := coreOptions(cfg, users, sessions, log)
 	coreOpts = append(coreOpts, deliveryOptions(deliver, log)...)
+	// The email flows: site URLs and the template store, seeded from the
+	// artifact. This is the one option set that can do I/O at cold start —
+	// reading email.templatesDir — and the one that can refuse for a store
+	// the driver lacks.
+	emailOpts, err := emailOptions(ctx, cfg, users, deliver, log)
+	if err != nil {
+		return nil, err
+	}
+	coreOpts = append(coreOpts, emailOpts...)
 	coreOpts = append(coreOpts, oauthOptions(cfg, users, deliver, log)...)
 
 	core, err := auth.New(coreOpts...)
@@ -324,14 +340,27 @@ type oauthStoreProvider interface {
 	PendingLinks() auth.PendingLinkStore
 }
 
-// oauthOptions wires the two OAuth stores when the driver has them and the
-// operator asked for them.
+// oauthOptions wires the OAuth side of the core: the site URL and origin
+// allowlist its redirects resolve against, and the two account-linking stores
+// when the driver has them and the operator asked for them.
 //
-// Each is gated on its own stores.enable key, which is the mechanism the schema
-// already defines for exactly this: "a disabled store makes its feature routes and
-// admin tabs absent, exactly as an absent injected store does in the reference"
-// (config.StoreEnable). With a key off, its routes answer NOT_IMPLEMENTED, which
-// is the truth rather than a silent 500.
+// The wiring is always present, because two of its fields are not about OAuth
+// at all. OAuthWiring.SiteURL is the core's override for the default site URL
+// and OAuthWiring.AllowedOrigins joins Config.SiteURLs in its origin allowlist
+// (Auth.ResolveSiteURL, wire.go) — the same two values every emailed link is
+// built from. Both come from siteURLs in email.go, so an emailed link and an
+// OAuth redirect cannot resolve a request's origin differently, which is how
+// the reference arranges it too (one allowedOrigins, one getDefaultSiteUrl).
+// Setting SiteURL here is also what makes the canonical fallback
+// deployment.publicUrl when email.siteUrls is empty: the core's own default is
+// the first allowlisted entry, and the auth service's origin is not one.
+//
+// The stores are each gated on their own stores.enable key, which is the
+// mechanism the schema already defines for exactly this: "a disabled store
+// makes its feature routes and admin tabs absent, exactly as an absent injected
+// store does in the reference" (config.StoreEnable). With a key off, or with a
+// driver that has no view for it, the store is nil and its routes answer
+// NOT_IMPLEMENTED, which is the truth rather than a silent 500.
 //
 // OAuthWiring.Service stays nil on purpose. The provider registry comes from the
 // oauth.* configuration block, which internal/config/phases.go still refuses as a
@@ -340,39 +369,35 @@ type oauthStoreProvider interface {
 // The four account-linking routes need no provider registry and work as soon as
 // the stores are here.
 func oauthOptions(cfg *config.Config, users auth.UserStore, deliver *delivery, log *slog.Logger) []auth.Option {
-	provider, ok := users.(oauthStoreProvider)
-	if !ok {
-		return nil
-	}
+	canonical, allowlist := siteURLs(cfg)
 	wiring := auth.OAuthWiring{
-		// The redirect allowlist and the fallback origin the emailed link points
-		// at. Both come from blocks P1 already wires, so neither drags the oauth
-		// domain in.
-		AllowedOrigins: cfg.HTTP.CORS.Origins,
-		SiteURL:        cfg.Deployment.PublicURL,
+		AllowedOrigins: allowlist,
+		SiteURL:        canonical,
 	}
-	if cfg.Stores.Enable.LinkedAccounts {
-		wiring.LinkedAccounts = provider.LinkedAccounts()
+	if provider, ok := users.(oauthStoreProvider); ok {
+		if cfg.Stores.Enable.LinkedAccounts {
+			wiring.LinkedAccounts = provider.LinkedAccounts()
+		}
+		if cfg.Stores.Enable.PendingLinks {
+			wiring.PendingLinks = provider.PendingLinks()
+		}
 	}
-	if cfg.Stores.Enable.PendingLinks {
-		wiring.PendingLinks = provider.PendingLinks()
-	}
-	if wiring.LinkedAccounts == nil && wiring.PendingLinks == nil {
-		return nil
-	}
-	// DeliverLinkToken used to be unconditionally absent, and the log line here
-	// said so. It is wired now whenever a mail transport exists, so POST
+	// DeliverLinkToken is wired whenever a mail transport exists, so POST
 	// /link-request sends the verification mail instead of storing a token
-	// nobody receives. With no mailer it is still nil, and the route still
-	// answers success without sending anything — which is what the reference
-	// does with no transport configured, so the fallback is not a degradation
-	// but the unconfigured behaviour.
+	// nobody receives. With no mailer it is nil, and the route still answers
+	// success without sending anything — which is what the reference does with
+	// no transport configured, so the fallback is not a degradation but the
+	// unconfigured behaviour. The delivery webhook has no seam for this mail
+	// (auth.DeliveryWebhook posts the five credential kinds and nothing else),
+	// so a webhook-only deployment is in the "none" branch here.
 	delivery := "none — POST /link-request stores the token and answers success without sending mail"
 	if deliver != nil && deliver.mail != nil {
 		wiring.DeliverLinkToken = deliver.deliverLinkToken
 		delivery = "ses"
 	}
-	log.Info("oauth account-linking stores wired",
+	log.Info("oauth wiring",
+		slog.String("siteUrl", canonical),
+		slog.Int("allowedOrigins", len(allowlist)),
 		slog.Bool("linkedAccounts", wiring.LinkedAccounts != nil),
 		slog.Bool("pendingLinks", wiring.PendingLinks != nil),
 		slog.String("linkTokenDelivery", delivery))
@@ -386,6 +411,14 @@ func oauthOptions(cfg *config.Config, users auth.UserStore, deliver *delivery, l
 // carries when an operator changes security.jwt.accessTokenTtl. The cookie
 // *name* prefix is likewise derived by the core (CookieOptions.CookieName) and
 // is not a knob in either layer.
+//
+// UIEnabled is the one field that reaches an emailed link: with it set, the
+// core's UILink points a link at <site><prefix>/ui/<path> — the hosted UI's
+// page for it — instead of at the bare API route (buildUiLink,
+// auth.router.ts:261-271). It follows ui.enabled, which phases.go still refuses
+// as a P6 domain, so today it is always false and every link points at the API
+// route; wiring it now means the link shape and the UI switch cannot drift
+// apart when the UI lands.
 func httpConfig(cfg *config.Config) auth.HTTPConfig {
 	return auth.HTTPConfig{
 		APIPrefix: cfg.HTTP.APIPrefix,
@@ -396,7 +429,8 @@ func httpConfig(cfg *config.Config) auth.HTTPConfig {
 			Domain:           cfg.Cookies.Domain,
 			RefreshTokenPath: cfg.Cookies.RefreshTokenPath,
 		},
-		CSRF: auth.CSRFConfig{Enabled: cfg.Security.CSRF.Enabled},
+		CSRF:      auth.CSRFConfig{Enabled: cfg.Security.CSRF.Enabled},
+		UIEnabled: cfg.UI.Enabled,
 	}
 }
 
@@ -442,11 +476,7 @@ func defaultStoreFactory(ctx context.Context, cfg *config.Config, log *slog.Logg
 		log.Warn("using the in-memory store: state is per execution environment and is lost on every cold start",
 			slog.String("path", "stores.driver"))
 		logDeviations(log, nil)
-		return memoryStoreBundle{
-			MemoryUserStore: auth.NewMemoryUserStore(),
-			links:           auth.NewMemoryLinkedAccounts(),
-			pending:         auth.NewMemoryPendingLinks(),
-		}, auth.NewMemorySessionStore(), nil
+		return newMemoryStoreBundle(), auth.NewMemorySessionStore(), nil
 
 	default:
 		return nil, nil, fmt.Errorf("stores.driver: %q is not implemented in this build; use %q or %q",
@@ -454,9 +484,10 @@ func defaultStoreFactory(ctx context.Context, cfg *config.Config, log *slog.Logg
 	}
 }
 
-// memoryStoreBundle is the in-memory user store plus the two OAuth stores the
-// core cannot find by type assertion, so that the development driver reaches the
-// account-linking routes the same way the DynamoDB one does.
+// memoryStoreBundle is the in-memory user store plus the stores the core cannot
+// find by type assertion — the two OAuth stores and the template store — so
+// that the development driver reaches the account-linking routes and the
+// stored templates the same way the DynamoDB one does.
 //
 // The embedded pointer is what keeps the rest working: every optional interface
 // the core *does* discover on the user store — MagicLinkStore, SMSStore,
@@ -464,12 +495,26 @@ func defaultStoreFactory(ctx context.Context, cfg *config.Config, log *slog.Logg
 // cannot quietly narrow the feature set.
 type memoryStoreBundle struct {
 	*auth.MemoryUserStore
-	links   auth.LinkedAccountStore
-	pending auth.PendingLinkStore
+	links     auth.LinkedAccountStore
+	pending   auth.PendingLinkStore
+	templates auth.TemplateStore
+}
+
+// newMemoryStoreBundle is the one place the development driver's bundle is
+// assembled, shared by defaultStoreFactory and the test harness so the two
+// cannot drift into different compositions.
+func newMemoryStoreBundle() memoryStoreBundle {
+	return memoryStoreBundle{
+		MemoryUserStore: auth.NewMemoryUserStore(),
+		links:           auth.NewMemoryLinkedAccounts(),
+		pending:         auth.NewMemoryPendingLinks(),
+		templates:       auth.NewMemoryTemplateStore(),
+	}
 }
 
 func (m memoryStoreBundle) LinkedAccounts() auth.LinkedAccountStore { return m.links }
 func (m memoryStoreBundle) PendingLinks() auth.PendingLinkStore     { return m.pending }
+func (m memoryStoreBundle) Templates() auth.TemplateStore           { return m.templates }
 
 // driverStores lists the stores.enable.<store> keys each driver can actually
 // back. A key that is enabled and absent from its driver's set is a knob that
@@ -483,16 +528,28 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// the four single-use token stores, TOTPStore, LinkedAccountStore and
 		// PendingLinkStore. Everything else is deliberately absent — see that
 		// package's interfaces.go.
+		//
+		// "templates" is absent on purpose: this build's DynamoDB store has no
+		// TemplateStore view at all, so stores.enable.templates on this driver
+		// is refused here, early and by name, rather than reaching emailOptions'
+		// structural assertion. That also makes email.templatesDir — for which
+		// rule STORE requires stores.enable.templates — a memory-driver-only
+		// feature in this build, which docs/config-reference.md §5.3 says out
+		// loud. The DynamoDB TemplateStore lands on its own branch; adding it
+		// to this set is that branch's first line.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true,
 		}, true
 	case config.StoreDriverMemory:
-		// awesome-go-auth ships MemoryLinkedAccounts and MemoryPendingLinks, so the
-		// development driver backs the same two keys.
+		// awesome-go-auth ships MemoryLinkedAccounts, MemoryPendingLinks and
+		// MemoryTemplateStore, and newMemoryStoreBundle hangs all three off the
+		// user store, so the development driver backs one key more than the
+		// production one: "templates". It is the only driver in this build that
+		// does, which is why emailOptions' refusal names the driver.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
-			"linkedAccounts": true, "pendingLinks": true,
+			"linkedAccounts": true, "pendingLinks": true, "templates": true,
 		}, true
 	default:
 		return nil, false
@@ -688,8 +745,19 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 // the report has to replace it, or an SMS gateway password in the environment
 // buys total silence: no mail, no text, no warning, and a 500 on the first
 // /sms/send that nothing in the log accounts for.
+//
+// Every one of those sentences changes when email.deliveryWebhook.url is set,
+// so each message that asserts something about what does or does not get
+// delivered branches on webhookConfigured. Under a webhook the five credential
+// seams are the webhook's (deliveryOptions), SES carries at most the
+// email-changed notice and the account-linking mail, and SNS carries nothing at
+// all — so "no mail is sent" and "POST /sms/send answers 500
+// SMS_NOT_CONFIGURED" would both be false. A wrong line here is worse than no
+// line: this report is the product's own anti-silent-misconfiguration
+// mechanism, and an operator who acts on it has no second source.
 func deliveryKnobGaps(cfg *config.Config) []knobGap {
 	var gaps []knobGap
+	hook := webhookConfigured(cfg)
 
 	// The credentials, reported wherever they appear. Each one names the switch
 	// its block is missing when the block is off, because "this key is unused"
@@ -703,12 +771,22 @@ func deliveryKnobGaps(cfg *config.Config) []knobGap {
 		// to move them off, so the hazard retires with the credential.
 		smsHazard = " — which also retires the credentials-in-URL hazard the schema records for it, since there is no URL"
 	)
+	// The "the block is off" texts, in the two postures. Without a webhook,
+	// switching the block off means the credential is not delivered at all and
+	// the route answers a coded 500; with one, the webhook already carries every
+	// credential and the block is genuinely optional, so telling an operator to
+	// set the switch would be telling them to wire a transport they do not need.
 	smsOff := "sms.endpoint is unset, so no SMS transport is wired at all and POST /sms/send answers 500 SMS_NOT_CONFIGURED: set it to turn SMS delivery on, or delete the credential"
+	mailOff := "email.mailer.from is unset, so no mail transport is wired at all and no mail is sent: set it to turn mail delivery on, or delete the key"
+	if hook {
+		smsOff = "sms.endpoint is unset, so no SNS transport is wired, but the delivery webhook carries the SMS code instead and POST /sms/send works: delete the credential, or set sms.endpoint only if you want the email-changed half of this document to be portable to a port that has no webhook"
+		mailOff = "email.mailer.from is unset, so no SES transport is wired, but the delivery webhook carries all five credential deliveries instead: delete the key, or set email.mailer.from only to turn on the two mails the webhook has no seam for — the email-changed notice and the account-linking mail"
+	}
 	for _, row := range []struct{ path, service, action, hazard, on, off string }{
 		{
 			path: "email.mailer.apiKey", service: "SES", action: "ses:SendEmail",
 			on:  "Deleting the secret it points at costs nothing here, and removes one credential from the blast radius",
-			off: "email.mailer.from is unset, so no mail transport is wired at all and no mail is sent: set it to turn mail delivery on, or delete the key",
+			off: mailOff,
 		},
 		{
 			path: "sms.apiKey", service: "SNS", action: "sns:Publish", hazard: smsHazard,
@@ -747,11 +825,20 @@ func deliveryKnobGaps(cfg *config.Config) []knobGap {
 	if mailOn {
 		const sesRemedy = "leave it set if the same document is deployed to another port in the family; nothing in this build reads it"
 
+		// What SES actually carries, which is the whole mailer only without a
+		// webhook. Under one it carries the two mails auth.DeliveryWebhook has no
+		// seam for, and saying "this build delivers mail through Amazon SES"
+		// would tell an operator the reset mail went out by mail when it did not.
+		sesCarries := "this build delivers mail through Amazon SES"
+		if hook {
+			sesCarries = "email.deliveryWebhook.url is set, so the five credential deliveries are POSTed to that receiver and Amazon SES carries only the email-changed notice and the account-linking mail"
+		}
+
 		// Always present when the mailer is on: validate.go requires an endpoint
 		// for any configured mailer block, and SES never has one.
 		gaps = append(gaps, knobGap{
 			Path:    "email.mailer.endpoint",
-			Problem: "this build delivers mail through Amazon SES, which is called through the AWS API and not by posting to a URL, so no request is ever made to this endpoint",
+			Problem: sesCarries + "; either way SES is called through the AWS API and not by posting to a URL, so no request is ever made to this endpoint",
 			Remedy:  sesRemedy + ". The schema requires it, which is why configuring a mailer at all means configuring one",
 		})
 		// provider is free-form in the schema and the reference passes it to its
@@ -760,7 +847,7 @@ func deliveryKnobGaps(cfg *config.Config) []knobGap {
 		if p := strings.TrimSpace(cfg.Email.Mailer.Provider); p != "" && !strings.EqualFold(p, "ses") {
 			gaps = append(gaps, knobGap{
 				Path:    "email.mailer.provider",
-				Problem: fmt.Sprintf("mail is delivered through Amazon SES and there is no second transport to select, so the configured provider %q selects nothing", p),
+				Problem: fmt.Sprintf("%s, and there is no second mail transport to select, so the configured provider %q selects nothing", sesCarries, p),
 				Remedy:  `set it to "ses" to describe what is actually deployed, or remove it`,
 			})
 		}
@@ -769,10 +856,30 @@ func deliveryKnobGaps(cfg *config.Config) []knobGap {
 	if smsOn {
 		const snsRemedy = "leave it set if the same document is deployed to another port in the family; nothing in this build reads it"
 
+		// Without a webhook the knob still has one job — it is the switch that
+		// wires SNS at all. With one it has none: the SMS code is POSTed to the
+		// receiver whether or not this block is configured, and SNS publishes
+		// nothing.
+		problem := "this build sends text messages with an SNS Publish to the recipient's number, so no request is ever made to this gateway; the knob's only remaining job is to say that SMS delivery should be wired at all"
+		remedy := snsRemedy + ", and keep it set: an empty sms block leaves POST /sms/send answering 500 SMS_NOT_CONFIGURED"
+		if hook {
+			problem = "email.deliveryWebhook.url is set, so the SMS code is POSTed to that receiver and nothing is published through SNS: no request is made to this gateway either, and the knob has no remaining job in this deployment"
+			remedy = snsRemedy + ". Removing the whole sms block changes nothing here — POST /sms/send keeps working through the webhook — so keep it only for a document that is also deployed without one"
+		}
+		gaps = append(gaps, knobGap{Path: "sms.endpoint", Problem: problem, Remedy: remedy})
+	}
+
+	// The delivery webhook's secret is the same shape of hazard as the four
+	// credentials above: a Secrets Manager entry the template carries, whose
+	// switch — the url — is the part that gets forgotten. A secret *referenced*
+	// from the document without a url is refused by validate.go; a value that
+	// arrived through its plain environment variable leaves no reference to
+	// refuse, so it is reported here instead of being silently unused.
+	if cfg.SecretValue("email.deliveryWebhook.secret") != "" && strings.TrimSpace(cfg.Email.DeliveryWebhook.URL) == "" {
 		gaps = append(gaps, knobGap{
-			Path:    "sms.endpoint",
-			Problem: "this build sends text messages with an SNS Publish to the recipient's number, so no request is ever made to this gateway; the knob's only remaining job is to say that SMS delivery should be wired at all",
-			Remedy:  snsRemedy + ", and keep it set: an empty sms block leaves POST /sms/send answering 500 SMS_NOT_CONFIGURED",
+			Path:    "email.deliveryWebhook.secret",
+			Problem: "the delivery webhook's signing secret resolves to a value, but email.deliveryWebhook.url is unset, so no webhook is wired and the secret signs nothing; credentials go through SES and SNS as if it were absent",
+			Remedy:  "set email.deliveryWebhook.url to the https receiver that should get every delivery, or delete the secret",
 		})
 	}
 

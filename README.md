@@ -13,13 +13,14 @@ The stack deploys and the two official clients, unmodified, register, log in, re
 | Event normalisation (`internal/lambdahttp`) | API Gateway HTTP v2 and REST v1, Function URL, ALB; multi-cookie round trips tested per shape |
 | Declarative configuration (`internal/config`) | JSON document + `AWESOME_AUTH_*` environment, refuse-to-start rules RS-1…RS-12, secrets from Secrets Manager → SSM → env |
 | Stores (`internal/store/dynamodb`) | users, sessions with refresh-token families, single-use tokens, TOTP, linked accounts, pending links, on one table with TTL |
-| Credential delivery (`internal/integration/aws`) | SES for mail, SNS for SMS, behind the core's sender seams |
+| Credential delivery (`internal/integration/aws`) | SES for mail, SNS for SMS, behind the core's sender seams; or a signed delivery webhook that takes every credential seam instead |
+| Email flows (`cmd/auth/email.go`) | `email.siteUrls` resolves every emailed link per request against the allowlist it forms with `http.cors.origins`; `email.templatesDir` seeds the template store from the artifact without ever overwriting a runtime edit — on the `memory` driver only, since the DynamoDB store has no template store yet |
 | Auth surface | every route `awesome-go-auth` mounts: register, login, refresh, logout, me, sessions, password and email flows, magic link, SMS OTP, TOTP, account linking |
 | Infrastructure (`infra/sam`) | HTTP API + Lambda (`provided.al2023`, arm64) + DynamoDB + Secrets Manager, deployed with the plain AWS CLI |
 | Contract suite (`test/contract`) | black-box, parametrised on a base URL, runs against this stack or the reference Express app |
 | Examples | `examples/angular-client` (ng-awesome-node-auth from npm) and `examples/flutter-client` (awesome_node_auth_flutter from pub.dev), unmodified |
 
-Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `email.siteUrls`, `email.templatesDir`, `email.deliveryWebhook`, `twoFactor`, `security.jwt.extraClaims`, `security.jwt.claimsWebhook`, `oauth`, `idProvider`, `resourceServer`, `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it.
+Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `twoFactor`, `security.jwt.extraClaims`, `security.jwt.claimsWebhook`, `oauth`, `idProvider`, `resourceServer`, `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it. The whole `email` domain now loads: `email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the last three to leave that list. One of them is not yet deployable — `email.templatesDir` needs a template store, which only the development `memory` driver provides in this build, so on `dynamodb` it refuses to start rather than seeding nothing ([docs/config-reference.md](docs/config-reference.md) §5.3).
 
 ## Configuration
 
@@ -30,7 +31,7 @@ Two sources, layered:
 
 Secrets are never values in the document. A secret-tagged knob is a reference (`{"secretsManager": "<arn>#<jsonKey>"}`, `{"ssmParameter": "<name>"}`, or its environment variable), resolved at cold start in that order; the template passes them as `AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER` and friends. A plaintext secret in the document refuses to start.
 
-The schema, every default with its reference citation, and the refuse-to-start rules are in [docs/spec/config-schema.md](docs/spec/config-schema.md).
+What the binary reads, in the order it reads it, plus the `email` domain knob by knob, is in [docs/config-reference.md](docs/config-reference.md). The schema behind it — every default with its reference citation, and the refuse-to-start rules — is in [docs/spec/config-schema.md](docs/spec/config-schema.md).
 
 ## Toolchain
 

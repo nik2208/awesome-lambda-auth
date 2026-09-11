@@ -245,6 +245,7 @@ func secretSlots(c *Config) []secretSlot {
 		{"security.jwt.accessTokenSecret", "AWESOME_AUTH_JWT_ACCESS_SECRET", func(c *Config) Secret { return c.Security.JWT.AccessTokenSecret }},
 		{"security.jwt.refreshTokenSecret", "AWESOME_AUTH_JWT_REFRESH_SECRET", func(c *Config) Secret { return c.Security.JWT.RefreshTokenSecret }},
 		{"email.mailer.apiKey", "AWESOME_AUTH_MAILER_API_KEY", func(c *Config) Secret { return c.Email.Mailer.APIKey }},
+		{"email.deliveryWebhook.secret", "AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET", func(c *Config) Secret { return c.Email.DeliveryWebhook.Secret }},
 		{"sms.apiKey", "AWESOME_AUTH_SMS_API_KEY", func(c *Config) Secret { return c.SMS.APIKey }},
 		{"sms.username", "AWESOME_AUTH_SMS_USERNAME", func(c *Config) Secret { return c.SMS.Username }},
 		{"sms.password", "AWESOME_AUTH_SMS_PASSWORD", func(c *Config) Secret { return c.SMS.Password }},

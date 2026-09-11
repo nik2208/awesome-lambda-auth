@@ -57,7 +57,7 @@ Metadata:
       - Label: {default: Credential delivery}
         Parameters: [MailerFromAddress, MailerFromName, MailerIdentity, MailerDefaultLang, EnableSmsDelivery]
       - Label: {default: Email flows}
-        Parameters: [EmailSiteUrls, EmailDeliveryWebhookUrl]
+        Parameters: [EmailSiteUrls, EmailDeliveryWebhookUrl, EmailDeliveryWebhookSecretArn]
       - Label: {default: Configuration document}
         Parameters: [ConfigFile]
       - Label: {default: Storage}
@@ -283,8 +283,25 @@ Parameters:
     Description: >-
       AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL — an https endpoint that receives a
       signed JSON copy of every credential delivery (kind, recipient, link or
-      code) instead of, or in addition to, SES and SNS. Empty disables it. Set it
-      only for a receiver you control: it is handed the credentials.
+      code) INSTEAD OF SES and SNS: with this set, all five credential seams go
+      here and nothing is mailed or texted for them. Empty disables it. Set it
+      only for a receiver you control: it is handed the credentials, and
+      EmailDeliveryWebhookSecretArn is required with it.
+
+  EmailDeliveryWebhookSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    Description: >-
+      ARN of an existing Secrets Manager secret holding the key that signs every
+      delivery webhook request (X-Webhook-Signature: sha256=<hex HMAC-SHA256 of
+      the body>). REQUIRED whenever EmailDeliveryWebhookUrl is set, and refused
+      without it: every request carries a credential, so a receiver that cannot
+      verify the signature cannot tell a replay or a forgery from a real
+      delivery. Nothing is generated for you here — the receiver has to be
+      configured with the same key, which only you can do. Append #<jsonKey> to
+      select one key of a JSON secret document. The function reads it at cold
+      start; the value never enters the template.
 
   # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
@@ -382,6 +399,7 @@ Conditions:
   HasCookieDomain: !Not [!Equals [!Ref CookieDomain, '']]
   HasEmailSiteUrls: !Not [!Equals [!Ref EmailSiteUrls, '']]
   HasDeliveryWebhook: !Not [!Equals [!Ref EmailDeliveryWebhookUrl, '']]
+  HasDeliveryWebhookSecret: !Not [!Equals [!Ref EmailDeliveryWebhookSecretArn, '']]
   HasConfigFile: !Not [!Equals [!Ref ConfigFile, '']]
   # A named stage on the raw execute-api URL puts /<stage> in front of every
   # path the browser sees, so the Path-scoped refresh cookie has to match.
@@ -683,6 +701,15 @@ Resources:
           # --- email flows -----------------------------------------------
           AWESOME_AUTH_EMAIL_SITE_URLS: !If [HasEmailSiteUrls, !Ref EmailSiteUrls, !Ref 'AWS::NoValue']
           AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL: !If [HasDeliveryWebhook, !Ref EmailDeliveryWebhookUrl, !Ref 'AWS::NoValue']
+          # A REFERENCE, like the signing secrets below and for the same reason:
+          # the _SECRETSMANAGER suffix means "this names a Secrets Manager
+          # secret" and the function fetches the value itself at cold start. The
+          # bare AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET, which holds the key
+          # in plaintext, is development-only and deliberately not set here.
+          AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET_SECRETSMANAGER: !If
+            - HasDeliveryWebhookSecret
+            - !Ref EmailDeliveryWebhookSecretArn
+            - !Ref 'AWS::NoValue'
 
           # --- configuration document ------------------------------------
           # A path inside the artifact, never a value: the document is part of
@@ -813,6 +840,25 @@ Resources:
                 - !If [GenerateSigningSecrets, !Ref JwtSigningSecrets, !Ref 'AWS::NoValue']
                 - !If [GenerateJwtAccessSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtAccessSecretArn]]]
                 - !If [GenerateJwtRefreshSecret, !Ref 'AWS::NoValue', !Select [0, !Split ['#', !Ref JwtRefreshSecretArn]]]
+
+        # -----------------------------------------------------------------
+        # The delivery webhook's signing key, present only when one was named
+        # and scoped to that one ARN — the '#<jsonKey>' selector stripped,
+        # because the selector is the function's and the resource is the
+        # secret. A separate statement rather than a fourth entry above so
+        # that a stack with no webhook grants nothing for it.
+        # -----------------------------------------------------------------
+        - !If
+          - HasDeliveryWebhookSecret
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadDeliveryWebhookSigningSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Select [0, !Split ['#', !Ref EmailDeliveryWebhookSecretArn]]
+          - !Ref 'AWS::NoValue'
 
         # -----------------------------------------------------------------
         # Credential delivery. Two statements, each present only when its half

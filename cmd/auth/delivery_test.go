@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,10 +31,19 @@ import (
 const (
 	testMailerFrom     = "no-reply@example.test"
 	testMailerFromName = "Example App"
-	// The base every emailed link must be built under: deployment.publicUrl
-	// (baseEnv) plus http.apiPrefix. No knob of its own — see newDelivery.
+	// The base every emailed link must be built under: the canonical site URL
+	// — deployment.publicUrl (baseEnv) with no email.siteUrls to override it —
+	// plus http.apiPrefix. See siteURLs in email.go and newDelivery here.
 	testLinkBase = "https://auth.example.test/auth"
 	testPhone    = "+15550100"
+
+	// The delivery webhook of the tests that only need one configured. Nothing
+	// is ever posted to it: the tests that post replace the url with an
+	// httptest receiver's (webhookEnv).
+	testWebhookURL = "https://delivery.example.test/hook"
+	// Long enough to be a plausible signing key and distinctive enough that a
+	// log assertion searching for it cannot match by accident.
+	testWebhookSecret = "delivery-webhook-signing-secret-0123456789"
 )
 
 // fakeMailer is an auth.MailerTransport that records instead of sending. err,
@@ -123,6 +133,23 @@ func smsEnv(base map[string]string) map[string]string {
 	return with(base, "AWESOME_AUTH_SMS_ENDPOINT", "https://sms.example.test/send")
 }
 
+// webhookEnv turns the delivery webhook on the way the schema requires it: the
+// receiver's url and the secret that signs every request together, because
+// internal/config refuses either without the other — the body of each request
+// is a credential, so an unsigned receiver cannot tell a replay from a real
+// delivery (validateDeliveryWebhook).
+//
+// url is a parameter rather than a constant because the tests that actually
+// post point it at an httptest receiver whose address is only known at run
+// time; testWebhookURL is for the ones that only care that a webhook is
+// configured.
+func webhookEnv(base map[string]string, url string, extra ...string) map[string]string {
+	return with(with(base,
+		"AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL", url,
+		"AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET", testWebhookSecret,
+	), extra...)
+}
+
 type deliveryApp struct {
 	app  *App
 	mail *fakeMailer
@@ -132,8 +159,16 @@ type deliveryApp struct {
 
 func newDeliveryApp(t *testing.T, env map[string]string) *deliveryApp {
 	t.Helper()
+	return newDeliveryAppWith(t, env, nil)
+}
+
+// newDeliveryAppWith is newDeliveryApp with a hook on the Options, for the
+// tests that inject a store bundle of their own or the HTTP client a TLS test
+// receiver trusts.
+func newDeliveryAppWith(t *testing.T, env map[string]string, adjust func(*Options)) *deliveryApp {
+	t.Helper()
 	d := &deliveryApp{mail: &fakeMailer{}, sms: &fakeSMS{}, log: &bytes.Buffer{}}
-	app, err := New(context.Background(), Options{
+	opts := Options{
 		Getenv: envFunc(env),
 		// Debug, and captured: half the assertions below are about what does
 		// NOT appear in this buffer.
@@ -141,7 +176,11 @@ func newDeliveryApp(t *testing.T, env map[string]string) *deliveryApp {
 		Stores: memoryStores,
 		Mail:   d.mail,
 		SMS:    d.sms,
-	})
+	}
+	if adjust != nil {
+		adjust(&opts)
+	}
+	app, err := New(context.Background(), opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -260,6 +299,51 @@ func TestUnconfiguredDeliveryKeepsTheReferenceBehaviour(t *testing.T) {
 	}
 }
 
+// The subjects of the reference's built-in templates (awesome-node-auth
+// src/services/mailer.service.ts:19-127), which awesome-go-auth v0.4.0 renders
+// verbatim. They are pinned as literals rather than read back from the core,
+// because the claim under test is that a mailbox cannot tell the two ports
+// apart — and a test that asked the core what it renders would pass whatever
+// it rendered.
+const (
+	subjectPasswordResetEN = "Reset your password"
+	subjectPasswordResetIT = "Reimposta la tua password"
+	subjectMagicLinkEN     = "Your magic sign-in link"
+	subjectVerifyEmailEN   = "Verify your email address"
+	subjectVerifyEmailIT   = "Verifica il tuo indirizzo email"
+	subjectEmailChangedEN  = "Your email address has been updated"
+)
+
+// assertRenderedMail is what every mail this port sends must satisfy: the
+// reference's subject for its template, HTML marked as such, a text
+// alternative that carries the same link, and a non-empty token in that link.
+// It returns the link.
+func assertRenderedMail(t *testing.T, msg auth.MailMessage, wantSubject, wantPath string) string {
+	t.Helper()
+	if msg.Subject != wantSubject {
+		t.Errorf("Subject = %q, want the reference's %q — the wrong template, or the wrong locale, was rendered", msg.Subject, wantSubject)
+	}
+	if !msg.IsHTML {
+		t.Errorf("message is not marked HTML, so SES would send the markup as plain text")
+	}
+	link := linkIn(t, msg.Body)
+	if !strings.HasPrefix(link, wantPath+"?token=") {
+		t.Errorf("link = %q, want it under %q", link, wantPath)
+	}
+	if tokenIn(t, link) == "" {
+		t.Errorf("link %q carries an empty token", link)
+	}
+	// v0.4.0 fills the plain-text alternative from the reference's text
+	// template; a transport that sends multipart needs it, and it must carry
+	// the same link as the HTML or a text-only mailbox gets a different token.
+	if msg.Text == "" {
+		t.Errorf("MailMessage.Text is empty; the core fills it from the text template and SES should send it as the plain-text part")
+	} else if !strings.Contains(msg.Text, link) {
+		t.Errorf("the text alternative does not carry the HTML link %q:\n%s", link, msg.Text)
+	}
+	return link
+}
+
 // TestConfiguredMailerWiresEveryMailRoute is the positive half of the gating,
 // and the per-flow template assertion in one pass: each route must render its
 // own template and build its link under the configured base.
@@ -270,42 +354,45 @@ func TestConfiguredMailerWiresEveryMailRoute(t *testing.T) {
 	token := d.register(t, owner)
 
 	cases := []struct {
-		name      string
-		path      string
-		body      string
-		headers   map[string]string
-		wantTo    string
-		wantPath  string
-		wantInSub string
+		name        string
+		path        string
+		body        string
+		headers     map[string]string
+		wantTo      string
+		wantPath    string
+		wantSubject string
 	}{
 		{
-			name:      "magic-link/send",
-			path:      "/auth/magic-link/send",
-			body:      fmt.Sprintf(`{"email":%q}`, owner),
-			headers:   jsonHeaders(),
-			wantTo:    owner,
-			wantPath:  testLinkBase + auth.MagicLinkVerifyPath,
-			wantInSub: "Magic Link",
+			name:        "magic-link/send",
+			path:        "/auth/magic-link/send",
+			body:        fmt.Sprintf(`{"email":%q}`, owner),
+			headers:     jsonHeaders(),
+			wantTo:      owner,
+			wantPath:    testLinkBase + auth.MagicLinkVerifyPath,
+			wantSubject: subjectMagicLinkEN,
 		},
 		{
-			name:      "forgot-password",
-			path:      "/auth/forgot-password",
-			body:      fmt.Sprintf(`{"email":%q}`, owner),
-			headers:   jsonHeaders(),
-			wantTo:    owner,
-			wantPath:  testLinkBase + auth.PasswordResetPath,
-			wantInSub: "Password Reset",
+			name:        "forgot-password",
+			path:        "/auth/forgot-password",
+			body:        fmt.Sprintf(`{"email":%q}`, owner),
+			headers:     jsonHeaders(),
+			wantTo:      owner,
+			wantPath:    testLinkBase + auth.PasswordResetPath,
+			wantSubject: subjectPasswordResetEN,
 		},
 		{
 			// The one message that does NOT go to the account's own address:
 			// this mail verifies that the new mailbox exists, so it goes there.
-			name:      "change-email/request",
-			path:      "/auth/change-email/request",
-			body:      `{"newEmail":"moved@example.test"}`,
-			headers:   bearer(token),
-			wantTo:    "moved@example.test",
-			wantPath:  testLinkBase + auth.EmailChangeConfirmPath,
-			wantInSub: "Confirm Email Change",
+			// It renders the verify-email template under the confirmation link,
+			// which is what the reference's /change-email/request sends
+			// (auth.router.ts:1027-1032): there is no email-change template.
+			name:        "change-email/request",
+			path:        "/auth/change-email/request",
+			body:        `{"newEmail":"moved@example.test"}`,
+			headers:     bearer(token),
+			wantTo:      "moved@example.test",
+			wantPath:    testLinkBase + auth.EmailChangeConfirmPath,
+			wantSubject: subjectVerifyEmailEN,
 		},
 	}
 
@@ -322,24 +409,40 @@ func TestConfiguredMailerWiresEveryMailRoute(t *testing.T) {
 			if msg.To != tc.wantTo {
 				t.Errorf("To = %q, want %q", msg.To, tc.wantTo)
 			}
-			if !msg.IsHTML {
-				t.Errorf("message is not marked HTML, so SES would send the markup as plain text")
-			}
-			if !strings.HasPrefix(msg.Subject, testMailerFromName) {
-				t.Errorf("Subject %q does not begin with the app name from email.mailer.fromName", msg.Subject)
-			}
-			if !strings.Contains(msg.Subject, tc.wantInSub) {
-				t.Errorf("Subject = %q, want it to name this flow (%q) — the wrong template was rendered", msg.Subject, tc.wantInSub)
-			}
-			link := linkIn(t, msg.Body)
-			if !strings.HasPrefix(link, tc.wantPath+"?token=") {
-				t.Errorf("link = %q, want it under %q — the base is deployment.publicUrl + http.apiPrefix", link, tc.wantPath)
-			}
-			if tokenIn(t, link) == "" {
-				t.Errorf("link %q carries an empty token", link)
-			}
+			assertRenderedMail(t, msg, tc.wantSubject, tc.wantPath)
 		})
 	}
+
+	// The sixth seam: confirming the change mails the OLD address a notice
+	// with the new address in it and no link (auth.router.ts:1060-1066).
+	t.Run("change-email/confirm notifies the old address", func(t *testing.T) {
+		d.mail.reset()
+		resp := invoke(t, d.app, http.MethodPost, "/auth/change-email/request", bearer(token), nil, `{"newEmail":"moved@example.test"}`)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("change-email/request status = %d (body %s)", resp.StatusCode, resp.Body)
+		}
+		pending := tokenIn(t, linkIn(t, d.mail.only(t).Body))
+		d.mail.reset()
+
+		confirm := invoke(t, d.app, http.MethodPost, "/auth/change-email/confirm",
+			jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, fmt.Sprintf(`{"token":%q}`, pending))
+		if confirm.StatusCode != http.StatusOK {
+			t.Fatalf("change-email/confirm status = %d (body %s)", confirm.StatusCode, confirm.Body)
+		}
+		notice := d.mail.only(t)
+		if notice.To != owner {
+			t.Errorf("the notice went to %q, want the old address %q", notice.To, owner)
+		}
+		if notice.Subject != subjectEmailChangedEN {
+			t.Errorf("Subject = %q, want %q", notice.Subject, subjectEmailChangedEN)
+		}
+		if !strings.Contains(notice.Body, "moved@example.test") || !strings.Contains(notice.Text, "moved@example.test") {
+			t.Errorf("the notice does not name the new address in both bodies:\n%s\n%s", notice.Body, notice.Text)
+		}
+		if strings.Contains(notice.Body, "?token=") {
+			t.Errorf("the notice carries a token link, but it confirms nothing:\n%s", notice.Body)
+		}
+	})
 }
 
 // TestVerificationEmailUsesItsOwnTemplate is the fifth sender, and it is driven
@@ -357,7 +460,7 @@ func TestVerificationEmailUsesItsOwnTemplate(t *testing.T) {
 	t.Parallel()
 
 	mailer := &fakeMailer{}
-	core, users := newDeliveryCore(t, mailerEnv(baseEnv()), mailer, nil)
+	core, users := newDeliveryCore(t, mailerEnv(baseEnv()), mailer, nil, nil)
 
 	user, err := users.CreateUser(context.Background(), auth.User{
 		Email:           "unverified@example.test",
@@ -377,13 +480,7 @@ func TestVerificationEmailUsesItsOwnTemplate(t *testing.T) {
 	if msg.To != user.Email {
 		t.Errorf("To = %q, want %q", msg.To, user.Email)
 	}
-	if !strings.Contains(msg.Subject, "Verify Your Email") {
-		t.Errorf("Subject = %q, want the verify_email template's", msg.Subject)
-	}
-	link := linkIn(t, msg.Body)
-	if !strings.HasPrefix(link, testLinkBase+auth.EmailVerificationPath+"?token=") {
-		t.Errorf("link = %q, want it under %q", link, testLinkBase+auth.EmailVerificationPath)
-	}
+	assertRenderedMail(t, msg, subjectVerifyEmailEN, testLinkBase+auth.EmailVerificationPath)
 
 	// And the failure contract: a transport error is the generic 500 here, not a
 	// swallow, and the token survives it — the link above still verifies.
@@ -403,14 +500,14 @@ func TestVerificationEmailUsesItsOwnTemplate(t *testing.T) {
 // newDeliveryCore composes the same auth core cmd/auth builds — coreOptions plus
 // deliveryOptions — over a memory store the caller keeps a handle on. It exists
 // for the flows that cannot be reached over the wire in this build.
-func newDeliveryCore(t *testing.T, env map[string]string, mail auth.MailerTransport, sms auth.SMSTransport) (*auth.Auth, *auth.MemoryUserStore) {
+func newDeliveryCore(t *testing.T, env map[string]string, mail auth.MailerTransport, sms auth.SMSTransport, client *http.Client) (*auth.Auth, *auth.MemoryUserStore) {
 	t.Helper()
 
 	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(env)})
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
-	deliver, err := newDelivery(cfg, mail, sms, discardLogger())
+	deliver, err := newDelivery(cfg, mail, sms, client, discardLogger())
 	if err != nil {
 		t.Fatalf("newDelivery: %v", err)
 	}
@@ -500,7 +597,7 @@ func TestResetTokenFromTheMailIsAcceptedByTheResetRoute(t *testing.T) {
 func TestLocaleComesFromTheMailerBlock(t *testing.T) {
 	t.Parallel()
 
-	cases := map[string]string{"it": "Reimposta Password", "en": "Password Reset", "de": "Password Reset"}
+	cases := map[string]string{"it": subjectPasswordResetIT, "en": subjectPasswordResetEN, "de": subjectPasswordResetEN}
 	for lang, want := range cases {
 		t.Run(lang, func(t *testing.T) {
 			t.Parallel()
@@ -516,11 +613,11 @@ func TestLocaleComesFromTheMailerBlock(t *testing.T) {
 					baseURL:   testLinkBase,
 					locale:    lang,
 				}
-				subject, _, err := d.templates.Render(d.locale, "reset_password", auth.MailTemplateData{})
+				subject, _, err := d.templates.Render(d.locale, auth.TemplatePasswordReset, auth.MailTemplateData{})
 				if err != nil {
 					t.Fatalf("Render: %v", err)
 				}
-				if !strings.Contains(subject, want) {
+				if subject != want {
 					t.Errorf("subject = %q, want the English fallback %q", subject, want)
 				}
 				return
@@ -536,8 +633,25 @@ func TestLocaleComesFromTheMailerBlock(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("forgot-password status = %d (body %s)", resp.StatusCode, resp.Body)
 			}
-			if got := d.mail.only(t).Subject; !strings.Contains(got, want) {
+			if got := d.mail.only(t).Subject; got != want {
 				t.Errorf("subject = %q, want it rendered in %q (%q)", got, lang, want)
+			}
+
+			// The request's emailLang wins over the block's default for that one
+			// mail (resolveLang, mailer.service.ts:255-259): the other language
+			// on the same deployment.
+			other, otherWant := "it", subjectPasswordResetIT
+			if lang == "it" {
+				other, otherWant = "en", subjectPasswordResetEN
+			}
+			d.mail.reset()
+			resp = invoke(t, d.app, http.MethodPost, "/auth/forgot-password", jsonHeaders(), nil,
+				fmt.Sprintf(`{"email":%q,"emailLang":%q}`, owner, other))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("forgot-password status = %d (body %s)", resp.StatusCode, resp.Body)
+			}
+			if got := d.mail.only(t).Subject; got != otherWant {
+				t.Errorf("subject with emailLang=%q = %q, want %q", other, got, otherWant)
 			}
 		})
 	}
@@ -747,6 +861,93 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 			t.Errorf("a delivered credential appears in the cold-start log:\n%s", out)
 		}
 	}
+
+	// The delivery webhook is the same claim over a different transport, and it
+	// adds one of its own: the receiver is handed every credential this
+	// deployment mints, so the whole request body is a secret — and so is the
+	// key that signs it, which the webhook branch is the only thing in the
+	// binary to hold.
+	t.Run("delivery webhook", func(t *testing.T) {
+		t.Parallel()
+		rec := newWebhookReceiver(t)
+		hooked := newDeliveryAppWith(t, webhookEnv(baseEnv(), rec.srv.URL),
+			func(o *Options) { o.HTTPClient = rec.srv.Client() })
+		const owner = "quiet-hook@example.test"
+		token := hooked.register(t, owner)
+
+		if resp := invoke(t, hooked.app, http.MethodPost, "/auth/add-phone", bearer(token), nil,
+			fmt.Sprintf(`{"phoneNumber":%q}`, testPhone)); resp.StatusCode != http.StatusOK {
+			t.Fatalf("add-phone status = %d (body %s)", resp.StatusCode, resp.Body)
+		}
+		// Both halves again: a receiver that answers, and one that is gone —
+		// the failing case is when this binary writes the most about delivery.
+		for _, failing := range []bool{false, true} {
+			if failing {
+				rec.srv.Close()
+			}
+			for _, tc := range []struct {
+				path, body string
+				headers    map[string]string
+			}{
+				{"/auth/magic-link/send", fmt.Sprintf(`{"email":%q}`, owner), jsonHeaders()},
+				{"/auth/forgot-password", fmt.Sprintf(`{"email":%q}`, owner), jsonHeaders()},
+				{"/auth/change-email/request", `{"newEmail":"quieter-hook@example.test"}`, bearer(token)},
+				{"/auth/sms/send", fmt.Sprintf(`{"email":%q}`, owner), jsonHeaders()},
+			} {
+				invoke(t, hooked.app, http.MethodPost, tc.path, tc.headers, nil, tc.body)
+			}
+		}
+
+		out := hooked.log.String()
+		if out == "" {
+			t.Fatal("nothing was logged at all, so this test proves nothing")
+		}
+		posted := rec.deliveries()
+		if len(posted) == 0 {
+			t.Fatal("no delivery was captured, so this test proves nothing")
+		}
+		for _, delivery := range posted {
+			if strings.Contains(out, string(delivery.body)) {
+				t.Errorf("a posted delivery body appears in the log:\n%s", out)
+			}
+			assertWebhookPayload(t, delivery.request.Kind, delivery.request.Delivery)
+			for _, credential := range credentialsIn(t, delivery) {
+				if strings.Contains(out, credential) {
+					t.Errorf("the %s credential appears in the log:\n%s", delivery.request.Kind, out)
+				}
+			}
+		}
+		// The signing secret is the credential this branch adds. It arrives
+		// through a plain environment variable here, is never sent to the
+		// receiver, and must not be written either.
+		if strings.Contains(out, testWebhookSecret) {
+			t.Errorf("the delivery webhook's signing secret appears in the log:\n%s", out)
+		}
+	})
+}
+
+// credentialsIn pulls the token or code out of one posted delivery, whatever
+// kind it is, so the log assertion can search for the exact strings that were
+// handed to the receiver.
+func credentialsIn(t *testing.T, delivery webhookDelivery) []string {
+	t.Helper()
+	var payload struct {
+		Token string `json:"token"`
+		Code  string `json:"code"`
+	}
+	if err := json.Unmarshal(delivery.request.Delivery, &payload); err != nil {
+		t.Fatalf("decode %s delivery: %v", delivery.request.Kind, err)
+	}
+	var out []string
+	for _, credential := range []string{payload.Token, payload.Code} {
+		if credential != "" {
+			out = append(out, credential)
+		}
+	}
+	if len(out) == 0 {
+		t.Errorf("the %s delivery carried no credential at all", delivery.request.Kind)
+	}
+	return out
 }
 
 // TestDeliveryKnobGapsAreReported: every knob of the two blocks that describes
@@ -800,6 +1001,66 @@ func TestDeliveryKnobGapsAreReported(t *testing.T) {
 			t.Errorf("unconfigured delivery still reported %s", gap.Path)
 		}
 	}
+
+	// The same knobs under a delivery webhook. Every message here asserts
+	// something about what is and is not delivered, and the webhook takes all
+	// five credential seams — so "no mail transport is wired at all and no mail
+	// is sent", "POST /sms/send answers 500 SMS_NOT_CONFIGURED" and "this build
+	// delivers mail through Amazon SES" all become false. A wrong line is worse
+	// than no line: this report is the only notice an operator gets that a knob
+	// is inert, and they have nothing to check it against.
+	t.Run("under a delivery webhook", func(t *testing.T) {
+		t.Parallel()
+
+		gapsFor := func(t *testing.T, env map[string]string) map[string]knobGap {
+			t.Helper()
+			cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(env)})
+			if err != nil {
+				t.Fatalf("config.Load: %v", err)
+			}
+			if !webhookConfigured(cfg) {
+				t.Fatal("the webhook is not configured, so this subtest proves nothing")
+			}
+			out := map[string]knobGap{}
+			for _, gap := range unwiredKnobs(cfg) {
+				out[gap.Path] = gap
+			}
+			return out
+		}
+
+		// Both blocks on, plus a webhook: SES then carries only the two mails
+		// the webhook has no seam for, and SNS carries nothing.
+		blocksOn := gapsFor(t, webhookEnv(env, testWebhookURL))
+		// Only the credentials set, plus a webhook: the blocks are off, but
+		// unlike the no-webhook case that is no longer "nothing is delivered".
+		credentialsOnly := gapsFor(t, webhookEnv(with(baseEnv(),
+			"AWESOME_AUTH_MAILER_API_KEY", "mailer-key",
+			"AWESOME_AUTH_SMS_API_KEY", "sms-key"), testWebhookURL))
+
+		for _, tc := range []struct {
+			gaps           map[string]knobGap
+			path, unwanted string
+		}{
+			{blocksOn, "email.mailer.endpoint", "this build delivers mail through Amazon SES"},
+			{blocksOn, "sms.endpoint", "500 SMS_NOT_CONFIGURED"},
+			{credentialsOnly, "email.mailer.apiKey", "no mail is sent"},
+			{credentialsOnly, "sms.apiKey", "500 SMS_NOT_CONFIGURED"},
+		} {
+			gap, ok := tc.gaps[tc.path]
+			if !ok {
+				t.Errorf("unwiredKnobs did not report %s, so a configured knob is silently inert", tc.path)
+				continue
+			}
+			said := gap.Problem + " " + gap.Remedy
+			if strings.Contains(said, tc.unwanted) {
+				t.Errorf("the %s gap still says %q, which is false when a delivery webhook is carrying the credentials:\n%s\n%s",
+					tc.path, tc.unwanted, gap.Problem, gap.Remedy)
+			}
+			if !strings.Contains(strings.ToLower(said), "webhook") {
+				t.Errorf("the %s gap never mentions the webhook that is actually delivering:\n%s\n%s", tc.path, gap.Problem, gap.Remedy)
+			}
+		}
+	})
 }
 
 // TestDeliveryCredentialsWithoutTheirBlockAreStillReported is the loud half of
@@ -911,16 +1172,22 @@ func TestMailerAppName(t *testing.T) {
 func TestDeliveryGatingIsConfigDriven(t *testing.T) {
 	t.Parallel()
 
+	// Option counts: the four mail seams plus the email-changed notice for a
+	// mailer, one for SMS, five for a webhook (which takes every credential
+	// seam) plus the notice when a mailer is also on.
 	cases := []struct {
-		name              string
-		env               map[string]string
-		wantMail, wantSMS bool
-		wantOptions       int
+		name                           string
+		env                            map[string]string
+		wantMail, wantSMS, wantWebhook bool
+		wantOptions                    int
 	}{
-		{"neither block", baseEnv(), false, false, 0},
-		{"mailer only", mailerEnv(baseEnv()), true, false, 4},
-		{"sms only", smsEnv(baseEnv()), false, true, 1},
-		{"both", smsEnv(mailerEnv(baseEnv())), true, true, 5},
+		{"neither block", baseEnv(), false, false, false, 0},
+		{"mailer only", mailerEnv(baseEnv()), true, false, false, 5},
+		{"sms only", smsEnv(baseEnv()), false, true, false, 1},
+		{"both", smsEnv(mailerEnv(baseEnv())), true, true, false, 6},
+		{"webhook only", webhookEnv(baseEnv(), testWebhookURL), false, false, true, 5},
+		{"webhook and sms", webhookEnv(smsEnv(baseEnv()), testWebhookURL), false, true, true, 5},
+		{"webhook and mailer", webhookEnv(mailerEnv(baseEnv()), testWebhookURL), true, false, true, 6},
 	}
 
 	for _, tc := range cases {
@@ -932,7 +1199,7 @@ func TestDeliveryGatingIsConfigDriven(t *testing.T) {
 			}
 			// Both transports are injected in every case; only the configuration
 			// decides whether they are used.
-			d, err := newDelivery(cfg, &fakeMailer{}, &fakeSMS{}, discardLogger())
+			d, err := newDelivery(cfg, &fakeMailer{}, &fakeSMS{}, nil, discardLogger())
 			if err != nil {
 				t.Fatalf("newDelivery: %v", err)
 			}
@@ -941,6 +1208,9 @@ func TestDeliveryGatingIsConfigDriven(t *testing.T) {
 			}
 			if (d.sms != nil) != tc.wantSMS {
 				t.Errorf("sms transport present = %v, want %v", d.sms != nil, tc.wantSMS)
+			}
+			if (d.webhook != nil) != tc.wantWebhook {
+				t.Errorf("delivery webhook present = %v, want %v", d.webhook != nil, tc.wantWebhook)
 			}
 			if got := len(deliveryOptions(d, discardLogger())); got != tc.wantOptions {
 				t.Errorf("deliveryOptions returned %d options, want %d", got, tc.wantOptions)
@@ -1009,11 +1279,14 @@ func TestLinkTokenMailReusesTheVerificationTemplate(t *testing.T) {
 	if msg.To != "linked@example.test" {
 		t.Errorf("To = %q", msg.To)
 	}
-	if !strings.Contains(msg.Subject, "Verify Your Email") {
-		t.Errorf("Subject = %q, want the verification template's — the reference mails link tokens through its verification sender", msg.Subject)
+	if msg.Subject != subjectVerifyEmailEN {
+		t.Errorf("Subject = %q, want the verification template's %q — the reference mails link tokens through its verification sender", msg.Subject, subjectVerifyEmailEN)
 	}
 	if got := linkIn(t, msg.Body); got != linkURL {
 		t.Errorf("link = %q, want the URL upstream built (%q); this sender must not rebuild it", got, linkURL)
+	}
+	if !strings.Contains(msg.Text, linkURL) {
+		t.Errorf("the text alternative does not carry the link:\n%s", msg.Text)
 	}
 
 	mailer.reset()
@@ -1022,7 +1295,30 @@ func TestLinkTokenMailReusesTheVerificationTemplate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("deliverLinkToken: %v", err)
 	}
-	if got := mailer.only(t).Subject; !strings.Contains(got, "Verifica Email") {
-		t.Errorf("Subject = %q, want the emailLang override honoured", got)
+	if got := mailer.only(t).Subject; got != subjectVerifyEmailIT {
+		t.Errorf("Subject = %q, want the emailLang override honoured (%q)", got, subjectVerifyEmailIT)
+	}
+
+	// A stored override of the verify-email id applies to this mail too: the
+	// closure renders outside a service call, so it has to be handed the store
+	// rather than find it on the context, and emailOptions does exactly that.
+	store := auth.NewMemoryTemplateStore()
+	html, text := `<p>STORED <a href="{{link}}">{{link}}</a></p>`, "STORED {{link}}"
+	if _, err := store.UpdateMailTemplate(context.Background(), auth.TemplateVerifyEmail, auth.MailTemplatePatch{
+		BaseHTML: &html, BaseText: &text,
+		Translations: map[string]map[string]string{"en": {"subject": "Stored subject"}},
+	}); err != nil {
+		t.Fatalf("UpdateMailTemplate: %v", err)
+	}
+	d.templates.Store = store
+	mailer.reset()
+	if err := d.deliverLinkToken(context.Background(), auth.LinkTokenDelivery{
+		Email: "linked@example.test", Token: "abc", URL: linkURL,
+	}); err != nil {
+		t.Fatalf("deliverLinkToken: %v", err)
+	}
+	stored := mailer.only(t)
+	if stored.Subject != "Stored subject" || !strings.Contains(stored.Body, "STORED") || linkIn(t, stored.Body) != linkURL {
+		t.Errorf("the stored verify-email template was not used for the link-token mail: subject %q body %q", stored.Subject, stored.Body)
 	}
 }

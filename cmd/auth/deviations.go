@@ -69,6 +69,21 @@ func WireDeviations() []WireDeviation {
 				"stack the store is the only place the theft can be acted on.",
 			Spec: "docs/spec/data-model.md §4.3; docs/spec/decisions.md D-7 (signed off 2026-09-11)",
 		},
+		{
+			ID:      "templates-dir-only-seeds-absent-ids",
+			Surface: "email.templatesDir, and the body and subject of every mail rendered from a stored template",
+			Behaviour: "The directory is read once, at cold start, and writes only the template ids " +
+				"and UI pages the template store does not already hold; a template saved " +
+				"through the store wins over the file of the same id, on every cold start.",
+			Reference: "There is no templates directory: config.templateStore is the only " +
+				"override source and its contents come from whoever writes to it " +
+				"(src/interfaces/template-store.interface.ts:13-43, memory-template.store.ts).",
+			Why: "A Lambda has no writable filesystem and no deploy step that runs code, so " +
+				"the artifact is the only place a shipped template can live and cold start " +
+				"the only moment it can be read; and a runtime edit must survive the next " +
+				"redeploy, or the admin API would be undone by every cold start.",
+			Spec: "docs/spec/config-schema.md §1.5, §3.8 and §3.10; docs/spec/decisions.md D-17",
+		},
 	}
 }
 

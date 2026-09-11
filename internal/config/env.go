@@ -184,6 +184,7 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_MAILER_DEFAULT_LANG", "email.mailer.defaultLang", func(c *Config, v string) { c.Email.Mailer.DefaultLang = v }),
 		envString("AWESOME_AUTH_EMAIL_VERIFICATION_MODE", "email.verification.mode", func(c *Config, v string) { c.Email.Verification.Mode = v }),
 		envString("AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL", "email.deliveryWebhook.url", func(c *Config, v string) { c.Email.DeliveryWebhook.URL = v }),
+		envInt("AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_TIMEOUT_MS", "email.deliveryWebhook.timeoutMs", func(c *Config, v int) { c.Email.DeliveryWebhook.TimeoutMs = v }),
 
 		// §1.6 SMS
 		envString("AWESOME_AUTH_SMS_ENDPOINT", "sms.endpoint", func(c *Config, v string) { c.SMS.Endpoint = v }),

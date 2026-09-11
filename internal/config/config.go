@@ -258,7 +258,22 @@ type Email struct {
 	Mailer          Mailer            `json:"mailer"`
 	Verification    EmailVerification `json:"verification"`
 	TemplatesDir    string            `json:"templatesDir"`
-	DeliveryWebhook Webhook           `json:"deliveryWebhook"`
+	DeliveryWebhook DeliveryWebhook   `json:"deliveryWebhook"`
+}
+
+// DeliveryWebhook covers email.deliveryWebhook.* (spec §1.5, §3.8): the https
+// receiver that is handed every minted credential instead of SES and SNS.
+//
+// It is not the generic Webhook type because it carries something the claims
+// webhook does not: a signing secret, and a required one. The body of every
+// request is a credential — a reset token, a magic link, a one-time code — so a
+// receiver that cannot verify X-Webhook-Signature cannot tell a replayed or
+// forged delivery from a real one. The secret is a product addition over the
+// spec's url-only knob, and validate.go refuses a url without one.
+type DeliveryWebhook struct {
+	URL       string `json:"url"`
+	TimeoutMs int    `json:"timeoutMs"`
+	Secret    Secret `json:"secret"`
 }
 
 // Mailer covers email.mailer.* (spec §1.5).
@@ -675,7 +690,7 @@ func Defaults() *Config {
 		Email: Email{
 			Mailer:          Mailer{DefaultLang: "en"},
 			Verification:    EmailVerification{Mode: EmailVerificationNone},
-			DeliveryWebhook: Webhook{TimeoutMs: 5000},
+			DeliveryWebhook: DeliveryWebhook{TimeoutMs: 5000},
 		},
 		SMS: SMS{CodeTTLMinutes: 10},
 		TwoFactor: TwoFactor{

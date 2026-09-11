@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
 
@@ -14,10 +17,27 @@ import (
 // Credential delivery: how a minted magic link, reset token, verification
 // token, email-change token or SMS code leaves this deployment.
 //
-// awesome-go-auth (v0.3.x) exposes five senders as func types on its Config, each
-// wired by a With*Sender option that rejects nil. This file turns two blocks of
-// configuration into those five functions, and nothing else in the binary knows
-// that mail is SES or that a text message is SNS.
+// awesome-go-auth (v0.4.0) exposes five senders as func types on its Config,
+// each wired by a With*Sender option that rejects nil, plus a sixth for the
+// notice /change-email/confirm mails to the address an account moved away
+// from. This file turns three blocks of configuration into those functions,
+// and nothing else in the binary knows that mail is SES, that a text message
+// is SNS, or that a delivery webhook exists.
+//
+// ── which sender ─────────────────────────────────────────────────────────────
+//
+// email.deliveryWebhook.url, when set, is THE sender for the five credential
+// seams: every minted credential is POSTed, signed, to that receiver and
+// nothing goes through SES or SNS for those routes (decision D-11). It replaces
+// the reference's five send-callback functions, which are in-process code a
+// configuration document cannot express (config-schema.md §3.8), and it is what
+// a deployment whose transport is neither mail nor SMS — or is not reachable
+// from a Lambda — wires. The mailer and sms blocks then cover only what the
+// webhook has no seam for: the email-changed notice and the OAuth link-token
+// mail, both of which still go through the mailer when one is configured.
+//
+// Without a webhook, the mailer block selects SES for the four mail seams and
+// the notice, and the sms block selects SNS for the fifth.
 //
 // ── transports or closures ───────────────────────────────────────────────────
 //
@@ -43,6 +63,16 @@ import (
 // The one thing a bridge cannot do is the OAuth link token, whose URL upstream
 // builds itself and hands over ready-made; that one is a closure, below, and it
 // still renders through the same templater.
+//
+// ── where a link points ──────────────────────────────────────────────────────
+//
+// Every bridge mailer takes a static BaseURL, but since v0.4.0 the adapters
+// resolve the base per request — the request's Origin or Referer when it is
+// allowlisted, else the canonical site URL — and put it on the delivery as
+// LinkBase, which wins over the static base. The static one is therefore the
+// fallback for a service called outside a request, and it is built from the
+// same canonical site URL (siteURLs, email.go) and the same HTTPConfig.UILink
+// shape the adapters use, so the two can never disagree about a link.
 //
 // ── what an unconfigured deployment does ─────────────────────────────────────
 //
@@ -74,14 +104,29 @@ type delivery struct {
 	// sms is nil unless the sms block is configured.
 	sms auth.SMSTransport
 
+	// webhook is nil unless email.deliveryWebhook.url is set. When it is set it
+	// is the sender for every credential seam, and mail and sms serve only the
+	// two mails it has no seam for.
+	webhook *auth.DeliveryWebhook
+
 	// templates renders subject and body for the link-token closure. The four
 	// bridge mailers hold their own equivalent; this one exists because
-	// DeliverLinkToken has no bridge.
+	// DeliverLinkToken has no bridge. emailOptions points its Store at the
+	// template store when one is enabled, because the closure renders outside a
+	// service call and cannot find the store on the context.
 	templates *auth.MailTemplater
 
 	appName string
 	baseURL string
 	locale  string
+}
+
+// webhookConfigured is the third enable signal, and like the other two it is
+// validation's own: validate.go refuses a delivery webhook url without its
+// signing secret and a secret without a url, so a non-empty url is exactly "the
+// operator configured a signed receiver and it passed validation".
+func webhookConfigured(cfg *config.Config) bool {
+	return strings.TrimSpace(cfg.Email.DeliveryWebhook.URL) != ""
 }
 
 // mailConfigured and smsConfigured are the enable signals, and they are the
@@ -104,18 +149,23 @@ func smsConfigured(cfg *config.Config) bool  { return strings.TrimSpace(cfg.SMS.
 // configures mail and never sends any pays nothing for it at init — which
 // matters because startTimeout gives the whole cold start 8 seconds.
 //
-// A bad from address is the one failure, and it aborts the cold start. That is
-// the right place for it: an unverified or malformed sender is a deployment
-// fault that would otherwise surface as a 500 on somebody's first password
-// reset.
-// mail and sms override the transports without changing the gating; both nil is
-// the binary's own path.
-func newDelivery(cfg *config.Config, mail auth.MailerTransport, sms auth.SMSTransport, log *slog.Logger) (*delivery, error) {
+// A bad from address is one failure, and a delivery webhook url the core
+// refuses is the other; both abort the cold start. That is the right place for
+// them: an unverified or malformed sender is a deployment fault that would
+// otherwise surface as a 500 on somebody's first password reset.
+//
+// mail, sms and client override the transports without changing the gating;
+// all nil is the binary's own path.
+func newDelivery(cfg *config.Config, mail auth.MailerTransport, sms auth.SMSTransport, client *http.Client, log *slog.Logger) (*delivery, error) {
+	canonical, _ := siteURLs(cfg)
 	d := &delivery{
-		// Exactly the base auth.MagicLinkURL and its three siblings want: the
-		// origin a mailbox can reach, plus the prefix the auth routes mount
-		// under. Both are P1 knobs, so credential delivery needs no new one.
-		baseURL: strings.TrimSuffix(cfg.Deployment.PublicURL, "/") + cfg.HTTP.APIPrefix,
+		// The static fallback base, in the exact shape the adapters resolve per
+		// request: the canonical site URL and the mount prefix, through
+		// HTTPConfig.UILink so that ui.enabled — when it lands — moves both
+		// the same way. With no canonical site the base is the bare prefix and
+		// the link is relative, which is the reference's behaviour with no
+		// siteUrl and is warned about below.
+		baseURL: strings.TrimSuffix(httpConfig(cfg).UILink(canonical, ""), "/"),
 		locale:  cfg.Email.Mailer.DefaultLang,
 	}
 
@@ -133,17 +183,6 @@ func newDelivery(cfg *config.Config, mail auth.MailerTransport, sms auth.SMSTran
 			d.mail = transport
 		}
 		d.templates = auth.NewMailTemplater(d.appName)
-
-		if cfg.Deployment.PublicURL == "" {
-			// Not fatal — RS-2 already decides when a missing public URL is a
-			// refusal, and a stack can legitimately run without one — but a
-			// relative link in a mailbox is a dead link, and upstream calls the
-			// empty base a misconfiguration in both ports. Better said once here
-			// than discovered from a user who could not click through.
-			log.Warn("mail is configured but deployment.publicUrl is unset, so every emailed link is relative and unusable from a mailbox",
-				slog.String("path", "deployment.publicUrl"),
-				slog.String("remedy", "set it to the origin clients reach, e.g. https://auth.example.com"))
-		}
 	}
 
 	if smsConfigured(cfg) {
@@ -151,6 +190,32 @@ func newDelivery(cfg *config.Config, mail auth.MailerTransport, sms auth.SMSTran
 		if d.sms == nil {
 			d.sms = awsintegration.NewSNSTransport(awsintegration.SNSOptions{})
 		}
+	}
+
+	if webhookConfigured(cfg) {
+		hook, err := auth.NewDeliveryWebhook(strings.TrimSpace(cfg.Email.DeliveryWebhook.URL), cfg.SecretValue("email.deliveryWebhook.secret"))
+		if err != nil {
+			return nil, err
+		}
+		// timeoutMs bounds one request through the request context, connect to
+		// last byte; validate.go guarantees it is positive. The route waiting on
+		// the answer is itself bounded by the Lambda timeout, so this is what
+		// keeps a slow receiver from turning every password reset into a
+		// function timeout.
+		hook.Timeout = time.Duration(cfg.Email.DeliveryWebhook.TimeoutMs) * time.Millisecond
+		hook.Client = client
+		d.webhook = hook
+	}
+
+	if canonical == "" && (d.mail != nil || d.webhook != nil) {
+		// Not fatal — RS-2 already decides when a missing public URL is a
+		// refusal, and a stack can legitimately run without one — but a
+		// relative link in a mailbox is a dead link, and upstream calls the
+		// empty base a misconfiguration in both ports. Better said once here
+		// than discovered from a user who could not click through.
+		log.Warn("credential delivery is configured but neither email.siteUrls nor deployment.publicUrl is set, so every emailed link is relative and unusable from a mailbox",
+			slog.String("path", "email.siteUrls"),
+			slog.String("remedy", "set email.siteUrls to the front end the links should point at, or deployment.publicUrl to the origin clients reach"))
 	}
 
 	return d, nil
@@ -176,34 +241,61 @@ func mailerAppName(cfg *config.Config) string {
 }
 
 // deliveryOptions returns the sender options the core accepts, appending each
-// one only when its transport exists.
+// one only when something exists to send through.
 //
 // The gating cannot be "append a possibly-nil sender": every With*Sender option
 // rejects nil with an error, so a nil transport handed to one of them would
 // abort the cold start of a deployment that simply does not send mail.
+//
+// A delivery webhook takes all five credential seams: one value, five methods
+// with the five sender signatures (auth.DeliveryWebhook), and no SES or SNS
+// call is made for those routes even when the mailer or sms block is also
+// configured. Those blocks still serve the email-changed notice — the webhook
+// has no seam for it — and, through oauthOptions, the link-token mail.
 func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 	var opts []auth.Option
 
-	if d.mail != nil {
-		magic := auth.NewMagicLinkMailer(d.mail, d.appName, d.baseURL)
-		magic.Locale = d.locale
-		reset := auth.NewPasswordResetMailer(d.mail, d.appName, d.baseURL)
-		reset.Locale = d.locale
-		verify := auth.NewEmailVerificationMailer(d.mail, d.appName, d.baseURL)
-		verify.Locale = d.locale
-		change := auth.NewEmailChangeMailer(d.mail, d.appName, d.baseURL)
-		change.Locale = d.locale
-
+	switch {
+	case d.webhook != nil:
 		opts = append(opts,
-			auth.WithMagicLinkSender(magic.Send),
-			auth.WithPasswordResetSender(reset.Send),
-			auth.WithEmailVerificationSender(verify.Send),
-			auth.WithEmailChangeSender(change.Send),
+			auth.WithMagicLinkSender(d.webhook.SendMagicLink),
+			auth.WithPasswordResetSender(d.webhook.SendPasswordReset),
+			auth.WithEmailVerificationSender(d.webhook.SendEmailVerification),
+			auth.WithEmailChangeSender(d.webhook.SendEmailChange),
+			auth.WithSMSCodeSender(d.webhook.SendSMSCode),
 		)
+	default:
+		if d.mail != nil {
+			magic := auth.NewMagicLinkMailer(d.mail, d.appName, d.baseURL)
+			magic.Locale = d.locale
+			reset := auth.NewPasswordResetMailer(d.mail, d.appName, d.baseURL)
+			reset.Locale = d.locale
+			verify := auth.NewEmailVerificationMailer(d.mail, d.appName, d.baseURL)
+			verify.Locale = d.locale
+			change := auth.NewEmailChangeMailer(d.mail, d.appName, d.baseURL)
+			change.Locale = d.locale
+
+			opts = append(opts,
+				auth.WithMagicLinkSender(magic.Send),
+				auth.WithPasswordResetSender(reset.Send),
+				auth.WithEmailVerificationSender(verify.Send),
+				auth.WithEmailChangeSender(change.Send),
+			)
+		}
+		if d.sms != nil {
+			opts = append(opts, auth.WithSMSCodeSender(auth.SMSTransportSender(d.sms)))
+		}
 	}
 
-	if d.sms != nil {
-		opts = append(opts, auth.WithSMSCodeSender(auth.SMSTransportSender(d.sms)))
+	if d.mail != nil {
+		// The notice POST /change-email/confirm mails to the OLD address once
+		// the change is applied (auth.router.ts:1060-1066). It carries no
+		// credential, so the webhook has nothing to sign for it and the mailer
+		// is its only transport; the route passes no language, so the mailer's
+		// Locale is the rule here rather than the default.
+		changed := auth.NewEmailChangedMailer(d.mail, d.appName)
+		changed.Locale = d.locale
+		opts = append(opts, auth.WithEmailChangedSender(changed.Send))
 	}
 
 	// One line an operator can read the whole delivery posture off, including
@@ -217,13 +309,39 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 	if d.sms != nil {
 		smsTransport = "sns"
 	}
+	noticeTransport := "none — POST /change-email/confirm applies the change and mails no notice"
+	if d.mail != nil {
+		noticeTransport = "ses"
+	}
+	webhook := "none"
+	if d.webhook != nil {
+		// The webhook takes every credential seam, and the line says so in the
+		// transport fields themselves: an operator who set both a mailer and a
+		// webhook must not read "ses" and conclude the reset mail went by mail.
+		mailTransport, smsTransport = "webhook", "webhook"
+		webhook = webhookOrigin(d.webhook.URL)
+	}
 	log.Info("credential delivery wired",
 		slog.String("mailTransport", mailTransport),
 		slog.String("smsTransport", smsTransport),
+		slog.String("emailChangedNotice", noticeTransport),
+		slog.String("deliveryWebhook", webhook),
 		slog.String("linkBase", d.baseURL),
 		slog.String("locale", d.locale))
 
 	return opts
+}
+
+// webhookOrigin is the part of the receiver's URL the cold-start log names:
+// scheme and host, never the path or query, because a receiver's path is where
+// an operator puts a capability token when the receiver cannot check a
+// signature on its own.
+func webhookOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "configured"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // deliverLinkToken is the OAuth account-linking mail, POST /link-request.
@@ -234,23 +352,24 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 // static BaseURL could reproduce — so there is nothing for a TokenMailer to
 // construct.
 //
-// The verify_email template is the deliberate choice. The reference sends this
+// The verify-email template is the deliberate choice. The reference sends this
 // mail through the same sendVerificationEmail callback its verification route
 // uses (auth.router.ts:1530-1535) and has no template of its own for it, so
 // reusing the verification template is what keeps the family consistent;
 // inventing a link-specific one here would be a port-only divergence in
-// something a user reads.
+// something a user reads. A stored override of that id applies here too,
+// through the templater's Store.
 //
 // EmailLang is honoured because upstream forwards the request's emailLang field
 // verbatim for exactly this, and MailTemplater falls back to English on an
-// unknown locale. It is the only route in this file with a per-request
-// language, which is why the four bridge mailers are pinned to defaultLang.
+// unknown locale — the same resolution the four bridge mailers apply to a
+// delivery's Lang.
 func (d *delivery) deliverLinkToken(ctx context.Context, in auth.LinkTokenDelivery) error {
 	locale := in.EmailLang
 	if locale == "" {
 		locale = d.locale
 	}
-	subject, body, err := d.templates.Render(locale, "verify_email", auth.MailTemplateData{
+	rendered, err := d.templates.RenderMail(ctx, locale, auth.TemplateVerifyEmail, auth.MailTemplateData{
 		UserName: in.Email,
 		Token:    in.Token,
 		URL:      in.URL,
@@ -258,5 +377,11 @@ func (d *delivery) deliverLinkToken(ctx context.Context, in auth.LinkTokenDelive
 	if err != nil {
 		return err
 	}
-	return d.mail.Send(ctx, auth.MailMessage{To: in.Email, Subject: subject, Body: body, IsHTML: true})
+	return d.mail.Send(ctx, auth.MailMessage{
+		To:      in.Email,
+		Subject: rendered.Subject,
+		Body:    rendered.HTML,
+		IsHTML:  true,
+		Text:    rendered.Text,
+	})
 }

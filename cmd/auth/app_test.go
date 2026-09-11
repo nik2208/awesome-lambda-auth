@@ -71,11 +71,7 @@ func discardLogger() *slog.Logger { return newLogger(io.Discard, slog.LevelError
 // here too — otherwise every test in this file would be exercising a narrower
 // composition than the binary builds.
 func memoryStores(_ context.Context, _ *config.Config, _ *slog.Logger) (auth.UserStore, auth.SessionStore, error) {
-	return memoryStoreBundle{
-		MemoryUserStore: auth.NewMemoryUserStore(),
-		links:           auth.NewMemoryLinkedAccounts(),
-		pending:         auth.NewMemoryPendingLinks(),
-	}, auth.NewMemorySessionStore(), nil
+	return newMemoryStoreBundle(), auth.NewMemorySessionStore(), nil
 }
 
 func newTestApp(t *testing.T, env map[string]string) *App {
@@ -724,5 +720,40 @@ func TestSameSiteMapping(t *testing.T) {
 		if got := sameSite(in); got != want {
 			t.Errorf("sameSite(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// TestUIEnabledIsFalseUntilTheUIDomainIsWired makes a dependency visible that is
+// otherwise invisible: httpConfig reads ui.enabled, which decides whether every
+// emailed link points at <site><prefix>/ui/<path> or at the bare API route
+// (UILink, wire.go) — but `ui` is still in unwiredDomains(), so a document that
+// configures it refuses to start and the field can only ever be false.
+//
+// The wiring is kept deliberately, so that the link shape and the UI switch
+// cannot drift apart when P6 lands. This test is the price of keeping it: it
+// pins both halves, so that un-gating the domain fails here and whoever does it
+// is told that emailed links change shape the moment ui.enabled is settable.
+func TestUIEnabledIsFalseUntilTheUIDomainIsWired(t *testing.T) {
+	t.Parallel()
+
+	// The gate: configuring the domain at all is refused, so there is no
+	// loadable document in which the field is true.
+	_, err := config.Load(context.Background(), config.Options{
+		Getenv: envFunc(with(baseEnv(), "AWESOME_AUTH_UI_ENABLED", "true")),
+	})
+	if err == nil {
+		t.Fatal("ui.enabled was accepted; it is no longer gated, and httpConfig now changes the shape of every emailed link")
+	}
+	if !strings.Contains(err.Error(), "ui") {
+		t.Errorf("the refusal does not name the ui domain:\n%v", err)
+	}
+
+	// And what the core is therefore handed, for a document that does load.
+	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(baseEnv())})
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if httpConfig(cfg).UIEnabled {
+		t.Error("httpConfig reports UIEnabled for a configuration that cannot set it")
 	}
 }

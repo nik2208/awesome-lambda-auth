@@ -19,15 +19,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		{"security.jwt.claimsWebhook", func(doc Document) {
 			set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
 		}},
-		{"email.siteUrls", func(doc Document) {
-			set(doc, "email.siteUrls", []any{"https://app.example.com"})
-		}},
-		{"email.templatesDir", func(doc Document) {
-			set(doc, "email.templatesDir", "./templates")
-		}},
-		{"email.deliveryWebhook", func(doc Document) {
-			set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook")
-		}},
 		{"oauth", func(doc Document) {
 			set(doc, "oauth.provisioning.autoCreate", true)
 		}},
@@ -216,6 +207,169 @@ func TestDeliverySecretsNoLongerTripThePhaseGap(t *testing.T) {
 
 	if _, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)}); err != nil {
 		t.Fatalf("delivery secrets must not reopen the phase gap:\n%v", err)
+	}
+}
+
+// TestEmailFlowDomainsAreWired is the P2 counterpart of
+// TestDeliveryDomainsAreWired: the three email-flow knobs the mailer left behind
+// — the site-URL allowlist, the templates directory and the delivery webhook —
+// load now instead of tripping the phase gap.
+//
+// Each is written the way the schema requires it, so the test also pins that
+// un-gating relaxed nothing: the webhook needs its signing secret, the
+// templates directory needs the store it seeds. What cmd/auth then does with
+// them — resolve links, seed the store, post deliveries — is its own tests'
+// business.
+func TestEmailFlowDomainsAreWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+		env    func(map[string]string)
+	}{
+		{"email.siteUrls", func(doc Document) {
+			set(doc, "email.siteUrls", []any{"https://app.example.com", "https://alt.example.com"})
+		}, nil},
+		{"email.templatesDir", func(doc Document) {
+			set(doc, "email.templatesDir", "/var/task/templates")
+			set(doc, "stores.enable.templates", true)
+		}, nil},
+		{"email.deliveryWebhook", func(doc Document) {
+			set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook")
+			set(doc, "email.deliveryWebhook.timeoutMs", 1500)
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = "delivery-webhook-signing-secret"
+		}},
+		{"all three together", func(doc Document) {
+			set(doc, "email.siteUrls", []any{"https://app.example.com"})
+			set(doc, "email.templatesDir", "/var/task/templates")
+			set(doc, "stores.enable.templates", true)
+			set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook")
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = "delivery-webhook-signing-secret"
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+			env := baseEnv()
+			if tc.env != nil {
+				tc.env(env)
+			}
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if err != nil {
+				t.Fatalf("the email-flow domains are wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if strings.HasPrefix(w.Path, "email.") && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("%s is still reported as an unwired domain: %s", w.Path, w.Problem)
+				}
+			}
+			for _, path := range []string{"email.siteUrls", "email.templatesDir", "email.deliveryWebhook"} {
+				if _, gated := UnwiredDomains()[path]; gated {
+					t.Errorf("%s is still listed by UnwiredDomains", path)
+				}
+			}
+		})
+	}
+}
+
+// TestDeliveryWebhookRequiresItsSecret: the webhook is handed every minted
+// credential, so a url without the secret that signs the requests is refused,
+// and a secret without a url is refused as the dead configuration it is.
+func TestDeliveryWebhookRequiresItsSecret(t *testing.T) {
+	t.Run("url without a secret", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook")
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		d := requireRule(t, err, "", "email.deliveryWebhook.secret")
+		if !strings.Contains(d.Remedy, "AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET") {
+			t.Errorf("the remedy does not name the variable that supplies the secret:\n%s", d.Remedy)
+		}
+	})
+
+	t.Run("secret reference without a url", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "email.deliveryWebhook.secret", map[string]any{"envVar": "MY_HOOK_SECRET"})
+		env := baseEnv()
+		env["MY_HOOK_SECRET"] = "delivery-webhook-signing-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		requireRule(t, err, "", "email.deliveryWebhook.url")
+	})
+
+	t.Run("a non-positive timeout", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook")
+		set(doc, "email.deliveryWebhook.timeoutMs", 0)
+		env := baseEnv()
+		env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = "delivery-webhook-signing-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		requireRule(t, err, "", "email.deliveryWebhook.timeoutMs")
+	})
+
+	// A refusal is written to CloudWatch, and this is the one URL knob in the
+	// schema whose path may itself be a secret: a receiver that cannot verify an
+	// HMAC signature is told to carry a capability token in the path instead,
+	// which is why cmd/auth logs only the origin of it at cold start
+	// (webhookOrigin). A diagnostic that echoed the whole value would undo that
+	// for exactly the deployments most likely to produce one.
+	t.Run("a refusal never echoes the receiver's path", func(t *testing.T) {
+		const capability = "hunter2-capability-token"
+		for _, tc := range []struct{ name, url string }{
+			{"plain http", "http://delivery.example.com/hook/" + capability},
+			{"not a URL at all", "delivery.example.com/hook/" + capability},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				doc := baseDoc()
+				set(doc, "email.deliveryWebhook.url", tc.url)
+				env := baseEnv()
+				env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = "delivery-webhook-signing-secret"
+
+				_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+				d := requireRule(t, err, "", "email.deliveryWebhook.url")
+				said := d.Problem + " " + d.Remedy
+				if strings.Contains(said, capability) {
+					t.Errorf("the diagnostic echoes the receiver's path, where the capability token lives:\n%s", said)
+				}
+			})
+		}
+	})
+
+	t.Run("the timeout has an environment override", func(t *testing.T) {
+		env := baseEnv()
+		env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL"] = "https://delivery.example.com/hook"
+		env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = "delivery-webhook-signing-secret"
+		env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_TIMEOUT_MS"] = "750"
+
+		cfg, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if got := cfg.Email.DeliveryWebhook.TimeoutMs; got != 750 {
+			t.Errorf("timeoutMs = %d, want 750 from the environment", got)
+		}
+		if got := cfg.SecretValue("email.deliveryWebhook.secret"); got != "delivery-webhook-signing-secret" {
+			t.Errorf("the secret did not resolve through its documented variable")
+		}
+	})
+}
+
+// TestTemplatesDirRequiresTheTemplateStore: a directory that seeds a store
+// nobody enabled would be read and discarded, which spec §1.17 treats as a
+// misconfiguration rather than a no-op.
+func TestTemplatesDirRequiresTheTemplateStore(t *testing.T) {
+	doc := baseDoc()
+	set(doc, "email.templatesDir", "/var/task/templates")
+
+	_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+	d := requireRule(t, err, RuleStoreRequired, "stores.enable.templates")
+	if !strings.Contains(d.Problem, "email.templatesDir") {
+		t.Errorf("the diagnostic does not name the knob that needs the store:\n%s", d.Problem)
 	}
 }
 

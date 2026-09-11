@@ -41,14 +41,17 @@ type domain struct {
 // security.password, security.csrf, tokens, cookies, sessions,
 // email.verification.mode, stores, http.
 //
-// Credential delivery adds two more. `email.mailer` and `sms` are now wired —
-// they select and configure the transports the five credential-minting routes
-// send through (cmd/auth delivery.go, internal/integration/aws ses.go and
-// sns.go) — so neither is refused any more. Note what did *not* move with them:
-// email.siteUrls, email.templatesDir and email.deliveryWebhook are still inert
-// and still refused, because a transport is not a redirect allowlist, a
-// template store or a webhook. Configuring the mailer therefore starts; asking
-// it to load your own templates still does not.
+// Credential delivery added `email.mailer` and `sms`: they select and configure
+// the transports the five credential-minting routes send through (cmd/auth
+// delivery.go, internal/integration/aws ses.go and sns.go).
+//
+// The email flows (P2) closed the rest of the email block. `email.siteUrls` is
+// the canonical base of every emailed link and, merged with http.cors.origins,
+// the allowlist a request's Origin or Referer is matched against;
+// `email.templatesDir` seeds the template store at cold start; and
+// `email.deliveryWebhook` selects a signed https receiver as the sender for
+// every credential seam in place of SES and SNS (cmd/auth email.go and
+// delivery.go). None of the three is refused any more.
 //
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
@@ -67,21 +70,6 @@ func unwiredDomains() []domain {
 			path:  "security.jwt.claimsWebhook",
 			phase: "P3 (token claims)",
 			get:   func(c *Config) any { return c.Security.JWT.ClaimsWebhook },
-		},
-		{
-			path:  "email.siteUrls",
-			phase: "P2 (email flows)",
-			get:   func(c *Config) any { return c.Email.SiteURLs },
-		},
-		{
-			path:  "email.templatesDir",
-			phase: "P2 (email flows)",
-			get:   func(c *Config) any { return c.Email.TemplatesDir },
-		},
-		{
-			path:  "email.deliveryWebhook",
-			phase: "P2 (email flows)",
-			get:   func(c *Config) any { return c.Email.DeliveryWebhook },
 		},
 		{
 			path:         "oauth",

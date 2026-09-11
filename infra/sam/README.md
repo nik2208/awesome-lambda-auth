@@ -205,6 +205,11 @@ where they do not:
 Both statements are absent from the role entirely unless their half is
 configured — `MailerFromAddress` for mail, `EnableSmsDelivery` for SMS.
 
+There is one more `secretsmanager:GetSecretValue` statement, and it follows the
+signing-secret one exactly: present only when `EmailDeliveryWebhookSecretArn` is
+set, scoped to that one ARN with any `#<jsonKey>` selector stripped, because the
+selector is the function's and the resource is the secret.
+
 ## Credential delivery
 
 Five routes mint something that has to reach a person: `/magic-link/send`,
@@ -267,6 +272,38 @@ calling the credential unused:
  "problem":"SNS authorises the call with the Lambda execution role's sns:Publish permission, …, and this deployment sends nothing through that half at all",
  "remedy":"sms.endpoint is unset, so no SMS transport is wired at all and POST /sms/send answers 500 SMS_NOT_CONFIGURED: set it to turn SMS delivery on, or delete the credential"}
 ```
+
+## Email flows
+
+Three more parameters decide where an emailed link points and who delivers it.
+
+| Parameter | Effect |
+|---|---|
+| `EmailSiteUrls` | Comma-separated absolute URLs. The first is the canonical site every emailed link is built on; all of them, together with `AllowedOrigins`, form the allowlist a request's `Origin` or `Referer` is matched against. Empty falls back to `PublicUrl` and honours no request origin. |
+| `EmailDeliveryWebhookUrl` | An https receiver that is POSTed a signed JSON copy of every credential delivery **instead of** SES and SNS: with it set, all five credential seams go there and nothing is mailed or texted for them. |
+| `EmailDeliveryWebhookSecretArn` | The Secrets Manager ARN of the key that signs those requests. **Required with the url**, and refused without it. |
+
+The signature is `X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the body>`,
+the family's outbound-webhook convention, so a receiver already written for the
+tools router's webhooks verifies these the same way. The secret is required
+because the body of every request *is* a credential: a receiver that cannot
+verify the signature cannot tell a replayed or forged delivery from a real one.
+Nothing is generated for you — the receiver has to hold the same key.
+
+`email.templatesDir` has no parameter here and is not an oversight: it names a
+directory inside the artifact, which `scripts/build-lambda.sh` bakes and the
+configuration document points at (`ConfigFile`). See
+[`docs/config-reference.md`](../../docs/config-reference.md) §5 for the file
+layout and for the rule that the store always wins over the directory.
+
+**Templates do not work on a stack deployed from this template, and that is a
+build limitation rather than a template one.** `email.templatesDir` requires
+`stores.enable.templates`, which requires a driver whose store provides a
+`TemplateStore`; `internal/store/dynamodb` has none in this build, and this
+template deploys nothing else. Turning the switch on refuses the cold start by
+name, so the failure is loud rather than silent, but there is no parameter here
+that makes it work — the built-in `en`/`it` templates render until the DynamoDB
+template store lands. `docs/config-reference.md` §5.3 has the whole picture.
 
 ## Cost at rest
 

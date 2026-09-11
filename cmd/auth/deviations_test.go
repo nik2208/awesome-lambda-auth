@@ -19,6 +19,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"csrf-enabled-by-default",
 		"production-by-default",
 		"refresh-token-families",
+		"templates-dir-only-seeds-absent-ids",
 	}
 	var got []string
 	for _, d := range WireDeviations() {

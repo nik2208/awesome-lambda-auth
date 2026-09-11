@@ -301,6 +301,10 @@ func checkStoreRequirements(c *Config, d *diagnostics) {
 		fmt.Sprintf("admin.accessPolicy is %q, which is evaluated against roles and permissions", c.Admin.AccessPolicy),
 		"enable stores.enable.rbac, or use the is-admin-flag policy")
 
+	requireStore(strings.TrimSpace(c.Email.TemplatesDir) != "", "stores.enable.templates", c.Stores.Enable.Templates,
+		"email.templatesDir names a directory to seed it from, so the templates would be read and then have nowhere to go",
+		"enable stores.enable.templates, or remove email.templatesDir")
+
 	requireStore(c.Tools.Enabled && c.Tools.InboundWebhooks.Enabled, "stores.enable.webhooks", c.Stores.Enable.Webhooks,
 		"inbound webhooks are enabled and their per-provider rows and mapping scripts live in that store",
 		"enable stores.enable.webhooks, or set tools.inboundWebhooks.enabled: false")
