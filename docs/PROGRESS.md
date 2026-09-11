@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-P2-D landed and is deployed: the email domain is fully wired, the stack redeployed and 44 contract cases pass against it with no skips. Twelve domains remain gated. Upstream: v0.4.0 and v0.5.0 tagged; PRs #61 settings store, #62 JWKS well-known route, #63 resource server, #64 OAuth provisioning open with CI running, each having passed an adversarial review and a fix pass.
+Upstream: #61 settings store, #62 JWKS well-known route and #63 resource server merged; #64 OAuth provisioning rebased and in CI. Next upstream tags: v0.6.0 (OAuth: #55, #57, #64) and v0.7.0 (IdP: #53, #59, #62, #63), then v0.8.0 for the settings store once the UI and docs work joins it. Product: P2-D green and deployed (44 contract cases, 0 skips); next is P3-D, which needs the core at v0.5.0 or later — the pin is still v0.4.0.
 
 ## Blocks
 
