@@ -632,42 +632,45 @@ func TestTemplateStoreRefusesADriverWithoutOne(t *testing.T) {
 	}
 }
 
-// TestTemplatesAreRefusedOnTheDynamoDBDriver pins the one thing that makes the
-// template store a development-only feature in this build, and pins it where an
-// operator meets it: internal/store/dynamodb has no TemplateStore view, so
-// driverStores must not claim "templates" for that driver and checkStoreSupport
-// must refuse the combination early, by name.
+// TestTemplatesAreBackedByEveryDriver pins the claim driverStores makes about
+// the template store, and pins the diagnosis an operator gets when a claim like
+// it is false.
 //
-// Early matters. Without the refusal here the cold start would get as far as
-// building the real stores and then fail inside emailOptions with a structural
-// assertion that reads like an internal error; with it, the operator is told
-// which driver lacks which store before anything is constructed. The two
-// refusals are deliberately both present — this one is the diagnosis, the
-// assertion in emailOptions is the guarantee — and this test is what stops the
-// claim and the implementation drifting apart again when the DynamoDB
-// TemplateStore lands on its own branch.
-func TestTemplatesAreRefusedOnTheDynamoDBDriver(t *testing.T) {
+// Both drivers back templates: internal/store/dynamodb keeps them on its
+// TEMPLATES partition and the memory driver hangs the core's MemoryTemplateStore
+// off the user store, so email.templatesDir is deployable on either. The
+// refusal mechanism still has to work, because the claim and the store can
+// drift apart again — so the second half enables a store no driver backs and
+// requires the early, named refusal. Early matters: without it the cold start
+// would get as far as building the real stores and then fail inside
+// emailOptions with a structural assertion that reads like an internal error.
+func TestTemplatesAreBackedByEveryDriver(t *testing.T) {
 	t.Parallel()
 
-	cfg := config.Defaults()
-	cfg.Stores.Driver = config.StoreDriverDynamoDB
-	cfg.Stores.Enable.Templates = true
-
-	err := checkStoreSupport(cfg)
-	if err == nil {
-		t.Fatal("stores.enable.templates was accepted on dynamodb, whose store has no TemplateStore in this build")
-	}
-	for _, want := range []string{"stores.enable.templates", config.StoreDriverDynamoDB} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error = %v, want it to name %q", err, want)
+	for _, driver := range []string{config.StoreDriverDynamoDB, config.StoreDriverMemory} {
+		cfg := config.Defaults()
+		cfg.Stores.Driver = driver
+		cfg.Stores.Enable.Templates = true
+		if err := checkStoreSupport(cfg); err != nil {
+			t.Errorf("%s backs a template store and was refused one: %v", driver, err)
 		}
 	}
 
-	// And the memory driver, which does have one, stays accepted: a refusal
-	// that fired for every driver would be a feature nobody can use at all.
-	cfg.Stores.Driver = config.StoreDriverMemory
-	if err := checkStoreSupport(cfg); err != nil {
-		t.Errorf("the memory driver backs a template store and was refused one: %v", err)
+	// RBAC is the counter-example: no driver in this build backs it, so the
+	// combination must be refused before anything is constructed, and the
+	// message must name both the key and the driver.
+	cfg := config.Defaults()
+	cfg.Stores.Driver = config.StoreDriverDynamoDB
+	cfg.Stores.Enable.RBAC = true
+
+	err := checkStoreSupport(cfg)
+	if err == nil {
+		t.Fatal("stores.enable.rbac was accepted on dynamodb, whose store has no roles or permissions")
+	}
+	for _, want := range []string{"stores.enable.rbac", config.StoreDriverDynamoDB} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to name %q", err, want)
+		}
 	}
 }
 

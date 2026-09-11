@@ -120,11 +120,11 @@ The whole `email` domain now loads. `email.siteUrls`, `email.templatesDir` and
 `email.deliveryWebhook` were the last three to leave that list; nothing under
 `email.` is refused by the phase gate any more.
 
-One of them is still not deployable, for a different reason, and it is refused by
-a different mechanism: `email.templatesDir` needs a template store, and only the
-development `memory` driver provides one in this build (§5.3). That is a store
-gap rather than a phase gap, so it is caught by `checkStoreSupport` at cold start
-and names the driver rather than the phase.
+`email.templatesDir` needs a template store, and both drivers now back one: the
+DynamoDB store keeps mail templates and UI translations on its `TEMPLATES`
+partition, the memory driver holds them per execution environment (§5.3). A
+driver that backs none is still refused by `checkStoreSupport` at cold start,
+by name — a store gap rather than a phase gap.
 
 ## 5. `email.*`, knob by knob
 
@@ -193,17 +193,14 @@ written into the template store. It requires `stores.enable.templates`: a
 directory that seeds a store nobody enabled would be read and discarded, which
 the loader treats as a misconfiguration rather than a no-op.
 
-> **In this build the template store exists only on the `memory` driver, which
-> makes this whole section development-only.** `internal/store/dynamodb` has no
-> `TemplateStore`, so `stores.enable.templates` on `stores.driver: dynamodb` is
-> refused at cold start by name — and since `email.templatesDir` requires that
-> switch, and rule RS-12 refuses the memory driver in a production deployment,
-> there is no production posture in this build that can use either knob. A
-> deployment that needs stored templates today runs `deployment.environment:
-> development` with `stores.driver: memory` and accepts what that costs (§1.17:
-> every execution environment holds its own copy, lost on each cold start), or
-> waits for the DynamoDB template store. Nothing is silently ignored either way:
-> both combinations refuse to start and say which driver is missing what.
+> **Both drivers back this.** On `dynamodb` the templates live on the table's
+> `TEMPLATES` partition, so a template seeded from the artifact outlives the
+> execution environment and an edit made through the store survives the next
+> redeploy — which is the whole point of seeding absent ids only. On `memory`
+> each execution environment holds its own copy and loses it on every cold
+> start, which is what the development driver is for (§1.17). A driver that
+> backs no template store is refused at cold start by name, so nothing is
+> silently ignored.
 
 Layout — one file per template at the top level, nothing recursive:
 
@@ -310,12 +307,10 @@ webhook to keep credentials off SES should know this one did not move with it.
 
 ## 6. Two worked postures
 
-**Mail through SES, templates from the artifact — development only.** Every key
-that is not `email.*` here is load-bearing: `stores.enable.templates` needs a
-driver that has a template store, only `memory` has one in this build, and RS-12
-refuses `memory` in production (§5.3). Written without the `stores` and
-`deployment` blocks this document does not start, because the defaults are
-`production` and `memory` together.
+**Mail through SES, templates from the artifact.** Every key that is not
+`email.*` here is load-bearing: `stores.enable.templates` needs a driver that
+backs a template store (§5.3), and the `stores` block has to name that driver,
+because the default is `memory` and rule RS-12 refuses it in production.
 
 ```json
 {

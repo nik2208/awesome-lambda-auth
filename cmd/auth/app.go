@@ -529,24 +529,20 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// PendingLinkStore. Everything else is deliberately absent — see that
 		// package's interfaces.go.
 		//
-		// "templates" is absent on purpose: this build's DynamoDB store has no
-		// TemplateStore view at all, so stores.enable.templates on this driver
-		// is refused here, early and by name, rather than reaching emailOptions'
-		// structural assertion. That also makes email.templatesDir — for which
-		// rule STORE requires stores.enable.templates — a memory-driver-only
-		// feature in this build, which docs/config-reference.md §5.3 says out
-		// loud. The DynamoDB TemplateStore lands on its own branch; adding it
-		// to this set is that branch's first line.
+		// "templates" joined the set when the store gained its TEMPLATES
+		// partition: mail templates and UI translations are readable and
+		// patchable on this driver, so email.templatesDir seeds a store that
+		// outlives the execution environment.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
-			"linkedAccounts": true, "pendingLinks": true,
+			"linkedAccounts": true, "pendingLinks": true, "templates": true,
 		}, true
 	case config.StoreDriverMemory:
 		// awesome-go-auth ships MemoryLinkedAccounts, MemoryPendingLinks and
 		// MemoryTemplateStore, and newMemoryStoreBundle hangs all three off the
-		// user store, so the development driver backs one key more than the
-		// production one: "templates". It is the only driver in this build that
-		// does, which is why emailOptions' refusal names the driver.
+		// user store, so the development driver backs the same set as the
+		// production one. A driver that backs fewer is still refused by name in
+		// emailOptions, which is why that refusal exists.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
