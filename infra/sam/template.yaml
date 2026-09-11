@@ -56,6 +56,10 @@ Metadata:
         Parameters: [JwtAccessSecretArn, JwtRefreshSecretArn]
       - Label: {default: Credential delivery}
         Parameters: [MailerFromAddress, MailerFromName, MailerIdentity, MailerDefaultLang, EnableSmsDelivery]
+      - Label: {default: Email flows}
+        Parameters: [EmailSiteUrls, EmailDeliveryWebhookUrl]
+      - Label: {default: Configuration document}
+        Parameters: [ConfigFile]
       - Label: {default: Storage}
         Parameters: [TableNamePrefix, MaxReadRequestUnits, MaxWriteRequestUnits, EnableDeletionProtection]
       - Label: {default: Function}
@@ -254,6 +258,49 @@ Parameters:
       are per-region, and several countries require a registered origination
       identity. Stored numbers must be E.164 — SNS routes nothing else.
 
+  # -----------------------------------------------------------------------
+  # Email flows (config-schema.md §1.5). Both empty by default, which leaves the
+  # domain untouched; a non-empty value wires it. Site URLs are what the links
+  # in every auth mail point at and the origins a magic-link or verification
+  # request may name as its return address; the delivery webhook is this
+  # port's own extension for exotic transports (no reference wire exists).
+  # -----------------------------------------------------------------------
+
+  EmailSiteUrls:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_EMAIL_SITE_URLS — comma-separated absolute URLs. The first is
+      the canonical site every emailed link is built on; all of them, together
+      with AllowedOrigins, form the allowlist a request's Origin or Referer is
+      matched against when a per-request return address is honoured. Empty
+      falls back to PublicUrl for the links and honours no request origin.
+
+  EmailDeliveryWebhookUrl:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://.+$'
+    Description: >-
+      AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL — an https endpoint that receives a
+      signed JSON copy of every credential delivery (kind, recipient, link or
+      code) instead of, or in addition to, SES and SNS. Empty disables it. Set it
+      only for a receiver you control: it is handed the credentials.
+
+  # -----------------------------------------------------------------------
+  # Configuration document. File-only knobs (templates directory, extra claims,
+  # OAuth profile maps, rate-limit scopes) have no environment variable by
+  # design; they arrive as a JSON document baked into the artifact by
+  # scripts/build-lambda.sh CONFIG_FILE=… and named here.
+  # -----------------------------------------------------------------------
+
+  ConfigFile:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_CONFIG_FILE — path of the JSON configuration document inside
+      the deployed artifact, normally /var/task/awesome-auth.json when the build
+      baked one. Empty means defaults plus the environment variables above.
+
   TableNamePrefix:
     Type: String
     Default: awesome-auth
@@ -333,6 +380,9 @@ Conditions:
   HasPublicUrl: !Not [!Equals [!Ref PublicUrl, '']]
   HasAllowedOrigins: !Not [!Equals [!Ref AllowedOrigins, '']]
   HasCookieDomain: !Not [!Equals [!Ref CookieDomain, '']]
+  HasEmailSiteUrls: !Not [!Equals [!Ref EmailSiteUrls, '']]
+  HasDeliveryWebhook: !Not [!Equals [!Ref EmailDeliveryWebhookUrl, '']]
+  HasConfigFile: !Not [!Equals [!Ref ConfigFile, '']]
   # A named stage on the raw execute-api URL puts /<stage> in front of every
   # path the browser sees, so the Path-scoped refresh cookie has to match.
   NeedsStagePrefixedCookiePath: !And
@@ -629,6 +679,15 @@ Resources:
           # role, which retires the credentials-in-URL hazard config-schema.md
           # §1.6 records for them along with the credentials themselves.
           AWESOME_AUTH_SMS_ENDPOINT: !If [SmsEnabled, 'https://sns.invalid/unused-see-template-comment', !Ref 'AWS::NoValue']
+
+          # --- email flows -----------------------------------------------
+          AWESOME_AUTH_EMAIL_SITE_URLS: !If [HasEmailSiteUrls, !Ref EmailSiteUrls, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL: !If [HasDeliveryWebhook, !Ref EmailDeliveryWebhookUrl, !Ref 'AWS::NoValue']
+
+          # --- configuration document ------------------------------------
+          # A path inside the artifact, never a value: the document is part of
+          # the reproducible zip, so what the function reads is what was built.
+          AWESOME_AUTH_CONFIG_FILE: !If [HasConfigFile, !Ref ConfigFile, !Ref 'AWS::NoValue']
 
           # --- signing secrets -------------------------------------------
           # REFERENCES, not values. The _SECRETSMANAGER suffix on a secret

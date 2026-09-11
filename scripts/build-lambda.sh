@@ -4,6 +4,8 @@
 #   ./scripts/build-lambda.sh                 # dist/auth-arm64.zip
 #   ARCH=amd64 ./scripts/build-lambda.sh      # dist/auth-amd64.zip
 #   OUT_DIR=/tmp/x ./scripts/build-lambda.sh
+#   CONFIG_FILE=./awesome-auth.json TEMPLATES_DIR=./templates ./scripts/build-lambda.sh
+#                                             # bake a config document and mail templates in
 #
 # The arch-suffixed name is canonical, and the default build is also copied to
 # dist/auth-lambda.zip, which is the CodeUri infra/sam/template.yaml resolves.
@@ -66,6 +68,8 @@ docker run --rm \
   -e "ARCH=${ARCH}" \
   -e "DEFAULT_ARCH=${DEFAULT_ARCH}" \
   -e "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
+  ${CONFIG_FILE:+-v "${CONFIG_FILE}":/bake/awesome-auth.json:ro} \
+  ${TEMPLATES_DIR:+-v "${TEMPLATES_DIR}":/bake/templates:ro} \
   "${GO_IMAGE}" \
   bash -euo pipefail -c '
     # The Go image ships no archiver. Installed quietly, and non-interactively:
@@ -87,13 +91,25 @@ docker run --rm \
     # provided.al2023 execs the file directly, so it has to be executable, and
     # the zip has to record that bit.
     chmod 0755 "${workdir}/bootstrap"
-    touch -d "@${SOURCE_DATE_EPOCH}" "${workdir}/bootstrap"
+
+    # Optional bake-ins. A configuration document (CONFIG_FILE=) and a mail
+    # templates directory (TEMPLATES_DIR=) travel inside the artifact, so what
+    # the function reads at /var/task is exactly what was built and checksummed;
+    # the template names them through AWESOME_AUTH_CONFIG_FILE and
+    # email.templatesDir.
+    if [ -f /bake/awesome-auth.json ]; then
+      cp /bake/awesome-auth.json "${workdir}/awesome-auth.json"
+    fi
+    if [ -d /bake/templates ]; then
+      cp -r /bake/templates "${workdir}/templates"
+    fi
+    find "${workdir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
 
     out="/out/auth-${ARCH}.zip"
     rm -f "${out}"
     # -X drops the extra field, which carries the high-resolution mtime and the
     # uid/gid of the build user; without it the archive differs per host.
-    (cd "${workdir}" && zip -q -X "${out}" bootstrap)
+    (cd "${workdir}" && zip -q -X -r "${out}" .)
 
     # The name infra/sam/template.yaml points its CodeUri at. Only the default
     # architecture claims it, so an amd64 build cannot quietly take the slot an
