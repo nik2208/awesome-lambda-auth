@@ -10,12 +10,12 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 - [x] H2 upstream `main` synced to `origin/main`; stale local branch dropped
 - [x] H3 upstream `v0.3.1` tagged at `0079771`; changelog cut `4196ed1`; product pinned (`1c1cb23`)
 - [x] H4 `scripts/toolchain.sh` forwards `DYNAMODB_ENDPOINT`, `GONOSUMDB`, `GOPRIVATE`, `TOOLCHAIN_NETWORK`
-- [~] H5 upstream PR #47 `.gitattributes` (LF for container-read files)
+- [x] H5 upstream PR #47 merged (`f332082`): `.gitattributes`, LF for container-read files
 - [x] H6 `.github/workflows/go.yml` + `scripts/check-artifact-size.sh`
-- [~] H7 README rewrite, this ledger, `spec/decisions.md`, product deviation register
+- [x] H7 README rewrite, this ledger, `spec/decisions.md`, product deviation register (`5e77c84`)
 - [~] H8 F1 re-check of the wire contract against the private `node-auth` line
-- [ ] H9 baseline: contract suite against the live stack
-- [ ] H10 upstream PR: truthful README parity table
+- [x] H9 baseline: 41 contract cases green against the live stack, `REQUIRE=register,csrf,secure-cookies,sessions,totp`, 0 skips
+- [x] H10 upstream PR #48 merged (`a8b8e26`): truthful README parity table and roadmap
 
 ### Phases (U half before D half)
 - [ ] P2 email flows — U: v0.4.0 · D: `email.siteUrls`, `email.templatesDir`, `email.deliveryWebhook`
@@ -33,17 +33,17 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-H7 — product docs and register. Gate so far: gofmt ✓ vet ✓ race ✓ (DynamoDB Local reached, `internal/store/dynamodb` 73 s) on the tree before the register was added; re-run pending.
+H8 — spec re-check from the F1 delta (branch `docs/f1-recheck`). P2 upstream PRs 1.1, 1.3, 1.4 in progress on worktrees `wt/goauth-*`.
 
 ## Blocks
 
 ### B0 — Housekeeping (product · main · 2026-09-11)
-Status: in progress
-Landed: `1c1cb23` build: depend on awesome-go-auth v0.3.1
-Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ build – deploy – contract –
+Status: green (H8 spec update still open as its own block)
+Landed: `1c1cb23` … `5e77c84` (toolchain, CI, deviation register, README, ledger) + this fix
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ build ✓ (auth-arm64.zip 6.77 MB, sha256 fb84dc9a…) deploy – (no runtime change) contract ✓ 41 cases
 Deviations: product register introduced (`cmd/auth/deviations.go`), index in `deviations.md`
 Decisions: D-0 … D-16 recorded
-Upstream dance: `v0.3.1` at `0079771`; PR #47 open
+Upstream dance: `v0.3.1` at `0079771`; PR #47 and #48 squash-merged
 Stack: unchanged
-Notes: the `lambda-auth` profile resolves to a different account than the one the project memory attributed to it; the profile name is the invariant and the pre-flight enforces it.
+Notes: the `lambda-auth` profile resolves to the standalone project account, distinct from the `default` profile; the profile name is the invariant and the pre-flight enforces it.
 Next: H8, H9, H10, then P2
