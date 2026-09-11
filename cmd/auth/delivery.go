@@ -14,7 +14,7 @@ import (
 // Credential delivery: how a minted magic link, reset token, verification
 // token, email-change token or SMS code leaves this deployment.
 //
-// awesome-go-auth v0.3.0 exposes five senders as func types on its Config, each
+// awesome-go-auth (v0.3.x) exposes five senders as func types on its Config, each
 // wired by a With*Sender option that rejects nil. This file turns two blocks of
 // configuration into those five functions, and nothing else in the binary knows
 // that mail is SES or that a text message is SNS.

@@ -55,7 +55,7 @@ type mountedRoute struct {
 	why string
 }
 
-// mountedRoutes is the adapter's full surface as of awesome-go-auth v0.2.0.
+// mountedRoutes is the adapter's full surface as of awesome-go-auth v0.3.1.
 //
 // Unlike TestNoInventedAuthRoutes, enumerating it here is the point: the question
 // is whether every route can reach a store, and that cannot be sampled. When the

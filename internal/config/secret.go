@@ -143,7 +143,8 @@ const (
 var ErrSecretNotFound = errors.New("config: secret not found")
 
 // ErrResolverUnavailable means a reference names a store this build cannot talk
-// to. It is what the P1 placeholders for the AWS-backed resolvers return.
+// to. It is what the placeholder resolvers return when no AWS-backed resolver has
+// been injected (cmd/auth injects both from internal/integration/aws).
 var ErrResolverUnavailable = errors.New("config: secret store not available in this build")
 
 // SecretResolver fetches a secret from one backing store.
@@ -173,9 +174,10 @@ type Resolvers struct {
 	Env            SecretResolver
 }
 
-// EnvSecretResolver reads secrets from process environment variables. This is
-// the only resolver that ships in P1; it is development-grade by definition, and
-// Load emits a deploy-time warning when a production stack depends on it.
+// EnvSecretResolver reads secrets from process environment variables. It is the
+// resolver of last resort behind Secrets Manager and SSM (both wired from
+// internal/integration/aws by cmd/auth); it is development-grade by definition,
+// and Load emits a deploy-time warning when a production stack depends on it.
 type EnvSecretResolver struct {
 	// Lookup defaults to os.LookupEnv. Injected in tests, and by the deployment
 	// tooling when it wants to resolve against a captured environment.
@@ -199,7 +201,8 @@ func (r EnvSecretResolver) Resolve(_ context.Context, ref string) (string, error
 }
 
 // UnavailableResolver stands in for a store this build cannot reach. Load uses
-// it for Secrets Manager and SSM in P1 so that a document referencing them fails
+// it for Secrets Manager and SSM when nothing is injected, so a document
+// referencing them fails
 // with an actionable message naming the knob, instead of starting with an empty
 // signing secret.
 type UnavailableResolver struct {
