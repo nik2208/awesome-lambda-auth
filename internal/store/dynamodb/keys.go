@@ -43,6 +43,13 @@ const (
 	typeLink        = "link"
 	typeLinkID      = "linkid"
 	typePendingLink = "plink"
+
+	// The two template-directory item types (data-model.md §1.6). Distinct
+	// values rather than one shared "template": they have different attribute
+	// sets, and _t exists so a migration sweep can tell them apart without
+	// inferring type from the sort-key prefix.
+	typeMailTemplate  = "template"
+	typeUITranslation = "uitranslation"
 )
 
 // Sort keys and partition-key prefixes for the item types this package writes.
@@ -71,6 +78,18 @@ const (
 	// from pkUserPrefix because the items that use it (memberships, linked
 	// accounts) are reachable from methods that carry no tenant id.
 	gsi1UserIDPrefix = "USERID" + keySep
+
+	// templatesPK is the directory partition every mail template and UI
+	// translation set lives in (data-model.md §1.6) — a constant, not a prefix,
+	// the way TENANTS is. auth.TemplateStore carries no tenant and no owner: a
+	// template is deployment-global in the reference too, and one partition is
+	// what makes each of the two list methods a single Query.
+	templatesPK = "TEMPLATES"
+
+	// The two sort-key namespaces of that partition. Their tails are validated
+	// against idPattern, so neither can be forged into the other.
+	skMailTemplatePrefix  = "MAIL" + keySep
+	skUITranslationPrefix = "UI" + keySep
 
 	skProfile      = "PROFILE"
 	skEmail        = "EMAIL"
@@ -274,6 +293,27 @@ func oauthGSI1SK(provider, providerID string) string {
 func linkIDPK(linkID string) string { return pkLinkIDPrefix + linkID }
 
 func pendingLinkPK(state string) string { return pkPendingLinkPrefix + state }
+
+// mailTemplateSK and uiTranslationSK key the two entries of the template
+// directory under templatesPK. The id and the page are validated with checkID
+// before either is called: the template ids the core defines (mailer.go:240-245,
+// "password-reset" and its siblings) all satisfy idPattern, and '#' is excluded
+// so MAIL#<id> cannot be made to read as anything else.
+func mailTemplateSK(id string) string { return skMailTemplatePrefix + id }
+
+func uiTranslationSK(page string) string { return skUITranslationPrefix + page }
+
+// mailTemplateIDFromSK and uiTranslationPageFromSK are the inverses. Neither
+// value is duplicated into an attribute of its own (data-model.md §5, "Mail
+// template"), so the sort key is the one place it lives and these are the only
+// decoders.
+func mailTemplateIDFromSK(sk string) (string, bool) {
+	return strings.CutPrefix(sk, skMailTemplatePrefix)
+}
+
+func uiTranslationPageFromSK(sk string) (string, bool) {
+	return strings.CutPrefix(sk, skUITranslationPrefix)
+}
 
 // pendingLinkSingleUsePrefixes are the two PendingLinkStore namespaces whose
 // entries are credentials spent exactly once, and are therefore consumed by the

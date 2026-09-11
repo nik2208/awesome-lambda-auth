@@ -44,6 +44,15 @@ var (
 	// and why cmd/auth tests that the routes above them work.
 	_ auth.LinkedAccountStore = (*LinkedAccounts)(nil)
 	_ auth.PendingLinkStore   = (*PendingLinks)(nil)
+
+	// The template store (template_store.go) is on *Store directly. The view
+	// pattern above exists for one reason — a method-name collision — and none
+	// of TemplateStore's six names collides with anything here, so a view would
+	// be a third type carrying nothing but an indirection. It shares one thing
+	// with the two OAuth stores: the core does not discover it by type assertion
+	// either, it is handed over explicitly through auth.WithTemplateStore, which
+	// is what Store.Templates() exists for and why cmd/auth pins the shape.
+	_ auth.TemplateStore = (*Store)(nil)
 )
 
 // Interfaces deliberately NOT implemented yet, listed so their absence reads as a

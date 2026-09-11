@@ -79,6 +79,14 @@ func (it item) tp(name string, v *time.Time) item {
 	return it.t(name, *v)
 }
 
+// av sets a prebuilt attribute value. It is for the composite types — a map of
+// maps — that the scalar setters above cannot express; the caller owns the
+// omission decision.
+func (it item) av(name string, v types.AttributeValue) item {
+	it[name] = v
+	return it
+}
+
 // ttl sets the expiry DynamoDB reaps on. TTL is not a security boundary —
 // deletion is best-effort within roughly 48 hours — so every read of a
 // TTL-bearing item re-checks its expiry attribute in code (§4.5).
@@ -163,6 +171,64 @@ func exprNames(attrs ...string) map[string]string {
 		m["#"+a] = a
 	}
 	return m
+}
+
+// itemBytes estimates an item's size the way DynamoDB's own accounting does —
+// attribute names plus values, three bytes per map or list plus one per element,
+// a number at about a byte per two digits — rounding up wherever the documented
+// rule is approximate. Its one caller compares the result against a cap set
+// 100 KB under the 400 KB item limit (MaxTemplateBytes), so the estimate has to
+// be conservative, not exact: an item that passes here must not be refused there.
+func itemBytes(m map[string]types.AttributeValue) int {
+	n := 0
+	for name, av := range m {
+		n += len(name) + attributeBytes(av)
+	}
+	return n
+}
+
+func attributeBytes(av types.AttributeValue) int {
+	switch v := av.(type) {
+	case *types.AttributeValueMemberS:
+		return len(v.Value)
+	case *types.AttributeValueMemberN:
+		return len(v.Value) + 1
+	case *types.AttributeValueMemberB:
+		return len(v.Value)
+	case *types.AttributeValueMemberBOOL, *types.AttributeValueMemberNULL:
+		return 1
+	case *types.AttributeValueMemberSS:
+		n := 0
+		for _, s := range v.Value {
+			n += len(s)
+		}
+		return n
+	case *types.AttributeValueMemberNS:
+		n := 0
+		for _, s := range v.Value {
+			n += len(s) + 1
+		}
+		return n
+	case *types.AttributeValueMemberBS:
+		n := 0
+		for _, b := range v.Value {
+			n += len(b)
+		}
+		return n
+	case *types.AttributeValueMemberM:
+		n := 3
+		for k, e := range v.Value {
+			n += len(k) + 1 + attributeBytes(e)
+		}
+		return n
+	case *types.AttributeValueMemberL:
+		n := 3
+		for _, e := range v.Value {
+			n += 1 + attributeBytes(e)
+		}
+		return n
+	}
+	return 0
 }
 
 func avS(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }

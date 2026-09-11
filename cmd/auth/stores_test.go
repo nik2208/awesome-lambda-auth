@@ -352,6 +352,32 @@ func TestDynamoDBStoreSatisfiesTheOAuthWiring(t *testing.T) {
 	}
 }
 
+// TestDynamoDBStoreSatisfiesTheTemplateStore pins the other capability the
+// core does not discover by type assertion. auth.TemplateStore is handed to it
+// through auth.WithTemplateStore, so if the DynamoDB store drifted out of shape
+// nothing would fail to build — the templates knob would simply do nothing, and
+// every mail would keep rendering the built-in template. The concrete store
+// must satisfy the interface directly (its methods are on *Store, see the
+// package's interfaces.go) and expose it through Templates(), which is what the
+// composition root looks for, structurally, the way it finds the OAuth views.
+func TestDynamoDBStoreSatisfiesTheTemplateStore(t *testing.T) {
+	t.Parallel()
+	store, err := ddbstore.New(stubDynamoAPI{}, ddbstore.Options{TableName: "unused", Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	if !asserts[auth.TemplateStore](store) {
+		t.Fatal("*dynamodb.Store does not satisfy auth.TemplateStore, so auth.WithTemplateStore could never receive it")
+	}
+	templates := store.Templates()
+	if templates == nil {
+		t.Fatal("Templates() returned nil")
+	}
+	if templates != auth.TemplateStore(store) {
+		t.Fatal("Templates() returned something other than the store itself; the methods are meant to be on *Store")
+	}
+}
+
 func asserts[T any](v any) bool {
 	_, ok := v.(T)
 	return ok
