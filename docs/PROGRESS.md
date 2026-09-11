@@ -18,10 +18,10 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 - [x] H10 upstream PR #48 merged (`a8b8e26`): truthful README parity table and roadmap
 
 ### Phases (U half before D half)
-- [ ] P2 email flows — U: v0.4.0 · D: `email.siteUrls`, `email.templatesDir`, `email.deliveryWebhook`
-- [ ] P3 2FA issuer and claims — U: v0.5.0 · D: `twoFactor`, `security.jwt.extraClaims`, `security.jwt.claimsWebhook`
-- [ ] P4 OAuth — U: v0.6.0 · D: `oauth`
-- [ ] P5 IdP, JWKS, KMS, resource server — U: v0.7.0 · D: `idProvider`, `resourceServer`
+- [x] P2 email flows — U: v0.4.0 · D: wired, deployed, 44 contract cases green
+- [~] P3 2FA issuer and claims — U: v0.5.0 done · D: in flight
+- [~] P4 OAuth — U: v0.6.0 done · D: in flight
+- [~] P5 IdP, JWKS, KMS, resource server — U: v0.6.0 done (JWKS route, resource server, signer, code store) · D: in flight
 - [ ] P6 settings, UI, docs, admin — U: v0.8.0, v0.9.0 · D: `ui`, `admin`, `docs`, `runtimeSettings`
 - [ ] P7 tools, event plane, SSE, rate limiting — U: v0.10.0 · D: `tools`, `rateLimit`
 
@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Upstream: #61 settings store, #62 JWKS well-known route and #63 resource server merged; #64 OAuth provisioning rebased and in CI. Next upstream tags: v0.6.0 (OAuth: #55, #57, #64) and v0.7.0 (IdP: #53, #59, #62, #63), then v0.8.0 for the settings store once the UI and docs work joins it. Product: P2-D green and deployed (44 contract cases, 0 skips); next is P3-D, which needs the core at v0.5.0 or later — the pin is still v0.4.0.
+Upstream: **v0.6.0** tagged 2026-09-12 (#61 settings store, #62 JWKS well-known route, #63 resource server, #64 OAuth provisioning); main clean, no open PRs. Product pinned to v0.6.0 and green. Workflow `product-p3-p4-p5` running: P3 twoFactor and claims, P4 OAuth, P5 IdP with a KMS signer and resource-server mode, each with an adversarial review and a fix pass. After them: deploy, contract suite with the grown REQUIRE list, then P6.
 
 ## Blocks
 
