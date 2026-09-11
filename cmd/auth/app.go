@@ -429,11 +429,10 @@ func defaultStoreFactory(ctx context.Context, cfg *config.Config, log *slog.Logg
 		if err != nil {
 			return nil, nil, err
 		}
-		// The deviations are logged once, at cold start, so they show up in the
-		// deployment log rather than being discovered from a client's bug report.
-		for _, note := range store.CompatibilityNotes() {
-			log.Info("store compatibility note", slog.String("note", note))
-		}
+		// Every register is logged once, at cold start, so the deviations show up
+		// in the deployment log rather than being discovered from a client's bug
+		// report. The memory driver announces the product and core registers only.
+		logDeviations(log, store.CompatibilityNotes())
 		return store, store, nil
 
 	case config.StoreDriverMemory:
@@ -442,6 +441,7 @@ func defaultStoreFactory(ctx context.Context, cfg *config.Config, log *slog.Logg
 		// concurrent execution environments do not share one.
 		log.Warn("using the in-memory store: state is per execution environment and is lost on every cold start",
 			slog.String("path", "stores.driver"))
+		logDeviations(log, nil)
 		return memoryStoreBundle{
 			MemoryUserStore: auth.NewMemoryUserStore(),
 			links:           auth.NewMemoryLinkedAccounts(),
