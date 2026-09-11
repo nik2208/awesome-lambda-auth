@@ -1,0 +1,72 @@
+name: go
+
+# The same gate scripts/toolchain.sh runs locally, on a hosted runner:
+# formatting, vet, build, race tests against a DynamoDB Local service
+# container, then the reproducible Lambda zip with a size budget. The
+# contract suite self-skips here because AWESOME_AUTH_CONTRACT_BASE_URL is
+# unset; it runs against a deployed stack, not in this workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: gofmt / vet / build / test
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports:
+          - 8000:8000
+    env:
+      DYNAMODB_ENDPOINT: http://localhost:8000
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: eu-west-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test (race, DynamoDB Local reachable)
+        run: go test -race -count=1 -timeout 30m ./...
+
+  artifact:
+    name: lambda zip within budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the Lambda zip in the pinned toolchain image
+        run: ./scripts/build-lambda.sh
+
+      - name: enforce the artifact size budget
+        run: ./scripts/check-artifact-size.sh dist/auth-arm64.zip "${ARTIFACT_BUDGET_BYTES:-12582912}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: auth-lambda
+          path: dist/auth-*.zip
+          if-no-files-found: error
