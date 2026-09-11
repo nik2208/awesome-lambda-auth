@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Upstream: **v0.4.0** (email flows: #49, #50, #52, #58) and **v0.5.0** (claims and IdP signer: #51, #56, #59, #60) tagged 2026-09-11; main `719f812`. Batch 3 running as workflow `upstream-batch-3` (OAuth provisioning 3.3, JWKS well-known route 4.2, resource-server verifier 4.4, settings store 5.1). Product: pinned to v0.4.0 (`2e4bca8`, local); P2-D running as workflow `product-p2-email-flows` on worktrees `wt/lambda-email` (wiring + delivery tests adapted to the reference subjects), `wt/lambda-templates` (DynamoDB template store), `wt/lambda-contract` (contract cases, docs, loginProvider tripwire). Lesson recorded: a rebase can drop a CHANGELOG hunk into a released section when the context matches; check the [Unreleased] section after every rebase (fixed for 0.5.0 in `719f812`).
+P2-D landed and is deployed: the email domain is fully wired, the stack redeployed and 44 contract cases pass against it with no skips. Twelve domains remain gated. Upstream: v0.4.0 and v0.5.0 tagged; PRs #61 settings store, #62 JWKS well-known route, #63 resource server, #64 OAuth provisioning open with CI running, each having passed an adversarial review and a fix pass.
 
 ## Blocks
 
@@ -47,3 +47,13 @@ Upstream dance: `v0.3.1` at `0079771`; PR #47 and #48 squash-merged
 Stack: unchanged
 Notes: the `lambda-auth` profile resolves to the standalone project account, distinct from the `default` profile; the profile name is the invariant and the pre-flight enforces it.
 Next: H8, H9, H10, then P2
+
+### B1 — P2 email flows (product · main · 2026-09-12)
+Status: green
+Landed: `4fda373` wiring + gates, `ceca016` DynamoDB template store, `08586fb` contract cases, `78addb9` driver claim
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ build ✓ (auth-arm64.zip, sha256 6a68aa26…) deploy ✓ UPDATE_COMPLETE contract ✓ 44 cases, 0 skips
+Deviations: `templates-dir-only-seeds-absent-ids` added to the product register and the index
+Decisions: D-17 (templates from the artifact), D-18 (the delivery webhook requires a secret), D-11 amended
+Upstream dance: core pinned to v0.4.0 (`2e4bca8`)
+Stack: no new resources; new parameters EmailSiteUrls, EmailDeliveryWebhookUrl, EmailDeliveryWebhookSecretArn, ConfigFile, all empty by default. $0/month added.
+Next: P3-D (twoFactor, extraClaims, claimsWebhook) once v0.5.0 is pinned; upstream #61–#64 merge and tag
