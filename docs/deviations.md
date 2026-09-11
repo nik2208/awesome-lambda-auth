@@ -52,6 +52,8 @@ The ids below are `auth.CompatibilityNotes().KnownDeviations`; the full text of 
 - `advertised-2fa-methods-require-store-support` — `available2faMethods` lists only the factors the mounted stores can complete.
 - `csrf-cookie-not-reissued-with-tokens` — the CSRF cookie is distributed by the middleware, not re-set by every token-issuing response.
 - `cookie-max-age-follows-configured-ttl` — cookie `Max-Age` derives from the configured token TTLs instead of fixed values.
+- `totp-issuer-defaults-to-config-issuer` — the TOTP issuer label defaults to `Config.Issuer` (the reference falls back to the literal `awesome-node-auth`); `WithTwoFactorAppName` matches the reference exactly.
+- `totp-accepts-one-step-of-skew` — a TOTP code from the previous or next 30-second step is accepted; the reference (otplib `epochTolerance` 0) accepts the current step only. No knob exists to match it.
 
 ## Recording a new deviation
 
