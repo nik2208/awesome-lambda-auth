@@ -189,6 +189,7 @@ On success the middleware sets `req.user = payload` (the raw JWT claims incl. `s
 - **Side effect**: welcome email via `config.email.sendWelcome(user.email, data)` or, failing that, `MailerService.sendWelcome(user.email, { loginUrl: `${siteUrl}/login` })` when `config.email.mailer` set (:719-725).
 - **Success**: **`201 { "success": true, "userId": "<user.id>" }`** (:726). Pinned: tests/new-features.test.ts:1000-1016.
 - **Errors**: whatever `onRegister` throws goes through `handleError` — plain `Error` → `500 { "error": "Internal server error" }` (pinned: tests/new-features.test.ts:1028-1037); an `AuthError` thrown by the callback surfaces its own status/`code`. No tokens are issued and no cookies set by this route (registration ≠ login).
+- **dev line (node-auth@e8af923):** mounted by default — `registerHandler = options.onRegister ?? <built-in userStore.create + bcrypt handler>` (auth.router.ts:515-525, gate :801; `400 INVALID_INPUT` on missing email/password, :519); see wire-contract.md §1 3.7.
 
 #### 3.8 POST /sessions/cleanup — auth.router.ts:733-744
 

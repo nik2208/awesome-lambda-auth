@@ -221,6 +221,7 @@ On success the middleware sets `req.user = payload` (the raw JWT claims incl. `s
 - **Side effect**: welcome email via `config.email.sendWelcome(user.email, data)` or, failing that, `MailerService.sendWelcome(user.email, { loginUrl: `${siteUrl}/login` })` when `config.email.mailer` set (:719-725).
 - **Success**: **`201 { "success": true, "userId": "<user.id>" }`** (:726). Pinned: tests/new-features.test.ts:1000-1016.
 - **Errors**: whatever `onRegister` throws goes through `handleError` — plain `Error` → `500 { "error": "Internal server error" }` (pinned: tests/new-features.test.ts:1028-1037); an `AuthError` thrown by the callback surfaces its own status/`code`. No tokens are issued and no cookies set by this route (registration ≠ login).
+- **dev line (node-auth@e8af923):** the mounting gate is `if (registerHandler && !isResourceServer)` (auth.router.ts:801) where `registerHandler = options.onRegister ?? (typeof userStore.create === 'function' ? <built-in> : undefined)` (:515-525); since `IUserStore.create` is a required member (src/interfaces/user-store.interface.ts:6) the route is **mounted by default** on every non-resource-server deployment. Built-in handler (:517-523): `email`/`password` missing, non-string or empty → `AuthError('Email and password are required', 'INVALID_INPUT', 400)` (:519) → **`400 { "error": "Email and password are required", "code": "INVALID_INPUT" }`** via `handleError` (:197-204); otherwise bcrypt hash (:521) and `userStore.create({ ...data, email: data['email'], password: hash })` (:522) — the **entire raw body is spread into the store** (mass assignment; reference-issues.md N41). Response unchanged: `201 { "success": true, "userId" }` (:817); still no tokens/cookies. The same resolved handler drives `GET <apiPrefix>/ui/config` `features.register` (`routerOptions: { ...options, onRegister: registerHandler }`, :1793 — §6 5.1) and the auth router's `GET <apiPrefix>/openapi.json`, which therefore lists `POST <basePath>/register` by default (`hasRegister: !!registerHandler`, :1808 → src/router/openapi.ts:154-169: 201 `{success, userId}` + 400 "Validation error"). The v1.9.0 pin tests/new-features.test.ts:1018-1026 (404) was rewritten to expect 201 (tests/new-features.test.ts:1052-1062); hashing + the `create` call are pinned at tests/auth.router.test.ts:142-166.
 
 #### 3.8 POST /sessions/cleanup — auth.router.ts:733-744
 
@@ -695,7 +696,7 @@ Also: any request into the router when `config.csrf.enabled` and no `csrf-token`
   4. `handleOAuthLogin(req, res, user, config, redirectTo)` (:1298-1317):
      - `requires2fa = (user.isTotpEnabled && user.totpSecret) || user.require2FA` (:1299-1300).
      - **2FA path:** builds `available2faMethods` from `'totp'` (TOTP enabled), `'sms'` (`user.phoneNumber && config.sms`), `'magic-link'` (`config.email.sendMagicLink || config.email.mailer`) (:1302-1305); mints a `tempToken` = access token signed with `accessTokenExpiresIn: '5m'` (:1306-1309); **302 redirect to `${redirectTo}/auth/2fa?tempToken=<urlenc>&methods=<urlenc comma-joined list>`** (:1310-1313). Note this does **not** go through `buildUiLink` — no apiPrefix or `/ui/` segment is inserted (unlike the account-conflict redirect); the front-end origin must serve `/auth/2fa` itself. No auth cookies are set on this response. Pinned: tests/auth-flow-improvements.test.ts:708-734; bearer completion of the tempToken via `POST /2fa/verify` with `X-Auth-Strategy: bearer` returning top-level `accessToken`/`refreshToken` and no cookies: :736-778.
-     - **No-2FA path:** `updateLastLogin(user.id)`; `issueTokens(..., redirectTo || '/')` → sets `accessToken`/`refreshToken` (+ `csrf-token` if enabled) cookies and **302 redirects to `redirectTo`** with no query params appended (:1315-1316, :445-447). Pinned: redirect to custom mobile scheme `myapp://auth` (tests/auth-flow-improvements.test.ts:688-706), redirect to state-embedded origin (:901-920).
+     - **No-2FA path:** `updateLastLogin(user.id)`; `issueTokens(..., redirectTo || '/')` → sets `accessToken`/`refreshToken` (+ `csrf-token` if enabled) cookies and **302 redirects to `redirectTo`** with no query params appended (:1315-1316, :445-447). Pinned: redirect to custom mobile scheme `myapp://auth` (tests/auth-flow-improvements.test.ts:688-706), redirect to state-embedded origin (:901-920). **dev line (node-auth@e8af923):** before `handleOAuthLogin` each callback pre-fills `user.loginProvider = user.loginProvider ?? '<google|github|s.name>'` (auth.router.ts:1476, :1526, :1576), so the callback-issued JWT pair carries `loginProvider: '<provider>'` where v1.9.0 signed `'local'` for strategies whose user lacks the field; the mutation is in-memory only, so `/me` and later `/refresh` pairs still derive from the DB user (§7 1.1, reference-issues.md N42). After `issueTokens` the no-2FA path also publishes `AUTH_OAUTH_SUCCESS` when a bus is set (:1443-1448); the 2FA redirect path emits nothing (§6 (8)).
 - **Account-conflict flow** (`catch` on `AuthError` with `code === 'OAUTH_ACCOUNT_CONFLICT'` — google :1346-1356, github :1392-1401, generic :1438-1447). This error is thrown by the application's `findOrCreateUser`/`handleCallback`, never by the library itself; `err.data` may carry `{ email, providerAccountId }`:
   1. `siteUrl = resolveOAuthRedirect(state, ...)`.
   2. If `options.pendingLinkStore` and both `email` and `providerAccountId` are present: `pendingLinkStore.stash(email, provider, providerAccountId)` (failures swallowed, console.error).
@@ -824,7 +825,7 @@ Scope: complete wire contract of `src/router/admin.router.ts` in awesome-node-au
 
 ### Route count note
 
-`grep 'router.(get|post|put|patch|delete)('` over src/router/admin.router.ts yields exactly **50** registrations, first at src/router/admin.router.ts:543 (`POST /login`) and last at src/router/admin.router.ts:1517 (`GET /api/docs`). The recon inventory's "51 routes" is off by one — [MISMATCH] with recon, not with any client. (`router.use(expressJson())` at src/router/admin.router.ts:509 is middleware, not a route; it means the admin router parses JSON bodies itself even if the host app has no body parser.)
+`grep 'router.(get|post|put|patch|delete)('` over src/router/admin.router.ts yields exactly **50** registrations, first at src/router/admin.router.ts:543 (`POST /login`) and last at src/router/admin.router.ts:1517 (`GET /api/docs`). The recon inventory's "51 routes" is off by one — [MISMATCH] with recon, not with any client. (`router.use(expressJson())` at src/router/admin.router.ts:509 is middleware, not a route; it means the admin router parses JSON bodies itself even if the host app has no body parser.) **dev line (node-auth@e8af923):** **51** registrations — the same 50 plus `POST /users/:id/promote` (src/router/admin.router.ts:1030-1064; documented under "User ↔ role assignment" below). Still no `code` field on any admin error body.
 
 ### Guard selection (applies to every `guard`-protected route)
 
@@ -844,6 +845,7 @@ Priority: `accessPolicy` (new) > `adminSecret` (legacy) > open with a stderr war
 - `userStore.findById(sub)` null/throws → `401 {"error":"Unauthorized"}` (:354-364). [UNTESTED]
 - Policy evaluation (:366-385): `'is-admin-flag'` → `user.isAdmin === true` (:369-370); `'first-user'` → `listUsers(1,0)[0].id === user.id` (:371-374), and if `listUsers` is not implemented → `500 {"error":"accessPolicy: first-user requires IUserStore.listUsers to be implemented"}` (:375-379) [UNTESTED]; custom function → `await policy(user, rbacStore)` (:380-381) [UNTESTED]; any throw → denied (:383-385). Denied → `403 {"error":"Forbidden"}` (:387-390). [UNTESTED for is-admin-flag denial path]
 - On success `(req as any).user = user` (:392-394).
+- **dev line (node-auth@e8af923):** the root-override synthetic user gains `roles: ['admin']` (admin.router.ts:405-416; typed `AuthorizedAdminUser = BaseUser & { roles: string[] }`, :30, exported from src/index.ts:68); after `findById`, `roles = rbacStore ? await rbacStore.getRolesForUser(user.id).catch(() => []) : []` and `authorizedUser = { ...user, roles }` (:431-432) — one extra RBAC read per guarded request when `rbacStore` is configured, failures collapse to `[]`; the policy (`is-admin-flag`, `first-user`, custom fn now typed `(user: AuthorizedAdminUser, rbacStore?) => boolean | Promise<boolean>`, :52) evaluates `authorizedUser` (:436-450) and `(req as any).user = authorizedUser` (:462). Nothing changes on the wire — `req.user` is never serialized. Pinned: tests/dx-improvements.test.ts:76-112.
 
 **Neither configured** → stderr warning `[awesome-node-auth] WARNING: createAdminRouter called without \`accessPolicy\` or \`adminSecret\`. …` and a pass-through guard (:530-537). [UNTESTED]
 
@@ -868,6 +870,8 @@ Registration is conditional: `if (sessionBased && secret)` (src/router/admin.rou
 - Pinned: clears the same name set at login with `Max-Age=0`/1970 expiry — tests/new-features.test.ts:1454-1476; clears `__Host-accessToken` on HTTPS — :1496-1515.
 
 ### UI shell & public static assets (no store gating)
+
+**dev line (node-auth@e8af923):** the built-in admin login form served to an unauthenticated HTML `GET /` gains `<p …>End-user login is at <code>/auth/ui/login</code>. This is the admin panel.</p>` (src/router/admin.router.ts:533) — a literal `/auth/…` path that ignores `apiPrefix`; cosmetic, body not pinned by any test.
 
 | Route | Guard | Notes |
 |---|---|---|
@@ -915,6 +919,7 @@ Registration is conditional: `if (sessionBased && secret)` (src/router/admin.rou
 - **GET /api/users/:id/roles** (src/router/admin.router.ts:893) → `200 {"roles":[…]}` (string array from `getRolesForUser`) (:897). Pinned: tests/new-features.test.ts:530-534.
 - **POST /api/users/:id/roles** (:904) — body `{role: string (required), tenantId?: string}`; missing role → `400 {"error":"role is required"}` (:908) [UNTESTED]; → `200 {"success":true}`. Pinned: :536-543.
 - **DELETE /api/users/:id/roles/:role** (:917) — `:role` is `decodeURIComponent`ed (:922) → `200 {"success":true}`. Pinned: :545-551.
+- **dev line (node-auth@e8af923): POST /users/:id/promote** (src/router/admin.router.ts:1030-1064) — the only admin JSON route **not** under `/api/`; middleware order `...rateLimiter, guard` (`AdminOptions.rateLimiter`, :208-211, is prepended here and nowhere else — :577, :1030). Body `{ method?: 'flag' | 'role' }`, default `'role'` (:1032). `flag`: `userStore.update` absent → **`501 {"error":"IUserStore.update is required for method=flag"}`** (:1036-1039), else `update(userId, { isAdmin: true })` → **`200 {"success":true,"method":"flag"}`** (:1040-1045). `role`: no `rbacStore` → **`404 {"error":"RBAC store not configured"}`** (:1049-1052), else `createRole('admin')` then `addRoleToUser(userId, 'admin')` (no tenant) → **`200 {"success":true,"method":"role"}`** (:1053-1059). Any throw → `500 {"error":"Internal server error"}` (:1060-1062). Absent from `buildAdminOpenApiSpec` (src/router/openapi.ts) and from `admin.js`. Under `AuthConfigurator.buildAllRouters` the full path is `<apiPrefix>/admin/users/:id/promote` (src/auth-configurator.ts:63-78). Pinned: tests/dx-improvements.test.ts:145-178. The two `/api/users/:id/roles*` mutations above additionally publish `ROLE_ASSIGNED` / `ROLE_REVOKED` when a bus is set (§6 (8)); their responses are unchanged.
 
 ### User ↔ tenant view (gated: `tenantStore`)
 
@@ -1144,7 +1149,7 @@ The JSON payload therefore contains keys `id`, `type`, `timestamp`, `topic`, `ra
 
 ### 4. AuthTools facade (src/tools/auth-tools.ts)
 
-Constructor (:170-189): `sseManager` created only when `options.sse === true` (else `null`); `WebhookSender` always instantiated; `webhookVersion` default `'1'` (:175); email/SMS `NotificationService` only when `emailConfig`/`smsConfig` provided; when SSE is on, the manager is registered in `SseNotifyRegistry` (:186-188, decorator plumbing in src/tools/sse-notify.decorator.ts:37-54 — not an HTTP surface).
+Constructor (:170-189): `sseManager` created only when `options.sse === true` (else `null`); `WebhookSender` always instantiated; `webhookVersion` default `'1'` (:175); email/SMS `NotificationService` only when `emailConfig`/`smsConfig` provided; when SSE is on, the manager is registered in `SseNotifyRegistry` (:186-188, decorator plumbing in src/tools/sse-notify.decorator.ts:37-54 — not an HTTP surface). **dev line (node-auth@e8af923):** constructor now :178-197; new `AuthToolsOptions.sseDistributor?: ISseDistributor` (:47-51, "used instead of the internal SseManager broadcaster" for `notify()`) stored at :184; stderr WARN when both `sse: true` and `sseDistributor` are given (:187-191).
 
 #### 4.1 track(eventName, data?, options) fan-out — exact order (:199-269)
 
@@ -1158,7 +1163,7 @@ Note: the code order is telemetry → bus → SSE → webhooks (comments `// 1.`
 #### 4.2 notify(target, data, options) channels (:292-342)
 
 - `channels` default `['sse']` (:293).
-- `'sse'`: `sseManager.broadcast(target, {type: options.type ?? 'notification', data, tenantId, userId, metadata})` (:296-304) — no-op without a manager (pinned tests/tools.test.ts:232-235, :237-251).
+- `'sse'`: `sseManager.broadcast(target, {type: options.type ?? 'notification', data, tenantId, userId, metadata})` (:296-304) — no-op without a manager (pinned tests/tools.test.ts:232-235, :237-251). **dev line (node-auth@e8af923):** the SSE branch (:310-323) tries `sseDistributor.publish(target, streamEvent).catch(() => {})` first (un-awaited, errors swallowed; the distributor receives the raw pre-envelope object — no `id`/`timestamp`/`topic`), then `sseManager.broadcast`, and is a no-op only when neither exists. `track()` (:248-259) is unchanged and still broadcasts through `sseManager` only — the distributor is honoured by `notify()` but not by `track()` (reference-issues.md N43). Pinned: tests/tools.test.ts "notify() prefers a custom SSE distributor when provided". HTTP surface (`POST /notify/:target` → 202) unchanged.
 - `'email'` / `'sms'`: require `options.userId` AND `userStore` (:307); user looked up via `userStore.findById` (errors → skip). Email additionally needs `user.email` + `emailConfig`: subject = `emailSubject ?? (type ? String(type) : 'Notification')` (:322 — a falsy `type` falls back to `'Notification'`; the `??`-chain notation previously given would never reach the fallback), text = `data` if string else `JSON.stringify(data, null, 2)`, html = `<p>` with `\n`→`<br>` (:321-330).
 > CORRECTED(verify): subject fallback is a ternary on `type`, not a nullish chain — `emailSubject ?? (options.type ? String(options.type) : 'Notification')`. SMS needs `user.phoneNumber` + `smsConfig`: message = `smsMessage ?? (string data or JSON.stringify(data))` (:333-339). All channel sends are `.catch()`-swallowed best-effort; a failing channel does not affect the others. [UNTESTED] (email/sms channels have no test in tests/tools.test.ts)
 
@@ -1176,7 +1181,7 @@ Auth: none. CSRF: none. Success `200` JSON, exact shape (built by `getUiConfig` 
 {
   "apiPrefix": "<req.baseUrl minus trailing '/ui', else configured apiPrefix>", // :97-98
   "features": {                       // :114-123 — all booleans
-    "register":       !!routerOptions.onRegister,
+    "register":       !!routerOptions.onRegister,   // dev line (node-auth@e8af923): true by default — routerOptions.onRegister is the resolved registerHandler (auth.router.ts:1793; ui.router.ts:121), false only in resource-server mode
     "magicLink":      !!email.sendMagicLink || !!email.mailer,
     "sms":            !!authConfig.sms,
     "google":         !!oauth.google,
@@ -1200,7 +1205,7 @@ Auth: none. CSRF: none. Success `200` JSON, exact shape (built by `getUiConfig` 
 ```
 
 - Quirk: when fetched via `/config`, the translations `page` argument is `'config'` (`req.path.replace(/^\//,'') || 'login'` evaluated inside the `/config` handler, :107). [UNTESTED]
-- Error fallback (:143-161): `features` collapses to only `{register:false, google:false, github:false}` — `magicLink`, `sms`, `forgotPassword`, `verifyEmail`, `twoFactor` become `undefined` for consumers; `ui` reverts to hardcoded defaults; `translations: {}`, `lang: 'en'`. [UNTESTED]
+- Error fallback (:143-161): `features` collapses to only `{register:false, google:false, github:false}` — `magicLink`, `sms`, `forgotPassword`, `verifyEmail`, `twoFactor` become `undefined` for consumers; `ui` reverts to hardcoded defaults; `translations: {}`, `lang: 'en'`. [UNTESTED] **dev line (node-auth@e8af923):** fallback unchanged (`register:false`, ui.router.ts:153).
 - Pinned: `headless:true`/`false` echoed from `authConfig.ui.headless` — tests/auth-js.test.ts:1398-1416.
 
 #### 5.2 Headless-mode early return (:175-182)
@@ -1258,6 +1263,104 @@ Final mount: `expressStatic(uiAssetsDir, { maxAge: 0, index: false })` — asset
 
 Not covered by any test [UNTESTED]: `POST /track` HTTP handler (body precedence, ip/UA extraction, 202), `POST /notify` HTTP handler, `GET /stream` handler (503, `?token=` promotion, topic intersection), `GET /telemetry` (200/501/param parsing), webhook 400 path, vm 5 s sync timeout + unbounded await, heartbeat wire format, `Last-Event-ID` semantics, distributor pub/sub paths, notify email/SMS channels, `/config` error fallback, upload statics, catch-all fallback chain, SSR injection content.
 
+### 8. Event emission map (dev line node-auth@e8af923)
+
+Not present at v1.9.0 — at `cc01e997` no router, strategy or middleware publishes to the `AuthEventBus` (reference-issues.md N10). At the dev line the routers publish when, and only when, a bus is supplied (`RouterOptions.eventBus`, src/router/auth.router.ts:183-188; `AdminOptions.eventBus`, src/router/admin.router.ts:162-166 — config-schema.md §1.20); every site below is skipped silently otherwise. Nothing in this subsection is visible on HTTP; it is the direct input for the P7 event plane. All `file:line` references here resolve against `nik2208/node-auth` @ `e8af923`.
+
+#### 8.1 Envelope and request context
+
+`AuthEventBus.publish(name, payload)` (src/events/auth-event-bus.ts:57-65) fills `event` and `timestamp` (ISO 8601, unless supplied) and emits on `name` **and** on `'*'`. Full `AuthEventPayload` (src/events/auth-event-bus.ts:6-26): `event`, `timestamp`, `data?`, `userId?`, `tenantId?`, `sessionId?`, `correlationId?`, `ip?`, `userAgent?`.
+
+`getRequestEventContext(req)` — identical in both routers (src/router/auth.router.ts:402-416, src/router/admin.router.ts:218-232):
+
+| Field | Source |
+|---|---|
+| `correlationId` | `req.headers['x-correlation-id']` (first element when the header repeats); `undefined` when absent; copied verbatim — **unvalidated client input**, no length or format check |
+| `ip` | `req.ip \|\| req.socket.remoteAddress` (honours Express `trust proxy` through `req.ip`) |
+| `userAgent` | `req.headers['user-agent']` (first element if array) |
+
+`publishRouterEvent` / `publishAdminEvent` (src/router/auth.router.ts:418-433, src/router/admin.router.ts:234-250) publish `{ ...context, ...payload }` — payload keys win. The three `AuthConfigurator` sites (§8.4) publish with **no** request context. `X-Correlation-Id` is thus the one new request header the dev line consumes; nothing is echoed back.
+
+#### 8.2 `src/router/auth.router.ts` — 19 sites
+
+| # | Line | Event | Trigger (route → outcome) | `userId` | `sessionId` | `data` |
+|---|---|---|---|---|---|---|
+| 1 | :649 | `AUTH_LOGIN_SUCCESS` | `POST /login` → 200 after `issueTokens` (no-2FA path only; the 2FA challenge responses emit nothing) | `user.id` | new `sid` | `{ method: 'local' }` |
+| 2 | :656 | `AUTH_LOGIN_FAILED` | `POST /login` → `AuthError` with `statusCode === 401` only (`INVALID_CREDENTIALS`, local.strategy.ts:21/:24/:28); the 403 `EMAIL_NOT_VERIFIED` / `EMAIL_VERIFICATION_REQUIRED` paths emit nothing | — | — | `{ method: 'local', email: req.body?.email }` (the attempted e-mail — PII on the bus) |
+| 3 | :692 | `AUTH_LOGOUT` | `POST /logout` → 200 (always, even with no/invalid cookie) | `req.user?.sub` (cookie-derived; bearer mode → `undefined`, §1 3.2 [MISMATCH] unchanged) | `req.user?.sid` | — |
+| 4 | :733 | `SESSION_ROTATED` | `POST /refresh` → 200 | `user.id` | new `sid` | `{ previousSessionId: payload.sid }` |
+| 5 | :813 | `USER_CREATED` | `POST /register` → 201 | `user.id` | — | `{ email: user.email, method: 'custom' \| 'default' }` (`'custom'` iff `options.onRegister` was supplied) |
+| 6 | :943 | `USER_2FA_ENABLED` | `POST /2fa/verify-setup` → 200 | `req.user.sub` | — | — |
+| 7 | :968 | `AUTH_LOGIN_SUCCESS` | `POST /2fa/verify` → 200 | `user.id` | new `sid` | `{ method: 'totp' }` |
+| 8 | :997 | `USER_2FA_DISABLED` | `POST /2fa/disable` → 200 | `req.user.sub` | — | — |
+| 9 | :1030 | `USER_PASSWORD_CHANGED` | `POST /change-password` → 200 (**not** `/reset-password`, which emits nothing) | `user.id` | — | — |
+| 10 | :1096 | `USER_EMAIL_VERIFIED` | `GET /verify-email` → 200 (not from the silent first-magic-link verification, :1278-1280) | `user.id` | — | — |
+| 11 | :1175 | `USER_EMAIL_CHANGED` | `POST /change-email/confirm` → 200 | `user.id` | — | `{ oldEmail, newEmail }` |
+| 12 | :1267 | `AUTH_LOGIN_SUCCESS` | `POST /magic-link/verify` `mode='2fa'` → 200 | `user.id` | new `sid` | `{ method: 'magic-link' }` |
+| 13 | :1282 | `AUTH_LOGIN_SUCCESS` | `POST /magic-link/verify` default (login) mode → 200 | `user.id` | new `sid` | `{ method: 'magic-link' }` |
+| 14 | :1408 | `AUTH_LOGIN_SUCCESS` | `POST /sms/verify` → 200 | `user.id` | new `sid` | `{ method: 'sms' }` |
+| 15 | :1444 | `AUTH_OAUTH_SUCCESS` | `GET /oauth/{google,github,<name>}/callback` → 302 (no-2FA path, after cookies set; the 2FA redirect path :1428-1440 returns first and emits nothing) | `user.id` | new `sid` | `{ provider: user.loginProvider ?? 'oauth', redirectTo }` |
+| 16 | :1480 | `AUTH_OAUTH_CONFLICT` | `GET /oauth/google/callback` → `OAUTH_ACCOUNT_CONFLICT` catch (before the 302) | — | — | `{ provider: 'google', ...err.data }` (`email`/`providerAccountId` from `err.data` land on the bus) |
+| 17 | :1530 | `AUTH_OAUTH_CONFLICT` | `GET /oauth/github/callback` → same | — | — | `{ provider: 'github', ...err.data }` |
+| 18 | :1580 | `AUTH_OAUTH_CONFLICT` | `GET /oauth/<name>/callback` → same | — | — | `{ provider: s.name, ...err.data }` |
+| 19 | :1776 | `USER_DELETED` | `DELETE /account` → 200 | `userId` (from token) | — | — |
+
+`tenantId` is never set by the auth router. `issueTokens` now returns `{ sessionId: payload.sid }` (:463, :493) to feed the `sessionId` column; it is `undefined` without a `sessionStore`.
+
+#### 8.3 `src/router/admin.router.ts` — 4 sites
+
+| # | Line | Event | Trigger | `userId` | `tenantId` | `data` |
+|---|---|---|---|---|---|---|
+| A | :1002 | `ROLE_ASSIGNED` | `POST /api/users/:id/roles` → 200 | `:id` | `body.tenantId` | `{ role }` |
+| B | :1020 | `ROLE_REVOKED` | `DELETE /api/users/:id/roles/:role` → 200 | `:id` | — | `{ role }` (decoded) |
+| C | :1041 | `ROLE_ASSIGNED` | `POST /users/:id/promote` `{ method: 'flag' }` → 200 | `:id` | — | `{ role: 'admin', method: 'flag' }` |
+| D | :1055 | `ROLE_ASSIGNED` | `POST /users/:id/promote` `{ method: 'role' }` → 200 | `:id` | — | `{ role: 'admin', method: 'role' }` |
+
+Admin `POST /login` / `POST /logout` and every other admin route emit nothing.
+
+#### 8.4 `src/auth-configurator.ts` — 3 sites (no request context)
+
+| # | Line | Event | Trigger | `data` |
+|---|---|---|---|---|
+| a | :92 | `ROLE_ASSIGNED` | `promoteToAdmin(userId, { method: 'flag' })` | `{ role: 'admin', method: 'flag' }` |
+| b | :104 | `ROLE_ASSIGNED` | `promoteToAdmin(userId, { method: 'role' })` | `{ role: 'admin', method: 'role' }` |
+| c | :133 | `ROLE_REVOKED` | `revokeAdmin(userId, { method })` — always, even when `method: 'both'` skipped the flag step for lack of `userStore.update` (:115-125) | `{ role: 'admin', method }` |
+
+#### 8.5 Full `AuthEventNames` (src/events/auth-event-names.ts:5-40) — 26 names, 15 with an emitter
+
+v1.9.0 has 25 names; the dev line inserts `USER_EMAIL_CHANGED` (:9). The 26 publish sites (19 + 4 + 3) cover 15 names; 11 remain convention-only.
+
+| Constant | String | Emitted at the dev line? |
+|---|---|---|
+| `USER_CREATED` | `identity.user.created` | yes (§8.2 #5) |
+| `USER_DELETED` | `identity.user.deleted` | yes (#19) — **not** from admin `DELETE /api/users/:id` |
+| `USER_EMAIL_CHANGED` | `identity.user.email.changed` | yes (#11) — **new name** |
+| `USER_EMAIL_VERIFIED` | `identity.user.email.verified` | yes (#10) — not from the first magic-link login (:1278-1280 verifies silently) |
+| `USER_PASSWORD_CHANGED` | `identity.user.password.changed` | yes (#9) — **not** from `/reset-password` |
+| `USER_2FA_ENABLED` | `identity.user.2fa.enabled` | yes (#6) |
+| `USER_2FA_DISABLED` | `identity.user.2fa.disabled` | yes (#8) |
+| `USER_LINKED` | `identity.user.linked` | **no** (linked-accounts / link-verify routes emit nothing) |
+| `USER_UNLINKED` | `identity.user.unlinked` | **no** |
+| `SESSION_CREATED` | `identity.session.created` | **no** (login success emits only `AUTH_LOGIN_SUCCESS`) |
+| `SESSION_REVOKED` | `identity.session.revoked` | **no** (`DELETE /sessions/:handle`, admin `DELETE /api/sessions/:handle`, logout's `revokeSession` all silent) |
+| `SESSION_EXPIRED` | `identity.session.expired` | **no** |
+| `SESSION_ROTATED` | `identity.session.rotated` | yes (#4) |
+| `AUTH_LOGIN_SUCCESS` | `identity.auth.login.success` | yes (#1, #7, #12, #13, #14) |
+| `AUTH_LOGIN_FAILED` | `identity.auth.login.failed` | yes (#2) — local 401 only; no failure events for TOTP/SMS/magic-link/OAuth |
+| `AUTH_LOGOUT` | `identity.auth.logout` | yes (#3) |
+| `AUTH_OAUTH_SUCCESS` | `identity.auth.oauth.success` | yes (#15) |
+| `AUTH_OAUTH_CONFLICT` | `identity.auth.oauth.conflict` | yes (#16–18) |
+| `TENANT_CREATED` | `identity.tenant.created` | **no** |
+| `TENANT_DELETED` | `identity.tenant.deleted` | **no** |
+| `TENANT_USER_ADDED` | `identity.tenant.user.added` | **no** |
+| `TENANT_USER_REMOVED` | `identity.tenant.user.removed` | **no** |
+| `ROLE_ASSIGNED` | `identity.role.assigned` | yes (§8.3 A, C, D; §8.4 a, b) |
+| `ROLE_REVOKED` | `identity.role.revoked` | yes (§8.3 B; §8.4 c) |
+| `PERMISSION_GRANTED` | `identity.permission.granted` | **no** |
+| `PERMISSION_REVOKED` | `identity.permission.revoked` | **no** |
+
+Coverage holes a port must not paper over by inventing emissions the reference lacks: `/reset-password`, session revocation (user and admin), linked accounts, admin user delete / tenant / role CRUD, admin login. Retention note for the telemetry store: `AUTH_LOGIN_FAILED.data.email` (:657) and `AUTH_OAUTH_CONFLICT.data` (spreads `err.data`, :1481) carry PII.
+
 ---
 
 ## 7. Token claim sets, cookie serialization matrix, JWKS, error catalog
@@ -1298,7 +1401,7 @@ if (config.buildTokenPayload) return { ...base, ...config.buildTokenPayload(user
 | `sub` | string (user.id) | always |
 | `email` | string | always |
 | `role` | string | only when `user.role !== undefined` (undefined values are dropped by JSON serialization in `jwt.sign`) |
-| `loginProvider` | string | always (`?? 'local'`, src/router/auth.router.ts:379) |
+| `loginProvider` | string | always (`?? 'local'`, src/router/auth.router.ts:379). **dev line (node-auth@e8af923):** `buildPayload` unchanged (:387), but the OAuth callbacks pre-fill `user.loginProvider ?? '<google\|github\|s.name>'` before signing (:1476, :1526, :1576), so the callback-issued pair carries the provider name for strategy users that lack the field; not persisted — `/me` and every later `/refresh` pair still say what the DB user says (claim drift, reference-issues.md N42) |
 | `isEmailVerified` | boolean | always (`?? false`) |
 | `isTotpEnabled` | boolean | always (`?? false`) |
 | `sid` | string | only when `options.sessionStore` configured (src/router/auth.router.ts:425-433) |
@@ -1485,7 +1588,7 @@ Emitters that translate AuthError → HTTP:
 
 So the canonical error body is `{ "error": "<message>", "code": "<CODE>" }`; unexpected errors are `{ "error": "Internal server error" }` **without** `code`.
 
-#### 4.2 Complete `new AuthError(` table (all 38 sites in `src/`)
+#### 4.2 Complete `new AuthError(` table (all 38 sites in `src/` at v1.9.0 — **39 at the dev line node-auth@e8af923**, last row)
 
 | `code` | message | HTTP | Emission site |
 |---|---|---|---|
@@ -1524,8 +1627,9 @@ So the canonical error body is `{ "error": "<message>", "code": "<CODE>" }`; une
 | `OAUTH_PROFILE_FAILED` | Failed to get GitHub user profile | 401 | src/strategies/oauth/github.strategy.ts:58 |
 | `OAUTH_PROFILE_FAILED` | Failed to get `${name}` user profile (dynamic) | 401 | src/strategies/oauth/generic-oauth.strategy.ts:148 |
 | `SMS_NOT_CONFIGURED` | SMS not configured | 500 | src/strategies/sms/sms.strategy.ts:12 |
+| `INVALID_INPUT` | Email and password are required | 400 | **dev line (node-auth@e8af923) only** — src/router/auth.router.ts:519, built-in `/register` handler (§1 3.7); absent at v1.9.0 |
 
-(Counts per file: auth.router.ts 5, token.service.ts 8, local 5, magic-link 5, api-key 6, google 3, github 3, generic-oauth 2, sms 1 = 38 — matches the grep count.)
+(Counts per file: auth.router.ts 5, token.service.ts 8, local 5, magic-link 5, api-key 6, google 3, github 3, generic-oauth 2, sms 1 = 38 — matches the grep count. **dev line (node-auth@e8af923):** auth.router.ts 6 with `INVALID_INPUT` = **39**, matches the grep count at `e8af923`.)
 
 #### 4.3 Coded errors emitted as plain objects (not AuthError)
 

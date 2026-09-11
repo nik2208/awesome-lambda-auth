@@ -165,7 +165,7 @@ Auth: none. CSRF: none. Success `200` JSON, exact shape (built by `getUiConfig` 
 {
   "apiPrefix": "<req.baseUrl minus trailing '/ui', else configured apiPrefix>", // :97-98
   "features": {                       // :114-123 — all booleans
-    "register":       !!routerOptions.onRegister,
+    "register":       !!routerOptions.onRegister,   // dev line (node-auth@e8af923): = resolved registerHandler (auth.router.ts:1793; ui.router.ts:121) → true unless resource-server mode
     "magicLink":      !!email.sendMagicLink || !!email.mailer,
     "sms":            !!authConfig.sms,
     "google":         !!oauth.google,
