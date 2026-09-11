@@ -8,6 +8,15 @@
 #
 # Module and build caches live in named volumes, so only source crosses the
 # host bind mount — incremental builds stay fast even on /mnt/c.
+#
+# The DynamoDB store tests need DynamoDB Local. Run it on a Docker network and
+# point the container at it by name; without both variables those tests skip:
+#
+#   docker network create awesome-auth-test
+#   docker run -d --name ddblocal --network awesome-auth-test \
+#     amazon/dynamodb-local -jar DynamoDBLocal.jar -inMemory -sharedDb
+#   DYNAMODB_ENDPOINT=http://ddblocal:8000 TOOLCHAIN_NETWORK=awesome-auth-test \
+#     ./scripts/toolchain.sh go test ./internal/store/dynamodb/... ./cmd/auth/...
 set -euo pipefail
 
 GO_IMAGE="${GO_IMAGE:-golang:1.25-trixie}"
@@ -30,6 +39,10 @@ run_in_go_image() {
     -e AWESOME_AUTH_CONTRACT_BASE_URL \
     -e AWESOME_AUTH_CONTRACT_API_PREFIX \
     -e AWESOME_AUTH_CONTRACT_REQUIRE \
+    -e DYNAMODB_ENDPOINT \
+    -e GONOSUMDB \
+    -e GOPRIVATE \
+    ${TOOLCHAIN_NETWORK:+--network "${TOOLCHAIN_NETWORK}"} \
     "$@"
 }
 
