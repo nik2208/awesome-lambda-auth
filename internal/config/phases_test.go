@@ -14,9 +14,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		domain string
 		mutate func(Document)
 	}{
-		{"ui", func(doc Document) {
-			set(doc, "ui.branding.siteName", "Example")
-		}},
 		{"admin", func(doc Document) {
 			set(doc, "admin.basePath", "/console")
 		}},
@@ -45,12 +42,18 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 // TestUnwiredDomainViaEnvIsAlsoRefused: the phase gap is detected on the layered
 // result, so an override supplied through the environment counts exactly as much
 // as one written in the document.
+//
+// It used to say this with AWESOME_AUTH_UI_ENABLED, and moved to the tools
+// block when `ui` was wired. The domain is incidental — what is under test is
+// that the environment layer is compared like the document layer — but a test
+// naming a wired domain would assert nothing at all, so the move is the point
+// rather than a rename.
 func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
 	env := baseEnv()
-	env["AWESOME_AUTH_UI_ENABLED"] = "true"
+	env["AWESOME_AUTH_TOOLS_BASE_PATH"] = "/ops"
 
 	_, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
-	requireRule(t, err, RuleUnimplemented, "ui")
+	requireRule(t, err, RuleUnimplemented, "tools")
 }
 
 // TestUnwiredDomainViaSecretIsAlsoRefused: a secret supplied through its
@@ -182,11 +185,78 @@ func TestDocsIsWired(t *testing.T) {
 	}
 }
 
+// TestUIIsWired is the other side of the refusal table for the domain this block
+// opened: a document that configures the hosted UI loads instead of tripping the
+// phase gate.
+//
+// Every case here is a knob that used to be enough to refuse a deployment on its
+// own, which is what the gate did and why it had to go before the block could be
+// used. `false` is in the table for the reason it was in TestDocsIsWired's: it is
+// the value an operator writes to say the surface is deliberately off, and the
+// gate made saying it impossible, because saying it was itself a configured
+// domain.
+//
+// The block needs no store of its own, which is what makes it unlike
+// runtimeSettings: the branding the UI *reads* from a settings store is
+// optional, and with no store configured the core serves the static branding
+// exactly as the reference serves its empty settings object. So there is nothing
+// for checkStoreRequirements to insist on and nothing here that should refuse.
+// What cmd/auth then does with the block — including the one refusal it adds,
+// for an assetsDir that cannot render a page — is its own tests' business.
+func TestUIIsWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+	}{
+		{"the surface switched on", func(doc Document) {
+			set(doc, "ui.enabled", true)
+		}},
+		{"the surface switched off deliberately", func(doc Document) {
+			set(doc, "ui.enabled", false)
+		}},
+		{"branding alone", func(doc Document) {
+			set(doc, "ui.branding.siteName", "Example")
+			set(doc, "ui.branding.primaryColor", "#112233")
+		}},
+		{"headless, with no pages served", func(doc Document) {
+			set(doc, "ui.enabled", true)
+			set(doc, "ui.headless", true)
+		}},
+		{"an asset directory of its own", func(doc Document) {
+			set(doc, "ui.enabled", true)
+			set(doc, "ui.assetsDir", "/var/task/ui")
+		}},
+		{"an upload directory, which is accepted and not honoured", func(doc Document) {
+			set(doc, "ui.uploadDir", "/var/task/uploads")
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+			if err != nil {
+				t.Fatalf("ui is wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if w.Path == "ui" && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("ui is still reported as an unwired domain: %s", w.Problem)
+				}
+			}
+			if _, gated := UnwiredDomains()["ui"]; gated {
+				t.Error("ui is still listed by UnwiredDomains")
+			}
+		})
+	}
+}
+
 // TestAllowUnimplementedDowngradesToWarning: the gap stays visible in the
 // deployment log, it just no longer refuses. It must never become silence.
 func TestAllowUnimplementedDowngradesToWarning(t *testing.T) {
 	doc := baseDoc()
-	set(doc, "ui.enabled", true)
+	set(doc, "tools.basePath", "/ops")
 
 	cfg, err := Load(t.Context(), Options{
 		Document:           doc,
@@ -197,7 +267,7 @@ func TestAllowUnimplementedDowngradesToWarning(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	for _, w := range cfg.Warnings() {
-		if w.Path == "ui" && strings.Contains(w.Problem, "not yet wired") {
+		if w.Path == "tools" && strings.Contains(w.Problem, "not yet wired") {
 			return
 		}
 	}
