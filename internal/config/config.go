@@ -924,7 +924,7 @@ func Defaults() *Config {
 		},
 		// Rate limiting. The reference has none and therefore no defaults to
 		// inherit; every value here is a product decision and each is argued in
-		// docs/config-reference.md §12. The short form:
+		// docs/config-reference.md §13. The short form:
 		//
 		// Enabled is true because this product's house rule is that forgetting
 		// tightens rather than loosens — the same rule that makes CSRF on by

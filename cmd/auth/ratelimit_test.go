@@ -108,7 +108,7 @@ func TestRetryAfterIsNeverZero(t *testing.T) {
 // They are a product decision with no upstream to appeal to — the reference has
 // no limiter and the spec left every one of them TBD — so the only thing keeping
 // them honest is that they are written down in three places that have to agree:
-// here, docs/config-reference.md §12, and the deviation register, which tells an
+// here, docs/config-reference.md §13, and the deviation register, which tells an
 // operator that a stack they never configured now answers 429 where the
 // reference answers 200. A default changed without those changed is the failure
 // this test exists to cause.

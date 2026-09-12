@@ -175,6 +175,57 @@ func WireDeviations() []WireDeviation {
 				"grows the branch, which is when this entry is retired.",
 			Spec: "docs/spec/wire-contract.md §3 (the tempToken) and §4; docs/config-reference.md §8.4",
 		},
+		{
+			ID: "rate-limited-routes-answer-429",
+			Surface: "every route named in rateLimit.scope -- by default POST <prefix>/login, POST <prefix>/forgot-password, " +
+				"POST <prefix>/magic-link/send, POST <prefix>/magic-link/verify, POST <prefix>/sms/send, " +
+				"POST <prefix>/sms/verify and POST <prefix>/2fa/verify",
+			Behaviour: "A deployment that configures nothing is rate limited. Over budget, the route answers, byte for byte, " +
+				"429 Too Many Requests with Retry-After: <integer seconds, at least 1>, Content-Type: application/json, " +
+				"Cache-Control: no-store and the body {\"error\":\"Too many requests\",\"code\":\"RATE_LIMITED\"} -- and no " +
+				"Set-Cookie, not even the CSRF auto-init one, because the limiter is outermost and nothing that sets a cookie " +
+				"has run. No RateLimit-Limit, RateLimit-Remaining or RateLimit-Reset header is sent, on this response or on a " +
+				"successful one. The default budget is 10 requests per 60-second fixed window per subject per scope, and the " +
+				"default subject is the normalised email in the request body, falling back to the sha256 of a presented " +
+				"tempToken and then to the client address the event reported.",
+			Reference: "There is no rate limiting anywhere. RouterOptions.rateLimiter (src/router/auth.router.ts:46) is an " +
+				"empty slot for a host-supplied Express handler; absent, the router collapses it to an empty middleware list " +
+				"(rl = [], :468) and the package ships no algorithm, no default, no status and no body. Every one of these " +
+				"routes answers its ordinary 200, 400 or 401 however often it is called.",
+			Why: "This is net-new surface rather than a divergence from something: there is no upstream behaviour to reproduce, so " +
+				"the question was never whether to match the reference but what a deployable product should do when nobody says. " +
+				"The answer is this product's house rule, the one csrf-enabled-by-default and production-by-default already state: " +
+				"a library may leave the choice to its integrator, a product has to be safe with an empty configuration. An auth " +
+				"stack that ships unlimited is one that gets credential-stuffed, and the scope is exactly the flows where a guess " +
+				"costs an attacker nothing -- login, the three credential-minting sends, and the two six-digit codes. An operator " +
+				"who wants the reference's behaviour sets rateLimit.enabled to false and gets it exactly.\n\n" +
+				"Four properties of the refusal are decisions in their own right. **The budget is per account, not per address.** " +
+				"keyBy defaults to email because the threat is account-shaped and because an address-keyed default would put a " +
+				"corporate NAT's whole office in one bucket and one DynamoDB partition, making the limiter the outage for the " +
+				"people it is not aimed at (data-model.md §2.3, whose own conclusion is that the account-scoped limiter must be the " +
+				"primary control); volumetric defence by source address belongs at the edge. **No RateLimit-* headers.** The usual " +
+				"objection, that they hand an attacker the limit, is weak -- anyone willing to spend requests finds it by reaching " +
+				"it. The decisive one is that RateLimit-Remaining on a successful response would be an oracle about somebody else's " +
+				"traffic under an account-keyed counter: whoever can name victim@example.com could read from a 200 whether that " +
+				"person has been logging in. Retry-After stays, because it tells a caller only what the refusal already told them " +
+				"and a client that backs off is better for everyone. **The window is fixed**, so the worst case over any sliding " +
+				"window of the same length is twice the budget; closing that seam means a read-modify-write on the login path " +
+				"forever, and a factor of two does not change what a limit does to a stuffing run. **It fails open.** The counter " +
+				"lives in the same DynamoDB table as the user store, so on this product a limiter that cannot count and a route " +
+				"that cannot serve are one event: refusing would convert a partial degradation into a total outage and would " +
+				"replace a 500 naming the store with a 429 blaming the caller. During such a window the remaining bound is the " +
+				"in-process pre-filter, which is per execution environment and is stated as such rather than sold as a limit.\n\n" +
+				"One 429 in this surface is not ours and is deliberately not restated here. GET <prefix>/oauth/{provider} and its " +
+				"callback, for a provider nobody configured, are bare 404 stubs registered outside the limiter slot in the " +
+				"reference (:1361-1362, :1407-1408) and one always-guarded handler here, so behind a limiter at its limit they " +
+				"answer 429 where the reference answers 404. That belongs to the imported core, whose HTTPConfig.RateLimiter " +
+				"comment names it and whose register carries it; duplicating it as a product entry would give one divergence two " +
+				"owners and two places to retire it from. It is also unreachable without an operator naming an OAuth route in " +
+				"rateLimit.scope, which the vocabulary does not offer. " +
+				"cmd/auth/ratelimit_test.go TestRateLimitResponseIsExactlyThis and " +
+				"TestTheShippedDefaultsAreTheOnesTheRegisterClaims fail the day this entry stops describing the product.",
+			Spec: "docs/spec/config-schema.md §1.16; docs/spec/data-model.md §1.5 row #61 and §2.3; docs/config-reference.md §13",
+		},
 	}
 }
 
