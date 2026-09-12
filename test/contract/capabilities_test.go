@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -345,4 +346,65 @@ func init() {
 			p.Set(CapDocs, classify(p.Anon.GET(t, "/openapi.json")))
 		},
 	})
+}
+
+// ── the hosted UI, probed on the document its pages boot from ────────────────
+
+// CapUI is the built-in UI: the whole of the reference's ui router, mounted at
+// <prefix>/ui — the config document, the server-rendered pages, the vendored
+// assets. A deployment either mounts all of it or none of it, because one flag
+// registers one handler for the subtree (ui.enabled here, config.ui.enabled and
+// auth.router.ts:1639-1648 there).
+const CapUI Capability = "ui"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapUI,
+		Stage: stageProbed,
+		Probe: func(t *testing.T, p *probeRun) {
+			// Anonymous, and on the config document rather than on a page.
+			//
+			// Anonymous because this is the first request a login page makes,
+			// before any session exists — the route asks for no credential and a
+			// probe holding one would hide a deployment that had put the UI
+			// behind a session.
+			//
+			// On the document because it is the one response under this mount
+			// whose *shape* says the UI is really there. Every page path falls
+			// through to the SSR catch-all, so a deployment serving a stray
+			// index.html would answer 200 to a page probe while being no UI at
+			// all; and the document is the only part of the surface a headless
+			// deployment still serves, so probing a page would report a
+			// legitimate SPA posture as an absent feature.
+			p.Set(CapUI, classifyUI(p.Anon.GET(t, "/ui/config")))
+		},
+	})
+}
+
+// classifyUI reads the probe answer for GET <prefix>/ui/config.
+//
+// It is classify with two changes, both of which exist because this route is
+// not gated on a store.
+//
+// A 404 is the UI being switched off, not a store being unwired: with
+// ui.enabled false the adapter registers nothing under the mount, and the
+// router answers whatever it answers for an unknown path. classify's own
+// message would tell an operator to go looking for a store.
+//
+// And a 200 has to be JSON. The config route lives *inside* the UI handler
+// rather than beside it (ui.router.ts:165), and the layer behind it is an SSR
+// catch-all that renders the login page for anything it does not recognise — so
+// a deployment whose config route had stopped answering would serve HTML here
+// with a perfectly good 200, and every case below would then fail on the
+// document's contents instead of the probe reporting one fault once.
+func classifyUI(r *Resp) capability {
+	switch {
+	case r.Status == 404:
+		return capability{state: capAbsent, why: fmt.Sprintf("%s answered 404 — ui.enabled is off, so no UI is mounted at all", r.Target)}
+	case r.Status == 200 && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json"):
+		return capability{state: capBroken, why: fmt.Sprintf(
+			"%s answered 200 %s, which is not the config document — the SSR catch-all is answering in its place",
+			r.Target, r.Header.Get("Content-Type"))}
+	}
+	return classify(r)
 }
