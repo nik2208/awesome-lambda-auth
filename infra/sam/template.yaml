@@ -58,6 +58,8 @@ Metadata:
         Parameters: [MailerFromAddress, MailerFromName, MailerIdentity, MailerDefaultLang, EnableSmsDelivery]
       - Label: {default: Email flows}
         Parameters: [EmailSiteUrls, EmailDeliveryWebhookUrl, EmailDeliveryWebhookSecretArn]
+      - Label: {default: Second factor and token claims}
+        Parameters: [TotpIssuer, ClaimsWebhookUrl, ClaimsWebhookTimeoutMs, ClaimsWebhookSecretArn]
       - Label: {default: Configuration document}
         Parameters: [ConfigFile]
       - Label: {default: Storage}
@@ -304,6 +306,68 @@ Parameters:
       start; the value never enters the template.
 
   # -----------------------------------------------------------------------
+  # Second factor and token claims (config-schema.md §1.1, §1.8). The TOTP
+  # issuer always applies; the claims webhook is off unless a url is given, and
+  # then its signing secret is required. security.jwt.extraClaims is a mapping
+  # table with no environment form at all — it arrives in the configuration
+  # document (ConfigFile below), like every other structured knob.
+  # -----------------------------------------------------------------------
+
+  TotpIssuer:
+    Type: String
+    Default: awesome-node-auth
+    MinLength: 1
+    Description: >-
+      AWESOME_AUTH_2FA_APP_NAME — the name an authenticator app shows above the
+      six digits, and the issuer in the otpauth:// URI POST /2fa/setup returns.
+      It is what a user reads to tell one enrolment from another, so set it to
+      the product name they know. The default is the reference's literal;
+      an empty value is refused at start.
+
+  ClaimsWebhookUrl:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://.+$'
+    Description: >-
+      AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL — an https endpoint asked for extra
+      token claims on every mint (login, refresh, 2FA step-up) and on GET /me.
+      It is POSTed {"user": <the profile as /me renders it>} and answers
+      {"claims": {...}}. Empty disables it. It CANNOT set sid, tid, jti, typ,
+      iss, iat or exp — the library writes those after the merge — but it can
+      override the six base claims, so point this only at a receiver you own.
+      A failure or timeout fails the mint: login answers 500 rather than issuing
+      a token with fewer claims than the deployment configured.
+
+  ClaimsWebhookTimeoutMs:
+    Type: Number
+    Default: 2000
+    MinValue: 1
+    MaxValue: 10000
+    Description: >-
+      AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS — one request, connect to last
+      byte. A login is waiting on this inside a Lambda invocation, so keep it
+      well under Timeout below; the whole invocation fails if the function times
+      out first, and this deadline is what turns a slow receiver into a fast 500
+      instead. MaxValue is not the only guard: the loader refuses anything above
+      10000 whatever route the value arrives by, so the same ceiling holds for
+      the configuration document and for a variable set outside this template.
+
+  ClaimsWebhookSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    Description: >-
+      ARN of an existing Secrets Manager secret holding the key that signs every
+      claims request (X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the body>).
+      REQUIRED whenever ClaimsWebhookUrl is set, and refused without it: the
+      request body is the user profile and the answer decides what the token
+      authorises, so an unsigned receiver can neither tell this deployment's
+      question from anybody else's nor be told apart from a receiver that is
+      not it. Nothing is generated for you — the receiver has to be configured
+      with the same key. Append #<jsonKey> to select one key of a JSON secret.
+      The function reads it at cold start; the value never enters the template.
+
+  # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
   # OAuth profile maps, rate-limit scopes) have no environment variable by
   # design; they arrive as a JSON document baked into the artifact by
@@ -400,6 +464,8 @@ Conditions:
   HasEmailSiteUrls: !Not [!Equals [!Ref EmailSiteUrls, '']]
   HasDeliveryWebhook: !Not [!Equals [!Ref EmailDeliveryWebhookUrl, '']]
   HasDeliveryWebhookSecret: !Not [!Equals [!Ref EmailDeliveryWebhookSecretArn, '']]
+  HasClaimsWebhook: !Not [!Equals [!Ref ClaimsWebhookUrl, '']]
+  HasClaimsWebhookSecret: !Not [!Equals [!Ref ClaimsWebhookSecretArn, '']]
   HasConfigFile: !Not [!Equals [!Ref ConfigFile, '']]
   # A named stage on the raw execute-api URL puts /<stage> in front of every
   # path the browser sees, so the Path-scoped refresh cookie has to match.
@@ -711,6 +777,26 @@ Resources:
             - !Ref EmailDeliveryWebhookSecretArn
             - !Ref 'AWS::NoValue'
 
+          # --- second factor and token claims ----------------------------
+          # The issuer is unconditional: every stack mounts /2fa/setup, the
+          # binary always passes the value, and an empty one is refused at
+          # start. The webhook knobs follow the delivery webhook exactly —
+          # a url that switches it on, a timeout, and a SECRETSMANAGER
+          # reference whose value the function fetches at cold start.
+          AWESOME_AUTH_2FA_APP_NAME: !Ref TotpIssuer
+          AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL: !If [HasClaimsWebhook, !Ref ClaimsWebhookUrl, !Ref 'AWS::NoValue']
+          # !Sub rather than !Ref: a Lambda environment variable is a string,
+          # and the parameter is a Number so that CloudFormation enforces the
+          # range before the stack is touched.
+          AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS: !If
+            - HasClaimsWebhook
+            - !Sub '${ClaimsWebhookTimeoutMs}'
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET_SECRETSMANAGER: !If
+            - HasClaimsWebhookSecret
+            - !Ref ClaimsWebhookSecretArn
+            - !Ref 'AWS::NoValue'
+
           # --- configuration document ------------------------------------
           # A path inside the artifact, never a value: the document is part of
           # the reproducible zip, so what the function reads is what was built.
@@ -858,6 +944,26 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Select [0, !Split ['#', !Ref EmailDeliveryWebhookSecretArn]]
+          - !Ref 'AWS::NoValue'
+
+        # -----------------------------------------------------------------
+        # The claims webhook's signing key, on exactly the same terms as the
+        # delivery webhook's above: its own statement, present only when an ARN
+        # was named, scoped to that one secret with the '#<jsonKey>' selector
+        # stripped because the selector is the function's and the resource is
+        # the secret. Two statements rather than one with two resources, so
+        # that a stack with one webhook grants nothing for the other.
+        # -----------------------------------------------------------------
+        - !If
+          - HasClaimsWebhookSecret
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadClaimsWebhookSigningSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Select [0, !Split ['#', !Ref ClaimsWebhookSecretArn]]
           - !Ref 'AWS::NoValue'
 
         # -----------------------------------------------------------------

@@ -72,9 +72,9 @@ type Options struct {
 	SMS  auth.SMSTransport
 
 	// HTTPClient issues every outbound HTTP request this binary makes on a
-	// route's behalf — today the delivery webhook. Nil, the zero value, is
-	// http.DefaultClient. Injected so a test can point the webhook at a TLS
-	// httptest server it trusts; like Mail and SMS, injecting it switches
+	// route's behalf: the delivery webhook and the claims webhook. Nil, the
+	// zero value, is http.DefaultClient. Injected so a test can point either at
+	// a TLS httptest server it trusts; like Mail and SMS, injecting it switches
 	// nothing on.
 	HTTPClient *http.Client
 }
@@ -195,6 +195,16 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 	coreOpts = append(coreOpts, emailOpts...)
+	coreOpts = append(coreOpts, twoFactorOptions(cfg)...)
+	// Token claims. Like emailOptions this one can refuse: a claim mapped from
+	// a field the core does not expose, or named after a reserved session
+	// claim, is a document fault and has to stop the deployment rather than
+	// turn every login into a 500.
+	claimsOpts, err := claimsOptions(cfg, opts.HTTPClient, log)
+	if err != nil {
+		return nil, err
+	}
+	coreOpts = append(coreOpts, claimsOpts...)
 	coreOpts = append(coreOpts, oauthOptions(cfg, users, deliver, log)...)
 
 	core, err := auth.New(coreOpts...)
@@ -314,6 +324,12 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 	return []auth.Option{
 		auth.WithSecret(cfg.AccessTokenSecret()),
 		auth.WithTokenTTLs(cfg.Security.JWT.AccessTokenTTL.Duration(), cfg.Security.JWT.RefreshTokenTTL.Duration()),
+		// The cost every password this deployment hashes is written at. It
+		// cannot fail here: WithBcryptCost refuses anything outside bcrypt's
+		// 4..31, and validate.go has already refused anything outside 10..15,
+		// which is the narrower range — so the option and the schema cannot
+		// disagree about a value that loaded.
+		auth.WithBcryptCost(cfg.Security.Password.BcryptSaltRounds),
 		auth.WithSessionCheckOn(cfg.Sessions.CheckOn),
 		auth.WithUserStore(users),
 		auth.WithSessionStore(sessions),
@@ -633,13 +649,14 @@ type knobGap struct {
 	Remedy  string
 }
 
-// coreBcryptCost is bcrypt.DefaultCost, which awesome-go-auth hardcodes in
-// hashPassword (security.go). Duplicated as a literal rather than imported so
-// that this file does not pull in golang.org/x/crypto for one constant; the
-// test that reads it against the core's behaviour is the guard.
-const coreBcryptCost = 10
-
 // unwiredKnobs reports every knob the operator set that the core cannot honour.
+//
+// security.password.bcryptSaltRounds used to head this list, because the core
+// hashed at a fixed cost and exposed no option for it. v0.6.0 exports
+// WithBcryptCost, coreOptions passes it, and the gap is gone — the configured
+// cost is now the deployed cost. Nothing replaced it: the only other candidate
+// P3 looked at was the iss claim, and there is no knob in a wired domain that
+// asks for one, so there is nothing being ignored to report (twofactor.go).
 func unwiredKnobs(cfg *config.Config) []knobGap {
 	defaults := config.Defaults()
 	var gaps []knobGap
@@ -651,16 +668,6 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 				"so security.jwt.accessTokenSecret is the only secret in use and this one signs nothing",
 			Remedy: "keep it set — RS-1 requires it and it becomes live as soon as the core takes a second secret — but do not " +
 				"rely on rotating it to invalidate refresh tokens today",
-		})
-	}
-
-	if cfg.Security.Password.BcryptSaltRounds != coreBcryptCost {
-		gaps = append(gaps, knobGap{
-			Path: "security.password.bcryptSaltRounds",
-			Problem: fmt.Sprintf("the auth core hashes passwords at the fixed bcrypt cost %d and exposes no option for it, so the configured %d has no effect",
-				coreBcryptCost, cfg.Security.Password.BcryptSaltRounds),
-			Remedy: fmt.Sprintf("set it to %d to match what is actually applied, or leave it and accept that the deployed cost is %d",
-				coreBcryptCost, coreBcryptCost),
 		})
 	}
 

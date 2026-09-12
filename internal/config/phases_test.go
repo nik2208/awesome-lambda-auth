@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -13,17 +14,8 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		domain string
 		mutate func(Document)
 	}{
-		{"security.jwt.extraClaims", func(doc Document) {
-			set(doc, "security.jwt.extraClaims.tenant", map[string]any{"fromUserField": "tenantId"})
-		}},
-		{"security.jwt.claimsWebhook", func(doc Document) {
-			set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
-		}},
 		{"oauth", func(doc Document) {
 			set(doc, "oauth.provisioning.autoCreate", true)
-		}},
-		{"twoFactor", func(doc Document) {
-			set(doc, "twoFactor.appName", "Example")
 		}},
 		{"idProvider", func(doc Document) {
 			set(doc, "idProvider.issuer", "https://auth.example.com")
@@ -312,6 +304,17 @@ func TestDeliveryWebhookRequiresItsSecret(t *testing.T) {
 		requireRule(t, err, "", "email.deliveryWebhook.timeoutMs")
 	})
 
+	t.Run("a timeout past the ceiling", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "email.deliveryWebhook.url", "https://delivery.example.com/hook")
+		set(doc, "email.deliveryWebhook.timeoutMs", maxWebhookTimeoutMs+1)
+		env := baseEnv()
+		env["AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET"] = "delivery-webhook-signing-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		requireRule(t, err, "", "email.deliveryWebhook.timeoutMs")
+	})
+
 	// A refusal is written to CloudWatch, and this is the one URL knob in the
 	// schema whose path may itself be a secret: a receiver that cannot verify an
 	// HMAC signature is told to carry a capability token in the path instead,
@@ -354,6 +357,221 @@ func TestDeliveryWebhookRequiresItsSecret(t *testing.T) {
 			t.Errorf("timeoutMs = %d, want 750 from the environment", got)
 		}
 		if got := cfg.SecretValue("email.deliveryWebhook.secret"); got != "delivery-webhook-signing-secret" {
+			t.Errorf("the secret did not resolve through its documented variable")
+		}
+	})
+}
+
+// TestTokenClaimDomainsAreWired is the P3 counterpart of
+// TestEmailFlowDomainsAreWired: the TOTP issuer and the two token-claim knobs
+// load instead of tripping the phase gap.
+//
+// Each is written the way the schema requires it, so this also pins that
+// un-gating relaxed nothing: the claims webhook needs its signing secret, an
+// extra claim needs exactly one of fromUserField and const. What cmd/auth then
+// does with them — build the claims hook, label the otpauth URI — is its own
+// tests' business.
+func TestTokenClaimDomainsAreWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+		env    func(map[string]string)
+	}{
+		{"twoFactor", func(doc Document) {
+			set(doc, "twoFactor.appName", "Example App")
+		}, nil},
+		{"security.jwt.extraClaims", func(doc Document) {
+			set(doc, "security.jwt.extraClaims.tenant", map[string]any{"fromUserField": "tenantId"})
+			set(doc, "security.jwt.extraClaims.plan", map[string]any{"const": "enterprise"})
+		}, nil},
+		{"security.jwt.claimsWebhook", func(doc Document) {
+			set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
+			set(doc, "security.jwt.claimsWebhook.timeoutMs", 1500)
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+		}},
+		{"all three together", func(doc Document) {
+			set(doc, "twoFactor.appName", "Example App")
+			set(doc, "security.jwt.extraClaims.tenant", map[string]any{"fromUserField": "tenantId"})
+			set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+			env := baseEnv()
+			if tc.env != nil {
+				tc.env(env)
+			}
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if err != nil {
+				t.Fatalf("the P3 domains are wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("%s is still reported as an unwired domain: %s", w.Path, w.Problem)
+				}
+			}
+			for _, path := range []string{"twoFactor", "security.jwt.extraClaims", "security.jwt.claimsWebhook"} {
+				if _, gated := UnwiredDomains()[path]; gated {
+					t.Errorf("%s is still listed by UnwiredDomains", path)
+				}
+			}
+		})
+	}
+}
+
+// TestClaimsWebhookRequiresItsSecret: the receiver is handed the user profile
+// and its answer decides what the token authorises, so a url without the secret
+// that signs the requests is refused, and a secret without a url is refused as
+// the dead configuration it is — the same rule the delivery webhook has, for a
+// different reason (config.go, the Webhook type).
+func TestClaimsWebhookRequiresItsSecret(t *testing.T) {
+	const secretPath = "security.jwt.claimsWebhook.secret"
+
+	t.Run("url without a secret", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		d := requireRule(t, err, "", secretPath)
+		if !strings.Contains(d.Remedy, "AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET") {
+			t.Errorf("the remedy does not name the variable that supplies the secret:\n%s", d.Remedy)
+		}
+		// The wording has to be the claims webhook's own: an operator told
+		// "every request carries a credential" about this knob would be told
+		// something untrue about the block they are fixing.
+		if strings.Contains(d.Problem, "delivery webhook") {
+			t.Errorf("the diagnostic describes the delivery webhook instead:\n%s", d.Problem)
+		}
+	})
+
+	t.Run("secret reference without a url", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, secretPath, map[string]any{"envVar": "MY_CLAIMS_SECRET"})
+		env := baseEnv()
+		env["MY_CLAIMS_SECRET"] = "claims-webhook-signing-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		requireRule(t, err, "", "security.jwt.claimsWebhook.url")
+	})
+
+	t.Run("a non-positive timeout", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
+		set(doc, "security.jwt.claimsWebhook.timeoutMs", 0)
+		env := baseEnv()
+		env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		requireRule(t, err, "", "security.jwt.claimsWebhook.timeoutMs")
+	})
+
+	// The ceiling, and the reason it is enforced here rather than only by the
+	// CFN parameter's MaxValue: the value can arrive by three routes and
+	// CloudFormation bounds one of them. This subtest uses the two the template
+	// cannot see — the environment variable and the document — because a rule
+	// that only held for a stack deployed through the template would not be a
+	// rule this product has.
+	//
+	// What it buys: every login, refresh and step-up waits on this receiver
+	// inside the invocation, so a deadline past the function's own Timeout does
+	// not turn a slow receiver into a fast 500 — it fails the invocation and
+	// answers nothing.
+	t.Run("a timeout past the ceiling", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			load func() (*Config, error)
+		}{
+			{"from the environment", func() (*Config, error) {
+				env := baseEnv()
+				env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL"] = "https://claims.example.com/hook"
+				env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+				env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS"] = "600000"
+				return Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
+			}},
+			{"from the document", func() (*Config, error) {
+				doc := baseDoc()
+				set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
+				set(doc, "security.jwt.claimsWebhook.timeoutMs", maxWebhookTimeoutMs+1)
+				env := baseEnv()
+				env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+				return Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := tc.load()
+				d := requireRule(t, err, "", "security.jwt.claimsWebhook.timeoutMs")
+				if !strings.Contains(d.Remedy, strconv.Itoa(maxWebhookTimeoutMs)) {
+					t.Errorf("the remedy does not name the ceiling the operator has to get under:\n%s", d.Remedy)
+				}
+			})
+		}
+	})
+
+	// And the ceiling itself loads: a rule written as > would refuse the
+	// documented maximum, which is the sort of off-by-one an operator discovers
+	// from a failed deployment.
+	t.Run("the ceiling itself is accepted", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "security.jwt.claimsWebhook.url", "https://claims.example.com/hook")
+		set(doc, "security.jwt.claimsWebhook.timeoutMs", maxWebhookTimeoutMs)
+		env := baseEnv()
+		env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+
+		cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		if err != nil {
+			t.Fatalf("load at the documented ceiling: %v", err)
+		}
+		if got := cfg.Security.JWT.ClaimsWebhook.TimeoutMs; got != maxWebhookTimeoutMs {
+			t.Errorf("timeoutMs = %d, want %d", got, maxWebhookTimeoutMs)
+		}
+	})
+
+	// The same reasoning the delivery webhook's refusals follow: a cold-start
+	// failure is written to CloudWatch, and a receiver behind a gateway that
+	// cannot check an HMAC is commonly given a capability token in the path.
+	t.Run("a refusal never echoes the receiver's path", func(t *testing.T) {
+		const capability = "hunter2-capability-token"
+		for _, tc := range []struct{ name, url string }{
+			{"plain http", "http://claims.example.com/hook/" + capability},
+			{"not a URL at all", "claims.example.com/hook/" + capability},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				doc := baseDoc()
+				set(doc, "security.jwt.claimsWebhook.url", tc.url)
+				env := baseEnv()
+				env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+
+				_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+				d := requireRule(t, err, "", "security.jwt.claimsWebhook.url")
+				said := d.Problem + " " + d.Remedy
+				if strings.Contains(said, capability) {
+					t.Errorf("the diagnostic echoes the receiver's path, where the capability token lives:\n%s", said)
+				}
+			})
+		}
+	})
+
+	t.Run("url, timeout and secret all have environment overrides", func(t *testing.T) {
+		env := baseEnv()
+		env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL"] = "https://claims.example.com/hook"
+		env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET"] = "claims-webhook-signing-secret"
+		env["AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS"] = "900"
+
+		cfg, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if got := cfg.Security.JWT.ClaimsWebhook.TimeoutMs; got != 900 {
+			t.Errorf("timeoutMs = %d, want 900 from the environment", got)
+		}
+		if got := cfg.SecretValue(secretPath); got != "claims-webhook-signing-secret" {
 			t.Errorf("the secret did not resolve through its documented variable")
 		}
 	})

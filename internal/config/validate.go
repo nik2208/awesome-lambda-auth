@@ -76,14 +76,14 @@ func validateJWT(c *Config, d *diagnostics) {
 		}
 	}
 
-	if u := c.Security.JWT.ClaimsWebhook.URL; u != "" {
-		absoluteURL(d, "security.jwt.claimsWebhook.url", u, true)
-		if c.Security.JWT.ClaimsWebhook.TimeoutMs <= 0 {
-			d.errf("", "security.jwt.claimsWebhook.timeoutMs",
-				"the claims webhook has no positive timeout, so a slow endpoint would stall every login",
-				"set a timeout in milliseconds, e.g. 2000")
-		}
-	}
+	validateSignedWebhook(c, d, signedWebhook{
+		base: "security.jwt.claimsWebhook",
+		hook: c.Security.JWT.ClaimsWebhook,
+		noSecret: "the claims webhook has no signing secret, and every request to it carries the user profile while its answer decides " +
+			"what the token authorises, which an unsigned receiver can neither attribute nor be attributed",
+		noTimeout:     "the claims webhook has no positive timeout, so a slow endpoint would stall every login",
+		timeoutRemedy: "set a timeout in milliseconds, e.g. 2000",
+	})
 }
 
 func validateTokens(c *Config, d *diagnostics) {
@@ -137,39 +137,92 @@ func validateEmail(c *Config, d *diagnostics) {
 			emailAddress(d, "email.mailer.from", c.Email.Mailer.From)
 		}
 	}
-	validateDeliveryWebhook(c, d)
+	validateSignedWebhook(c, d, signedWebhook{
+		base: "email.deliveryWebhook",
+		hook: c.Email.DeliveryWebhook,
+		noSecret: "the delivery webhook has no signing secret, and every request to it carries a credential that an unsigned " +
+			"receiver cannot tell from a replay",
+	})
 }
 
-// validateDeliveryWebhook: a delivery webhook is a url and a signing secret,
-// together or not at all.
+// signedWebhook is one of the schema's two outbound webhooks, with the wording
+// the shared check cannot share: what the requests carry differs, and a
+// diagnostic that said "a credential" about the claims webhook would be telling
+// the operator something untrue about the knob they are fixing.
+type signedWebhook struct {
+	// base is the dotted prefix, e.g. "email.deliveryWebhook".
+	base string
+	hook Webhook
+	// noSecret is the problem text of a url with no signing secret.
+	noSecret string
+	// noTimeout and timeoutRemedy replace the generic positive() diagnostic
+	// when the block has something more useful to say about the deadline.
+	// Empty leaves the generic one, which quotes the configured value.
+	noTimeout, timeoutRemedy string
+}
+
+// maxWebhookTimeoutMs is the ceiling on both webhooks' timeoutMs.
 //
-// The body of every request it receives is a credential, so the secret is not
-// optional the way the reference's outbound-webhook secret is: an unsigned
-// receiver has no way to tell a replayed or forged delivery from a real one, and
-// would mint sessions for whoever posts to it. The check runs after the secrets
-// resolved, so it sees the value rather than the reference — a Secrets Manager
-// entry that exists but is empty is refused too.
-func validateDeliveryWebhook(c *Config, d *diagnostics) {
-	const secretPath = "email.deliveryWebhook.secret"
-	u := strings.TrimSpace(c.Email.DeliveryWebhook.URL)
+// A floor alone is not the rule these knobs need. Every mint — login, refresh,
+// the 2FA step-up — and every GET /me waits on the claims receiver inside the
+// invocation, and four credential routes wait on the delivery one; the whole
+// point of the knob, and of the sentence the SAM parameter uses to describe it,
+// is that a slow receiver becomes a fast 500 rather than a hung function. A
+// ten-minute deadline does not bound anything: it outlives the function Timeout
+// (900 s at most, and far less in practice), so the invocation fails before the
+// deadline fires and the route answers nothing at all rather than the 500 the
+// design promises.
+//
+// The number is the MaxValue of the CFN parameter ClaimsWebhookTimeoutMs, and
+// it lives here rather than only there because CloudFormation bounds one way of
+// supplying the value. AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS set on the
+// function by any other means, or timeoutMs written into the configuration
+// document, reaches the loader without passing a CFN parameter at all — so a
+// rule that lived only in the template would be a rule the product does not
+// actually have. email.deliveryWebhook.timeoutMs has no parameter of its own
+// and arrives only by those two routes, which is exactly why it gets the same
+// ceiling here.
+const maxWebhookTimeoutMs = 10000
+
+// validateSignedWebhook: a webhook is a url, a positive timeout and a signing
+// secret, together or not at all.
+//
+// The secret is not optional the way the reference's outbound-webhook secret
+// is, for the reasons the Webhook type records — one reason per block, which is
+// why the problem text is a field here rather than a constant. The check runs
+// after the secrets resolved, so it sees the value rather than the reference: a
+// Secrets Manager entry that exists but is empty is refused too.
+func validateSignedWebhook(c *Config, d *diagnostics, w signedWebhook) {
+	urlPath, secretPath := w.base+".url", w.base+".secret"
+	u := strings.TrimSpace(w.hook.URL)
 	if u == "" {
-		if c.Email.DeliveryWebhook.Secret.configured() {
-			d.errf("", "email.deliveryWebhook.url",
-				"email.deliveryWebhook.secret references a signing secret but no url is set, so nothing would ever be signed",
-				"set email.deliveryWebhook.url to the https receiver, or remove the secret reference")
+		if w.hook.Secret.configured() {
+			d.errf("", urlPath,
+				secretPath+" references a signing secret but no url is set, so nothing would ever be signed",
+				"set "+urlPath+" to the https receiver, or remove the secret reference")
 		}
 		return
 	}
 	// The origin-only variant, not the generic one: see absoluteURLOrigin.
-	absoluteURLOrigin(d, "email.deliveryWebhook.url", u, true)
-	positive(d, "email.deliveryWebhook.timeoutMs", c.Email.DeliveryWebhook.TimeoutMs)
+	absoluteURLOrigin(d, urlPath, u, true)
+	switch {
+	case w.hook.TimeoutMs > maxWebhookTimeoutMs:
+		d.errf("", w.base+".timeoutMs",
+			fmt.Sprintf("%d ms is above the ceiling of %d ms, and a deadline longer than the invocation bounds nothing",
+				w.hook.TimeoutMs, maxWebhookTimeoutMs),
+			fmt.Sprintf("set a value between 1 and %d; a receiver that needs longer than that has to be asked asynchronously, not inside the request", maxWebhookTimeoutMs))
+	case w.hook.TimeoutMs > 0:
+	case w.noTimeout != "":
+		d.errf("", w.base+".timeoutMs", w.noTimeout, w.timeoutRemedy)
+	default:
+		positive(d, w.base+".timeoutMs", w.hook.TimeoutMs)
+	}
 	if c.secretFailed(secretPath) {
 		// The resolution failure is already reported against the knob.
 		return
 	}
 	if c.SecretValue(secretPath) == "" {
-		d.errf("", secretPath,
-			"the delivery webhook has no signing secret, and every request to it carries a credential that an unsigned receiver cannot tell from a replay",
+		d.errf("", secretPath, w.noSecret,
 			"reference it from a store -- "+secretPath+": {secretsManager: <id>} -- or set "+envNameFor(secretPath)+" for development")
 	}
 }
@@ -510,10 +563,11 @@ func absoluteURL(d *diagnostics, path, got string, requireHTTPS bool) {
 // absoluteURLOrigin is absoluteURL for a knob whose value must not be echoed
 // whole into a diagnostic.
 //
-// A cold-start failure is written to CloudWatch, and email.deliveryWebhook.url
-// is the one URL knob in the schema whose *path* may itself be a secret: a
-// receiver that cannot verify an HMAC signature is told to carry a capability
-// token in the path instead, which is why cmd/auth logs only the origin of it
+// A cold-start failure is written to CloudWatch, and the two webhook urls —
+// email.deliveryWebhook.url and security.jwt.claimsWebhook.url — are the knobs
+// in this schema whose *path* may itself be a secret: a receiver behind a
+// gateway that cannot check an HMAC is commonly given a capability token in the
+// path as well, which is why cmd/auth logs only the origin of either
 // (webhookOrigin, delivery.go). A refusal that printed the whole value would
 // undo that for exactly the deployments most likely to hit it. So https is
 // reported against the origin, and a value too malformed to have an origin is

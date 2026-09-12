@@ -108,8 +108,9 @@ func init() {
 		},
 
 		Case{
-			Name:  "2fa/temp-token-alone-does-not-open-me",
-			Doc:   "§3.1 / §3 — the tempToken is a step-up credential for /2fa/verify; on its own it must not stand in for a session",
+			Name: "2fa/temp-token-is-not-accepted-by-me",
+			Doc: "§3.1 / §3 — the tempToken is a step-up credential for /2fa/verify; on its own it must not stand in for a session, " +
+				"and the refusal is the middleware's own 403 {\"error\":\"Invalid or expired access token\"} with no `code`",
 			Needs: []Capability{CapTOTP},
 			Run: func(t *testing.T, e *Env) {
 				enrolled, acct := e.LoginCookie(t)
@@ -119,11 +120,26 @@ func init() {
 				login := c.POST(t, "/login", body{"email": acct.Email, "password": acct.Password})
 				login.mustStatus(t, 200)
 				tempToken := login.str(t, "tempToken")
+				if tempToken == "" {
+					t.Fatalf("the challenge carried no tempToken, so there is nothing to present\n  %s", login.where())
+				}
 
+				// The claim, stated first and separately from the envelope: a
+				// half-authentication must not be a full one. The reference
+				// mints its tempToken as an ordinary access token with a five
+				// minute life and nothing distinguishing it, so this case fails
+				// against it by design — the typed temp token is the registered
+				// deviation `temp-token-is-typed-not-an-access-token`, and the
+				// five-minute bypass it closes is worth the divergence.
 				r := e.NewClient().GET(t, "/me", Bearer(tempToken))
 				if r.Status == 200 {
-					t.Errorf("the login tempToken opened GET /me on its own, so a stolen half-authentication is a full one\n  %s", r.where())
+					t.Fatalf("the login tempToken opened GET /me on its own, so a stolen half-authentication is a full one\n  %s", r.where())
 				}
+				// And the refusal is the ordinary bad-token answer, not a
+				// 2FA-flavoured one: a client must not be able to tell a
+				// step-up token presented as a session from any other unusable
+				// token, or the error becomes an oracle for what the token is.
+				r.mustCodelessError(t, 403, "Invalid or expired access token")
 			},
 		},
 
@@ -164,6 +180,61 @@ func init() {
 
 				c.POST(t, "/2fa/verify", body{"tempToken": login.str(t, "tempToken"), "totpCode": "000000"}).
 					mustCodelessError(t, 401, "Invalid TOTP code")
+			},
+		},
+
+		Case{
+			Name: "2fa/verify-wrong-code-is-uniform",
+			Doc: "§3 (2fa/verify), §4.4 — every way of getting the step-up token wrong answers the same " +
+				"401 {\"error\":\"Invalid or expired access token\",\"code\":\"INVALID_ACCESS_TOKEN\"}",
+			Needs: []Capability{CapTOTP},
+			Run: func(t *testing.T, e *Env) {
+				enrolled, acct := e.LoginCookie(t)
+				secret := enrolTOTP(t, enrolled)
+
+				c := e.NewClient()
+				login := c.POST(t, "/login", body{"email": acct.Email, "password": acct.Password})
+				login.mustStatus(t, 200)
+				valid := login.str(t, "tempToken")
+
+				// This route has no missing-token branch: an absent tempToken
+				// simply fails verification, so "you sent nothing" and "you sent
+				// something wrong" are one answer. That is what keeps the route
+				// from telling an attacker which half of the guess was right —
+				// and it is checked for both because a port that added a
+				// helpful "tempToken is required" would be adding the oracle.
+				for _, tc := range []struct {
+					name string
+					b    body
+				}{
+					{"no tempToken at all", body{"totpCode": "000000"}},
+					{"an empty tempToken", body{"tempToken": "", "totpCode": "000000"}},
+					{"a tempToken that is not a token", body{"tempToken": "not-a-token", "totpCode": "000000"}},
+					{"a structurally valid token signed by nobody", body{
+						"tempToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ4IiwidHlwIjoidGVtcCJ9.AAAA",
+						"totpCode":  "000000",
+					}},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						e.NewClient().POST(t, "/2fa/verify", tc.b).
+							mustError(t, 401, "INVALID_ACCESS_TOKEN", "Invalid or expired access token")
+					})
+				}
+
+				// The code this route answers is deliberately NOT the
+				// INVALID_TEMP_TOKEN its siblings answer for the same failure:
+				// the reference verifies the tempToken here through
+				// verifyAccessToken and lets that error through unchanged
+				// (auth.router.ts:862 vs :1096), so the same mistake has two
+				// codes depending on the 2FA method. Pinned rather than
+				// harmonised — a client that special-cases TOTP today would
+				// break if this route started agreeing with the others.
+				//
+				// And the challenge the user actually holds still completes:
+				// none of the refusals above may consume it, or a mistyped code
+				// from somebody else would cost this user their login.
+				c.POST(t, "/2fa/verify", body{"tempToken": valid, "totpCode": totpNow(t, secret)}).
+					mustSuccessOnly(t)
 			},
 		},
 	)

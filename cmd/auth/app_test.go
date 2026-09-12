@@ -31,12 +31,24 @@ const (
 // rule: development (RS-12 forbids the memory driver in production), a public
 // URL on a domain of our own (RS-2 forbids cookie delivery on execute-api), and
 // two distinct signing secrets (RS-1).
+//
+// Plus one knob that is not required and is here for time. Since
+// security.password.bcryptSaltRounds became a wired knob, the product default
+// of 12 is the cost every test in this package actually hashes at, four times
+// the work of 10 — and under -race, with the store suite running beside it, the
+// package went from half a minute to over three. The floor of the schema's own
+// supported range is used instead, because the cost is orthogonal to everything
+// these tests assert and paying for it in every one of them buys nothing.
+// TestBcryptCostReachesTheCore is where the knob itself is pinned, at a value
+// that is neither this nor the product default so that it cannot pass by
+// coincidence.
 func baseEnv() map[string]string {
 	return map[string]string{
 		"AWESOME_AUTH_DEPLOYMENT_ENVIRONMENT": "development",
 		"AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL":  "https://auth.example.test",
 		"AWESOME_AUTH_JWT_ACCESS_SECRET":      testAccessSecret,
 		"AWESOME_AUTH_JWT_REFRESH_SECRET":     testRefreshSecret,
+		"AWESOME_AUTH_BCRYPT_SALT_ROUNDS":     "10",
 	}
 }
 
@@ -589,9 +601,9 @@ func TestUnwiredKnobsAreReportedLoudly(t *testing.T) {
 	}
 
 	out := buf.String()
-	// The shipped default is 12 and the core is fixed at 10, so this gap is
-	// present in every deployment that does not override the knob.
-	for _, want := range []string{"security.password.bcryptSaltRounds", "security.jwt.refreshTokenSecret"} {
+	// One HS256 secret signs both tokens, so this gap is present in every
+	// deployment — RS-1 requires the second secret and nothing signs with it.
+	for _, want := range []string{"security.jwt.refreshTokenSecret"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("cold-start log does not mention the unwired knob %s:\n%s", want, out)
 		}
@@ -616,14 +628,22 @@ func TestUnwiredKnobs(t *testing.T) {
 			t.Errorf("gap %s has an empty problem or remedy", g.Path)
 		}
 	}
-	for _, want := range []string{"security.jwt.refreshTokenSecret", "security.password.bcryptSaltRounds"} {
+	for _, want := range []string{"security.jwt.refreshTokenSecret"} {
 		if !paths[want] {
 			t.Errorf("unwiredKnobs did not report %s", want)
 		}
 	}
 	// Knobs the core does honour must not be reported, or the warning becomes
-	// noise nobody reads.
-	for _, unwanted := range []string{"security.jwt.accessTokenSecret", "sessions.checkOn", "http.apiPrefix"} {
+	// noise nobody reads. bcryptSaltRounds is here rather than above because
+	// v0.6.0 exports WithBcryptCost and coreOptions passes it: the configured
+	// cost is the deployed cost, and a warning saying otherwise would send an
+	// operator to lower a value that is actually in force.
+	for _, unwanted := range []string{
+		"security.jwt.accessTokenSecret",
+		"security.password.bcryptSaltRounds",
+		"sessions.checkOn",
+		"http.apiPrefix",
+	} {
 		if paths[unwanted] {
 			t.Errorf("unwiredKnobs reported %s, which is wired", unwanted)
 		}

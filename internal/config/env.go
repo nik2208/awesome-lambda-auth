@@ -154,6 +154,7 @@ func envBindings() []envBinding {
 		envDuration("AWESOME_AUTH_JWT_ACCESS_TTL", "security.jwt.accessTokenTtl", func(c *Config, v Duration) { c.Security.JWT.AccessTokenTTL = v }),
 		envDuration("AWESOME_AUTH_JWT_REFRESH_TTL", "security.jwt.refreshTokenTtl", func(c *Config, v Duration) { c.Security.JWT.RefreshTokenTTL = v }),
 		envString("AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL", "security.jwt.claimsWebhook.url", func(c *Config, v string) { c.Security.JWT.ClaimsWebhook.URL = v }),
+		envInt("AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS", "security.jwt.claimsWebhook.timeoutMs", func(c *Config, v int) { c.Security.JWT.ClaimsWebhook.TimeoutMs = v }),
 		envInt("AWESOME_AUTH_BCRYPT_SALT_ROUNDS", "security.password.bcryptSaltRounds", func(c *Config, v int) { c.Security.Password.BcryptSaltRounds = v }),
 		envInt("AWESOME_AUTH_TOKENS_PASSWORD_RESET_TTL_MINUTES", "tokens.passwordResetTtlMinutes", func(c *Config, v int) { c.Tokens.PasswordResetTTLMinutes = v }),
 		envInt("AWESOME_AUTH_TOKENS_EMAIL_VERIFICATION_TTL_MINUTES", "tokens.emailVerificationTtlMinutes", func(c *Config, v int) { c.Tokens.EmailVerificationTTLMinutes = v }),

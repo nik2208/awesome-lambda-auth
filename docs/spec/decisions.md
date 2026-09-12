@@ -26,6 +26,13 @@ Only the OIDC surface: `id_token` and the OIDC `access_token` from `/oidc/token`
 
 Kept as the upstream registered deviation `temp-token-is-typed-not-an-access-token`: a five-minute HS256 JWT with `typ: "temp"`, refused as a session credential by every protected route, `INVALID_TEMP_TOKEN` everywhere. Reversal cost: low.
 
+Amended when 2FA was wired (P3), on the last three words. `INVALID_TEMP_TOKEN` is the code the *sibling* step-up routes answer; the two surfaces this block put under contract answer something else, and both were read out of the source rather than assumed.
+
+- **`POST /2fa/verify` answers `401 {"error":"Invalid or expired access token","code":"INVALID_ACCESS_TOKEN"}`** for every way of getting the token wrong — missing, empty, unparseable, or well-formed and signed by nobody. It is not a port decision: the reference verifies the tempToken on this route through `verifyAccessToken` and lets that error through unchanged (`auth.router.ts:862`, against the `INVALID_TEMP_TOKEN` its siblings raise at `:1096`), so the same mistake has two codes depending on the 2FA method. The core reproduces it (`passwordless.go` `HTTPErrInvalidStepUpToken`, passed for both the missing and the bad token by `adapter/nethttp/passwordless.go`). Pinned rather than harmonised: a client that special-cases TOTP today would break if this route started agreeing with the others.
+- **The authenticated middleware answers the ordinary code-less `403 {"error":"Invalid or expired access token"}`** when a tempToken is presented as a session credential. No 2FA-flavoured refusal, and deliberately so — a distinguishable answer would tell a caller what the token it is holding actually is.
+
+Contract cases `2fa/verify-wrong-code-is-uniform` and `2fa/temp-token-is-not-accepted-by-me` pin the two. The deviation itself is unchanged: what the typed token *refuses* is the decision, and it still refuses everything a session token opens.
+
 ## D-5 — Offset pagination on DynamoDB
 
 Admin list endpoints emulate `limit`/`offset` by walking query pages and discarding `offset` items, capped at `offset + limit ≤ 1000` (`400 OFFSET_TOO_LARGE` beyond); `total` reproduces the reference's heuristic; an additive `nextCursor` is returned for clients that can use it. Reversal cost: low.
@@ -48,7 +55,14 @@ Upstream serves the reference HTML verbatim (swagger-ui-dist from unpkg). In the
 
 ## D-10 — Claims webhook failure
 
-Fails closed: a webhook error or timeout fails token issuance with `500 CLAIMS_WEBHOOK_FAILED`. The auth middleware uses a verification path that never calls the claims builder, so the webhook fires on token issuance only. Reversal cost: trivial.
+Fails closed: a webhook error or timeout fails token issuance. The auth middleware uses a verification path that never calls the claims builder, so the webhook fires on token issuance only. Reversal cost: trivial.
+
+Amended when it was wired (P3), on two points of fact:
+
+- **There is no `CLAIMS_WEBHOOK_FAILED` code, and this port does not invent one.** The core already fails the mint — `Config.BuildTokenClaims` returning an error aborts `issueToken` — and the adapters answer a broken host hook with `HTTPErrInternal`: `500 {"error":"Internal server error"}`, deliberately code-less and deliberately describing nothing. The error envelope belongs to the shared wire layer every port in the family emits, so adding a code here would make this deployment answer something no sibling answers, for a failure a client cannot act on anyway. The behaviour D-10 asked for is exactly what ships; only the spelling in this entry was wrong.
+- **`GET /me` deliberately does not fail closed.** It runs the builder too — its body is the profile and `customClaims` is rendered in it — but `Service.Me` logs a builder failure and leaves `customClaims` empty rather than failing the read. A read should not go dark because a mint-time hook is down, so a receiver outage costs logins and refreshes and leaves the profile answering. The middleware path runs the builder zero times, as the entry says.
+
+Nothing was re-implemented for either point: cmd/auth builds the hook out of the core's own `StaticClaims`, `UserFieldClaims`, `ChainClaims` and `ClaimsWebhook`, and the tests verify the failure contract rather than producing it.
 
 ## D-11 — Delivery webhook
 
@@ -84,3 +98,18 @@ The core `Service` publishes to the in-process bus; the tools facade subscribes 
 
 `email.deliveryWebhook` is a transport, not a notification: the core's `auth.NewDeliveryWebhook(url, secret)` (v0.4.0) is handed the magic link, the reset token, the verification token, the email-change token and the SMS code, and POSTs them to the operator's endpoint so a transport the product does not ship (Postmark, a queue, an on-premises relay) can carry them. The body therefore carries the credential itself, and the receiver has to be able to tell the product's POST from anyone else's — the core signs each request with `X-Webhook-Signature` only when a secret is set, and leaves the choice to the integrator. The product does not: a `deliveryWebhook.url` with no secret refuses to start, in every environment, as a refuse-to-start rule beside RS-1…RS-12. The secret is a secret-tagged knob like the JWT secrets (`{"secretsManager": …}`, `{"ssmParameter": …}`, or `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET`), never a value in the document. Not a wire deviation — the reference has no webhook to compare against; it replaces the reference's five send-callback functions (`config-schema.md` §3.8) — so it is recorded here rather than in a register. D-11's "synchronous, bounded by `timeoutMs`, never fails the route" still applies to the call. Reversal cost: trivial in code (drop one validation rule), but it would ship a product that mails credentials to an endpoint nothing authenticates, so it is not expected to be reversed.
 
+
+## D-19 — The claims webhook requires a secret (2026-09-12)
+
+`security.jwt.claimsWebhook` gains a `secret`, required whenever the url is set, on the same terms as D-18's and for a different reason. The spec specified this block as a url and a timeout (`config-schema.md` §1.1, §3.1) and the core's `auth.NewClaimsWebhook(url, secret)` accepts an empty secret, sending the request unsigned — the integrator's choice, which a library is right to leave open and a deployable product is not.
+
+D-18's argument does not transfer: the claims request hands over no credential. Two others do, and either is sufficient.
+
+- **The request body is the user's profile.** It is `PublicUser`, the same object `GET /me` renders — address, names, phone number, tenant, roles — for every login, every refresh and every `/me`. An unsigned receiver has no way to tell this deployment's question from anyone else's, so anything that can reach the endpoint can ask it about a user and read the answer; and a receiver that logs what it was asked accumulates the profile of everyone who logs in, keyed by nothing.
+- **The answer decides what the token authorises.** Claims from this receiver go into the token every downstream consumer makes decisions on. Unsigned, the deployment cannot tell the configured receiver from anything that can answer on that address first — a DNS or routing compromise becomes a claims-injection primitive, bounded only by the seven session claims the core refuses to let any builder set.
+
+So: a `claimsWebhook.url` with no secret refuses to start, in every environment, and a secret reference with no url is refused as the dead configuration it is. It is a secret-tagged knob (`{"secretsManager": …}`, `{"ssmParameter": …}`, or `AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET`), never a value in the document, and the SAM template passes it as `ClaimsWebhookSecretArn` with its own IAM statement scoped to that ARN. Not a wire deviation — the reference has no claims webhook to compare against, only the in-process `buildTokenPayload` callback this replaces — so it is recorded here rather than in a register.
+
+Both webhooks now carry the same three fields, so `config.DeliveryWebhook` was folded back into `config.Webhook` rather than kept as a second identical struct.
+
+Reversal cost: trivial in code (drop one validation rule), but it would ship a product that hands its users' profiles to an endpoint nothing authenticates and takes authorisation claims back from it, so it is not expected to be reversed.

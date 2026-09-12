@@ -205,10 +205,12 @@ where they do not:
 Both statements are absent from the role entirely unless their half is
 configured — `MailerFromAddress` for mail, `EnableSmsDelivery` for SMS.
 
-There is one more `secretsmanager:GetSecretValue` statement, and it follows the
-signing-secret one exactly: present only when `EmailDeliveryWebhookSecretArn` is
-set, scoped to that one ARN with any `#<jsonKey>` selector stripped, because the
-selector is the function's and the resource is the secret.
+There are two more `secretsmanager:GetSecretValue` statements, and each follows
+the signing-secret one exactly: present only when `EmailDeliveryWebhookSecretArn`
+or `ClaimsWebhookSecretArn` is set, scoped to that one ARN with any `#<jsonKey>`
+selector stripped, because the selector is the function's and the resource is
+the secret. Two statements rather than one with two resources, so that a stack
+with one webhook grants nothing for the other.
 
 ## Credential delivery
 
@@ -304,6 +306,40 @@ template deploys nothing else. Turning the switch on refuses the cold start by
 name, so the failure is loud rather than silent, but there is no parameter here
 that makes it work — the built-in `en`/`it` templates render until the DynamoDB
 template store lands. `docs/config-reference.md` §5.3 has the whole picture.
+
+## Second factor and token claims
+
+Four parameters, and only the first applies to every stack.
+
+| Parameter | Effect |
+|---|---|
+| `TotpIssuer` | `AWESOME_AUTH_2FA_APP_NAME` — the name an authenticator app prints above the six digits, and the issuer in the `otpauth://` URI `POST /2fa/setup` returns. Default `awesome-node-auth`, the reference's own; set it to the product name your users know. Empty is refused at start. |
+| `ClaimsWebhookUrl` | An https endpoint asked for extra token claims on every mint and on `GET /me`. Empty disables it. |
+| `ClaimsWebhookTimeoutMs` | One request, connect to last byte. Default 2000. A login is waiting on it inside the invocation, so keep it well under `Timeout`. |
+| `ClaimsWebhookSecretArn` | The Secrets Manager ARN of the key that signs those requests. **Required with the url**, and refused without it. |
+
+The claims webhook is POSTed `{"user": <the profile as GET /me renders it>}`
+and answers `{"claims": {…}}`, signed with the same
+`X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the body>` convention the
+delivery webhook uses. The secret is required for a different reason than the
+delivery webhook's: the request body is your users' profiles and the answer
+decides what the token authorises, so an unsigned receiver can neither tell your
+deployment's question from anyone else's nor be told apart from a receiver that
+is not it.
+
+**It fails closed.** A failure, a timeout, a non-2xx, or a body that is not a
+claims object aborts the mint, and login, refresh and 2FA step-up answer
+`500 {"error":"Internal server error"}`. Budget for that when you decide whether
+the receiver belongs in the login path at all. `GET /me` is the exception: it
+answers without `customClaims` rather than failing.
+
+**A session is two tokens and the hook runs per token, so one login is two
+requests** and one `GET /me` is one. Every other authenticated route is zero.
+
+`security.jwt.extraClaims` has no parameter here, for the reason
+`email.templatesDir` has none: it is a mapping table, which an environment
+variable cannot carry. It arrives in the configuration document (`ConfigFile`);
+see [`docs/config-reference.md`](../../docs/config-reference.md) §6.
 
 ## Cost at rest
 

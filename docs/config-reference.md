@@ -120,6 +120,9 @@ The whole `email` domain now loads. `email.siteUrls`, `email.templatesDir` and
 `email.deliveryWebhook` were the last three to leave that list; nothing under
 `email.` is refused by the phase gate any more.
 
+So do `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook`
+(§6, §7). Nothing under `security.` is refused any more either.
+
 `email.templatesDir` needs a template store, and both drivers now back one: the
 DynamoDB store keeps mail templates and UI translations on its `TEMPLATES`
 partition, the memory driver holds them per execution environment (§5.3). A
@@ -140,7 +143,7 @@ by name — a store gap rather than a phase gap.
 | `email.verification.mode` | `none`\|`lazy`\|`strict` | `none` | `AWESOME_AUTH_EMAIL_VERIFICATION_MODE` |
 | `email.templatesDir` | string (directory) | none | — (file-only) |
 | `email.deliveryWebhook.url` | string (https) | none | `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_URL` |
-| `email.deliveryWebhook.timeoutMs` | integer > 0 | `5000` | `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_TIMEOUT_MS` |
+| `email.deliveryWebhook.timeoutMs` | integer 1–10000 | `5000` | `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_TIMEOUT_MS` |
 | `email.deliveryWebhook.secret` | secret | none; **required** with a url | `AWESOME_AUTH_EMAIL_DELIVERY_WEBHOOK_SECRET` |
 
 ### 5.1 `email.siteUrls` — where an emailed link points
@@ -287,7 +290,11 @@ proof of it.
 `email.deliveryWebhook.timeoutMs` bounds one request, connect to last byte. The
 route that minted the credential is waiting on the answer inside a Lambda
 invocation, so this is what keeps a slow receiver from turning every password
-reset into a function timeout.
+reset into a function timeout. It is capped at 10000, the same ceiling
+`security.jwt.claimsWebhook.timeoutMs` has and for the same reason: a deadline
+longer than the invocation bounds nothing, because the function times out first
+and the route then answers nothing at all rather than the 500 the deadline
+exists to produce.
 
 Two mails stay with the mailer, and are sent only when one is configured: the
 notice `POST /change-email/confirm` sends to the address an account just moved
@@ -305,7 +312,150 @@ webhook to keep credentials off SES should know this one did not move with it.
   "secret": {"secretsManager": "awesome-auth/prod/delivery-webhook"}}}}
 ```
 
-## 6. Two worked postures
+## 6. `security.jwt.extraClaims` and `security.jwt.claimsWebhook` — what a token carries
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `security.jwt.extraClaims` | map of `{fromUserField}` \| `{const}` | none | — (file-only) |
+| `security.jwt.claimsWebhook.url` | string (https) | none | `AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_URL` |
+| `security.jwt.claimsWebhook.timeoutMs` | integer 1–10000 | `2000` | `AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS` |
+| `security.jwt.claimsWebhook.secret` | secret | none; **required** with a url | `AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_SECRET` |
+
+Every token this deployment mints carries six base claims — `sub`, `email`,
+`role`, `loginProvider`, `isEmailVerified`, `isTotpEnabled` — and seven session
+claims: `sid`, `tid`, `jti`, `typ`, `iss`, `iat`, `exp`. These two knobs add to
+that set. They replace the reference's `buildTokenPayload(user)` callback, which
+is in-process code a configuration document cannot carry: the table covers
+"copy a field" and "write a constant", the webhook covers everything that has to
+be computed.
+
+### 6.1 `security.jwt.extraClaims` — the mapping table
+
+A map from claim name to exactly one of two forms:
+
+```json
+{"security": {"jwt": {"extraClaims": {
+  "tenant":  {"fromUserField": "tenantId"},
+  "plan":    {"const": "enterprise"},
+  "seats":   {"const": 25}
+}}}}
+```
+
+It is file-only: a map of objects has no sensible environment form, so it
+arrives in the configuration document (`AWESOME_AUTH_CONFIG_FILE`).
+
+`fromUserField` reads one field of the user, spelled as `GET /me` spells it:
+`id`, `email`, `role`, `tenantId`, `firstName`, `lastName`, `phoneNumber`,
+`isEmailVerified`, `isTotpEnabled`, `loginProvider`. Anything else is refused at
+start with the claim's dotted path. The credential columns are deliberately not
+on that list, and neither are the enriched collections — a mint sees the stored
+row, and a collection is not a claim value.
+
+A mapped claim is emitted on every token with whatever the field holds: an empty
+`firstName` becomes an empty-string claim, not an absent one. A mapping declares
+that a claim exists, and a consumer must be able to tell "not configured" from
+"empty". `const` lands verbatim, keeping its JSON type.
+
+**Three classes of name are refused at start, each naming the knob to edit:**
+
+| Refused | Why |
+|---|---|
+| the six base claims | the family's clients read them off every token; redefining one changes what every client in the family sees |
+| the seven session claims | the library writes them *after* the merge, so the entry could never reach a token — a claim that is silently discarded on every mint is worse than one that does not exist |
+| a `fromUserField` outside the list above | a mapping is configuration, and a typo in configuration must fail at startup rather than turn every login into a 500 |
+
+### 6.2 `security.jwt.claimsWebhook.*` — claims that are computed
+
+With a url set, every mint — login, refresh, the 2FA step-up token — and every
+`GET /me` POSTs one request:
+
+```
+POST <url>
+Content-Type:        application/json
+X-Webhook-Event:     claims.build
+X-Webhook-Delivery:  <a fresh UUID per request>
+X-Webhook-Timestamp: <ISO 8601 UTC, milliseconds>
+X-Webhook-Signature: sha256=<hex HMAC-SHA256 of the exact body>
+
+{"user": { …the profile exactly as GET /me renders it… }}
+```
+
+and expects `200 {"claims": {…}}`. The claims object is merged last, so it wins
+over the table on a shared name — the table says the same thing for everybody,
+the receiver computed its answer for this user.
+
+**A session is two tokens and the builder runs per token, so one login is two
+requests.** A `GET /me` is one. An authenticated request to any other route is
+**zero**: the middleware verifies the token and never runs the hook, because
+what the hook computed is already inside the token the request carried.
+
+**`security.jwt.claimsWebhook.secret` is required when the url is set.** The
+request body is the user's profile and the answer decides what the token
+authorises, so an unsigned receiver can neither tell this deployment's question
+from anybody else's nor be told apart from a receiver that is not it. A url
+without a secret is refused; a secret without a url is refused as the dead
+configuration it is. The secret is never sent, only proof of it.
+
+`timeoutMs` bounds one request, connect to last byte. A login is waiting on the
+answer inside a Lambda invocation, so this is what turns a slow receiver into a
+fast 500 rather than a function timeout. It must be between 1 and 10000: the
+loader refuses anything above that ceiling however the value arrives, because a
+deadline longer than the invocation bounds nothing — the function times out
+first and the route answers nothing at all. The `ClaimsWebhookTimeoutMs` CFN
+parameter carries the same `MaxValue`, and the loader enforces it for the two
+routes CloudFormation cannot see: the environment variable set some other way,
+and `timeoutMs` written into the configuration document.
+
+**It fails closed (decision D-10), and the core already does it.** A non-2xx
+answer, a transport failure, the timeout, a body over 64 KiB, a body that is not
+JSON, a missing or non-object `claims` member: each aborts the mint, and login,
+refresh and 2FA step-up answer `500 {"error":"Internal server error"}` — the
+generic envelope, deliberately code-less, deliberately describing nothing. A
+token minted without the claims the deployment configured would authorise less,
+or more, than the deployment decided.
+
+`GET /me` is the one deliberate exception: a builder failure there is logged and
+leaves `customClaims` out of the body rather than failing the read. So a
+receiver outage costs logins and refreshes and leaves the profile answering.
+
+That log line names the receiver's **origin only**, never its path or query, and
+so does the cold-start line and every refusal the loader writes about either
+webhook url. A receiver behind a gateway that cannot verify an HMAC is commonly
+given a capability token in its path instead; an outage must not then copy that
+token into CloudWatch once per `/me` for as long as it lasts. The same holds for
+`email.deliveryWebhook.url`, whose failures `POST /forgot-password` can only
+report to the log.
+
+**The receiver cannot retype a token or rebind its session.** `sid`, `tid`,
+`jti`, `typ`, `iss`, `iat` and `exp` are written after the merge and a returned
+value under those names is discarded. It *can* override the six base claims, as
+the reference's callback can — so point this only at a receiver you own.
+
+```json
+{"security": {"jwt": {"claimsWebhook": {
+  "url": "https://claims.example.com/token",
+  "timeoutMs": 2000,
+  "secret": {"secretsManager": "awesome-auth/prod/claims-webhook"}}}}}
+```
+
+## 7. `twoFactor.appName` — the TOTP issuer
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `twoFactor.appName` | string, non-empty | `awesome-node-auth` | `AWESOME_AUTH_2FA_APP_NAME` |
+
+The name an authenticator app prints above the six digits. It is the issuer in
+the `otpauth://` URI `POST /2fa/setup` returns, in both places the URI carries
+one — the label prefix and the `issuer` parameter — and it is the only part of
+TOTP a user ever reads. Set it to the product name they know; an empty value is
+refused at start, because it produces a URI no app can label.
+
+It is passed unconditionally, so the core's fallback to its own issuer never
+applies and a deployment that configures nothing gets the reference's own
+default. The `iss` claim is a different thing and is not this knob: it is not
+configurable in this build, and it becomes one with the identity-provider block.
+
+## 8. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that

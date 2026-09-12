@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -193,15 +194,19 @@ func newDelivery(cfg *config.Config, mail auth.MailerTransport, sms auth.SMSTran
 	}
 
 	if webhookConfigured(cfg) {
-		hook, err := auth.NewDeliveryWebhook(strings.TrimSpace(cfg.Email.DeliveryWebhook.URL), cfg.SecretValue("email.deliveryWebhook.secret"))
+		hookURL := strings.TrimSpace(cfg.Email.DeliveryWebhook.URL)
+		hook, err := auth.NewDeliveryWebhook(hookURL, cfg.SecretValue("email.deliveryWebhook.secret"))
 		if err != nil {
-			return nil, err
+			// Unreachable — validate.go refuses everything the core's parser
+			// would — but the core's message quotes the url it rejected, and a
+			// cold-start failure is written to CloudWatch like any other line.
+			return nil, scrubbedWebhookError(err, hookURL)
 		}
 		// timeoutMs bounds one request through the request context, connect to
-		// last byte; validate.go guarantees it is positive. The route waiting on
-		// the answer is itself bounded by the Lambda timeout, so this is what
-		// keeps a slow receiver from turning every password reset into a
-		// function timeout.
+		// last byte; validate.go guarantees it is positive and no larger than
+		// its ceiling. The route waiting on the answer is itself bounded by the
+		// Lambda timeout, so this is what keeps a slow receiver from turning
+		// every password reset into a function timeout.
 		hook.Timeout = time.Duration(cfg.Email.DeliveryWebhook.TimeoutMs) * time.Millisecond
 		hook.Client = client
 		d.webhook = hook
@@ -257,12 +262,16 @@ func deliveryOptions(d *delivery, log *slog.Logger) []auth.Option {
 
 	switch {
 	case d.webhook != nil:
+		// Every one of the five is wrapped rather than passed, and the wrapper
+		// does one thing: keep the receiver's URL out of the error the core
+		// logs. See scrubbedWebhookError.
+		receiver := d.webhook.URL
 		opts = append(opts,
-			auth.WithMagicLinkSender(d.webhook.SendMagicLink),
-			auth.WithPasswordResetSender(d.webhook.SendPasswordReset),
-			auth.WithEmailVerificationSender(d.webhook.SendEmailVerification),
-			auth.WithEmailChangeSender(d.webhook.SendEmailChange),
-			auth.WithSMSCodeSender(d.webhook.SendSMSCode),
+			auth.WithMagicLinkSender(scrubbedSender(d.webhook.SendMagicLink, receiver)),
+			auth.WithPasswordResetSender(scrubbedSender(d.webhook.SendPasswordReset, receiver)),
+			auth.WithEmailVerificationSender(scrubbedSender(d.webhook.SendEmailVerification, receiver)),
+			auth.WithEmailChangeSender(scrubbedSender(d.webhook.SendEmailChange, receiver)),
+			auth.WithSMSCodeSender(scrubbedSender(d.webhook.SendSMSCode, receiver)),
 		)
 	default:
 		if d.mail != nil {
@@ -342,6 +351,77 @@ func webhookOrigin(raw string) string {
 		return "configured"
 	}
 	return u.Scheme + "://" + u.Host
+}
+
+// scrubbedWebhookError is what both webhooks' errors pass through on their way
+// back into the core, and the only thing it changes is the text.
+//
+// The leak it closes is not the product's own logging — the cold-start line
+// already names webhookOrigin and validate.go already refuses a bad url without
+// quoting it (absoluteURLOrigin). It is the core's. Both webhooks wrap a
+// transport failure as fmt.Errorf("%s: %w", where, err) around the *url.Error
+// net/http returns, and a *url.Error renders as `Post "<the whole URL>":
+// <cause>` — path and query included, as the core's own comment says. Three
+// paths then write that error to a log rather than to the caller: a claims
+// builder failing under Service.Me (the read does not fail closed, it logs and
+// drops the claims), a delivery failing under Auth.ForgotPassword (the route
+// must answer 200 whatever happened, so the log is the only report) and one
+// under Auth.LinkStart. All three arrive here through Config.Logger, which
+// coreOptions funnels into slog. So a receiver at
+// https://gw.example.test/hook/<capability-token> would write that token to
+// CloudWatch on every login for as long as it was slow or down — the exact
+// value the origin-only machinery exists to keep out of there, arriving by the
+// back door and at request rate rather than once.
+//
+// The message is rebuilt instead of re-wrapped because fmt.Errorf formats
+// eagerly: by the time an error reaches this function the URL is already inside
+// the text of the core's wrapper, and mutating the *url.Error underneath it
+// would change nothing that is ever printed. The chain stays reachable to
+// errors.Is and errors.As — the core tests a delivery failure with errors.Is,
+// and sentinels have to survive — and the *url.Error's own URL field is cut
+// down too, for anything that reads the field rather than the string.
+func scrubbedWebhookError(err error, configured string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	// The configured value first: a redirect can land the request somewhere
+	// else entirely, so the two are not necessarily the same string and both
+	// have to go.
+	if configured != "" {
+		msg = strings.ReplaceAll(msg, configured, webhookOrigin(configured))
+	}
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.URL != "" {
+		origin := webhookOrigin(uerr.URL)
+		msg = strings.ReplaceAll(msg, uerr.URL, origin)
+		uerr.URL = origin
+	}
+	if msg == err.Error() {
+		return err
+	}
+	return &scrubbedError{msg: msg, err: err}
+}
+
+// scrubbedError is an error whose text has been rewritten and whose cause is
+// still reachable. Error is what a log writes; Unwrap is what errors.Is and
+// errors.As walk.
+type scrubbedError struct {
+	msg string
+	err error
+}
+
+func (e *scrubbedError) Error() string { return e.msg }
+func (e *scrubbedError) Unwrap() error { return e.err }
+
+// scrubbedSender wraps one of the delivery webhook's five sender methods. The
+// signatures differ only in the delivery type, which is what the parameter is
+// for: five hand-written wrappers would be five places for the next one to be
+// forgotten.
+func scrubbedSender[T any](send func(context.Context, T) error, configured string) func(context.Context, T) error {
+	return func(ctx context.Context, in T) error {
+		return scrubbedWebhookError(send(ctx, in), configured)
+	}
 }
 
 // deliverLinkToken is the OAuth account-linking mail, POST /link-request.

@@ -181,7 +181,8 @@ type JWT struct {
 	ExtraClaims map[string]Claim `json:"extraClaims"`
 
 	// ClaimsWebhook is the escape hatch for claims that need computation
-	// (spec §3.1).
+	// (spec §3.1). Its signing secret is required alongside its url, for the
+	// reason the Webhook type gives.
 	ClaimsWebhook Webhook `json:"claimsWebhook"`
 }
 
@@ -192,11 +193,26 @@ type Claim struct {
 	Const         any    `json:"const"`
 }
 
-// Webhook is an outbound HTTP escape hatch (claims, email delivery). Timeouts
-// are strict by design: an auth request must not hang on someone else's server.
+// Webhook is an outbound HTTP escape hatch: the two the schema has are
+// security.jwt.claimsWebhook (spec §1.1, §3.1) and email.deliveryWebhook
+// (§1.5, §3.8). Timeouts are strict by design — an auth request must not hang
+// on someone else's server — and the signing secret is a product addition over
+// the spec's url-and-timeout knob, required in both.
+//
+// Required, because the two requests carry different things and each is a
+// reason on its own. A delivery hands the receiver the credential itself — a
+// reset token, a magic link, a one-time code — and a receiver that cannot
+// verify X-Webhook-Signature would mint sessions for whoever posts to it. A
+// claims request hands it the user profile as GET /me renders it, and takes
+// back claims that go into the token every client authorises on: unsigned, the
+// receiver cannot tell this deployment's question from anybody else's, and
+// answering the wrong asker leaks the profile while answering as the wrong
+// receiver decides authorisation. validate.go refuses a url without a secret
+// and a secret without a url, in both blocks.
 type Webhook struct {
 	URL       string `json:"url"`
 	TimeoutMs int    `json:"timeoutMs"`
+	Secret    Secret `json:"secret"`
 }
 
 // Password covers security.password.* (spec §1.1).
@@ -254,26 +270,16 @@ type Sessions struct {
 // Email covers email.* (spec §1.5).
 type Email struct {
 	// SiteURLs is the redirect allowlist; the first entry is canonical.
-	SiteURLs        []string          `json:"siteUrls"`
-	Mailer          Mailer            `json:"mailer"`
-	Verification    EmailVerification `json:"verification"`
-	TemplatesDir    string            `json:"templatesDir"`
-	DeliveryWebhook DeliveryWebhook   `json:"deliveryWebhook"`
-}
+	SiteURLs     []string          `json:"siteUrls"`
+	Mailer       Mailer            `json:"mailer"`
+	Verification EmailVerification `json:"verification"`
+	TemplatesDir string            `json:"templatesDir"`
 
-// DeliveryWebhook covers email.deliveryWebhook.* (spec §1.5, §3.8): the https
-// receiver that is handed every minted credential instead of SES and SNS.
-//
-// It is not the generic Webhook type because it carries something the claims
-// webhook does not: a signing secret, and a required one. The body of every
-// request is a credential — a reset token, a magic link, a one-time code — so a
-// receiver that cannot verify X-Webhook-Signature cannot tell a replayed or
-// forged delivery from a real one. The secret is a product addition over the
-// spec's url-only knob, and validate.go refuses a url without one.
-type DeliveryWebhook struct {
-	URL       string `json:"url"`
-	TimeoutMs int    `json:"timeoutMs"`
-	Secret    Secret `json:"secret"`
+	// DeliveryWebhook covers email.deliveryWebhook.* (spec §1.5, §3.8): the
+	// https receiver that is handed every minted credential instead of SES and
+	// SNS. It is the Webhook type, which carries the signing secret this block
+	// and the claims webhook both require; see there.
+	DeliveryWebhook Webhook `json:"deliveryWebhook"`
 }
 
 // Mailer covers email.mailer.* (spec §1.5).
@@ -690,7 +696,7 @@ func Defaults() *Config {
 		Email: Email{
 			Mailer:          Mailer{DefaultLang: "en"},
 			Verification:    EmailVerification{Mode: EmailVerificationNone},
-			DeliveryWebhook: DeliveryWebhook{TimeoutMs: 5000},
+			DeliveryWebhook: Webhook{TimeoutMs: 5000},
 		},
 		SMS: SMS{CodeTTLMinutes: 10},
 		TwoFactor: TwoFactor{

@@ -162,6 +162,33 @@ after the token was stored — a fault, and the suite reports it as one. Only
 | `send-verification-email/requires-auth` | bare, body-less request → `403 {"error":"No access token provided"}` (no `code`), the way the Flutter client and the served `auth.js` call it | — |
 | `forgot-password/unknown-address-is-a-plain-success` | (extended) the optional `emailLang` body field is accepted: `{"email":…,"emailLang":"it"}` is the same plain `200 {"success":true}` | — |
 
+**The token itself is pinned in one place, and only there.** Everywhere else a
+token is opaque, which is right — the family's clients are handed one and send
+it back, and none of them parses it. `cases_token_test.go` is the exception,
+because `security.jwt.extraClaims` and `security.jwt.claimsWebhook` make the
+token the carrier of whatever a deployment configured, and the consumer reading
+those claims is outside this repository and outside the family. It decodes the
+payload the way such a consumer does — split on `.`, unpadded base64url, JSON —
+and verifies nothing: this suite holds no signing secret and must not pretend
+to. No new capability: it needs an account and a bearer login, which every
+deployment that mounts `register` can give it.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `token/bearer-access-token-is-a-jws-with-the-session-claims` | a bearer access token is a three-part compact JWS; its payload carries `sub`, `sid`, `typ: "access"`, `iss`, and numeric `iat`/`exp`; the refresh token is the same shape with `typ: "refresh"`; no credential material is inside a payload anyone holding the token can read | — |
+| `2fa/temp-token-is-not-accepted-by-me` | a `tempToken` from a 2FA login challenge does not open `GET /me`, and the refusal is the ordinary `403 {"error":"Invalid or expired access token"}` with no `code` rather than a 2FA-flavoured one | `totp` |
+| `2fa/verify-wrong-code-is-uniform` | `POST /2fa/verify` answers the same `401 INVALID_ACCESS_TOKEN` for an absent, empty, malformed or unsigned `tempToken` — the route has no missing-token branch, so it is no oracle for which half of a guess was right — and the challenge the user holds still completes afterwards | `totp` |
+
+`2fa/temp-token-is-not-accepted-by-me` fails against the reference by design:
+the reference mints its `tempToken` as an ordinary access token with a
+five-minute life and nothing distinguishing it, so there the token *does* open
+`/me`. The typed temp token is the registered core deviation
+`temp-token-is-typed-not-an-access-token`, and the five-minute bypass it closes
+is worth the divergence. `2fa/verify-wrong-code-is-uniform` pins the other half
+of that route's oddity — it answers `INVALID_ACCESS_TOKEN` where its magic-link
+and SMS siblings answer `INVALID_TEMP_TOKEN` for the same failure, which is the
+reference's own inconsistency, reproduced rather than harmonised.
+
 `me/known-gaps-against-the-reference` changed with awesome-go-auth v0.4.0: the
 profile now carries `loginProvider` unconditionally (`"local"` for a password
 account, the reference's `?? 'local'`), and the case that used to record its
@@ -205,7 +232,8 @@ and nothing here can be imported by it.
 Covered: the contract hard points — cookie vs bearer mode, cookie names and
 attributes, CSRF double-submit, unwrapped `/me` (with `loginProvider`),
 empty-body refresh, the `{sessions:[…]}` and `{linkedAccounts:[…]}` wrappers,
-`SESSION_REVOKED`, the TOTP round trip end to end, the documented error shapes
+`SESSION_REVOKED`, the TOTP round trip end to end, the step-up token's limits
+and the shape of the access token itself, the documented error shapes
 including the paths that carry no `code`, and the mailbox-free half of the email
 flows: the auth and CSRF gates on `/change-email/request` and
 `/send-verification-email`, `GET /verify-email` answering JSON and never

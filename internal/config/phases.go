@@ -53,6 +53,16 @@ type domain struct {
 // every credential seam in place of SES and SNS (cmd/auth email.go and
 // delivery.go). None of the three is refused any more.
 //
+// Token claims and the TOTP issuer (P3) closed three more. `twoFactor.appName`
+// is the issuer an authenticator app labels an enrolment with, handed to the
+// core as WithTwoFactorAppName (cmd/auth twofactor.go).
+// `security.jwt.extraClaims` is the declarative form of the reference's
+// buildTokenPayload callback and `security.jwt.claimsWebhook` the escape hatch
+// for a claim that has to be computed; both become one TokenClaimsBuilder built
+// out of the core's own StaticClaims, UserFieldClaims, ChainClaims and
+// ClaimsWebhook (cmd/auth claims.go). The claims webhook gained a required
+// signing secret with the wiring, for the reason the Webhook type gives.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
@@ -62,25 +72,10 @@ type domain struct {
 func unwiredDomains() []domain {
 	return []domain{
 		{
-			path:  "security.jwt.extraClaims",
-			phase: "P3 (token claims)",
-			get:   func(c *Config) any { return c.Security.JWT.ExtraClaims },
-		},
-		{
-			path:  "security.jwt.claimsWebhook",
-			phase: "P3 (token claims)",
-			get:   func(c *Config) any { return c.Security.JWT.ClaimsWebhook },
-		},
-		{
 			path:         "oauth",
 			phase:        "P4 (OAuth and account linking)",
 			get:          func(c *Config) any { return c.OAuth },
 			secretPrefix: "oauth.",
-		},
-		{
-			path:  "twoFactor",
-			phase: "P3 (SMS and 2FA)",
-			get:   func(c *Config) any { return c.TwoFactor },
 		},
 		{
 			path:         "idProvider",

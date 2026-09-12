@@ -15,12 +15,14 @@ The stack deploys and the two official clients, unmodified, register, log in, re
 | Stores (`internal/store/dynamodb`) | users, sessions with refresh-token families, single-use tokens, TOTP, linked accounts, pending links, on one table with TTL |
 | Credential delivery (`internal/integration/aws`) | SES for mail, SNS for SMS, behind the core's sender seams; or a signed delivery webhook that takes every credential seam instead |
 | Email flows (`cmd/auth/email.go`) | `email.siteUrls` resolves every emailed link per request against the allowlist it forms with `http.cors.origins`; `email.templatesDir` seeds the template store from the artifact without ever overwriting a runtime edit |
+| Token claims (`cmd/auth/claims.go`) | `security.jwt.extraClaims` maps user fields and constants into every minted token; `security.jwt.claimsWebhook` asks a signed https receiver for the rest and fails the mint closed when it cannot answer |
+| Second factor (`cmd/auth/twofactor.go`) | `twoFactor.appName` is the issuer an authenticator app labels a TOTP enrolment with |
 | Auth surface | every route `awesome-go-auth` mounts: register, login, refresh, logout, me (now carrying `loginProvider`), sessions, password and email flows, magic link, SMS OTP, TOTP, account linking |
 | Infrastructure (`infra/sam`) | HTTP API + Lambda (`provided.al2023`, arm64) + DynamoDB + Secrets Manager, deployed with the plain AWS CLI |
 | Contract suite (`test/contract`) | black-box, parametrised on a base URL, runs against this stack or the reference Express app |
 | Examples | `examples/angular-client` (ng-awesome-node-auth from npm) and `examples/flutter-client` (awesome_node_auth_flutter from pub.dev), unmodified |
 
-Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `twoFactor`, `security.jwt.extraClaims`, `security.jwt.claimsWebhook`, `oauth`, `idProvider`, `resourceServer`, `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it. The whole `email` domain now loads: `email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the last three to leave that list.
+Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `oauth`, `idProvider`, `resourceServer`, `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it. The whole `email` domain now loads — `email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the last three to leave that list — and so does the whole `security` domain, `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook` having left it with the token-claims block.
 
 ## Configuration
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
 
@@ -870,7 +871,7 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 	t.Run("delivery webhook", func(t *testing.T) {
 		t.Parallel()
 		rec := newWebhookReceiver(t)
-		hooked := newDeliveryAppWith(t, webhookEnv(baseEnv(), rec.srv.URL),
+		hooked := newDeliveryAppWith(t, webhookEnv(baseEnv(), rec.srv.URL+capabilityPath),
 			func(o *Options) { o.HTTPClient = rec.srv.Client() })
 		const owner = "quiet-hook@example.test"
 		token := hooked.register(t, owner)
@@ -923,7 +924,109 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 		if strings.Contains(out, testWebhookSecret) {
 			t.Errorf("the delivery webhook's signing secret appears in the log:\n%s", out)
 		}
+		// And the third credential, which does not look like one: the
+		// receiver's own path. POST /forgot-password is the seam that makes
+		// this reachable — it must answer 200 whatever the receiver did, so the
+		// core reports the failure to the log instead (Auth.ForgotPassword),
+		// and the error it reports wraps the *url.Error whose text is the whole
+		// URL. With the receiver closed above, that is exactly what just
+		// happened.
+		assertReceiverPathNotLogged(t, out, rec.srv.URL)
 	})
+
+	// The claims webhook is the same claim over the third transport, and what
+	// it adds is a request body nobody would think of as a credential: the user
+	// profile as GET /me renders it. A deployment's logs are readable for the
+	// retention period by anyone with logs:FilterLogEvents, and the addresses
+	// and names of everyone who logged in is exactly the sort of thing that
+	// must not accumulate there because a hook was chatty about its requests.
+	// The signing secret is the other half, as above.
+	t.Run("claims webhook", func(t *testing.T) {
+		t.Parallel()
+		rec := newClaimsReceiver(t, map[string]any{"tier": "gold"})
+		hooked := newDeliveryAppWith(t,
+			claimsEnv(baseEnv(), rec.srv.URL+capabilityPath, "AWESOME_AUTH_JWT_CLAIMS_WEBHOOK_TIMEOUT_MS", "250"),
+			func(o *Options) { o.HTTPClient = rec.srv.Client() })
+
+		const owner = "quiet-claims@example.test"
+		token := hooked.register(t, owner)
+		invoke(t, hooked.app, http.MethodGet, "/auth/me", bearer(token), nil, "")
+
+		// Both halves again, and the failing one is where a binding that logged
+		// its request on the way to reporting an outage would show up.
+		rec.set(func(r *claimsReceiver) { r.hangFor = 10 * time.Second })
+		invoke(t, hooked.app, http.MethodPost, "/auth/login", jsonHeaders(), nil,
+			fmt.Sprintf(`{"email":%q,"password":%q}`, owner, testPassword))
+
+		// A failing login writes nothing: the mint aborts and the 500 carries
+		// the error to the client, not to CloudWatch. GET /me is the path that
+		// logs — it deliberately does not fail closed, so Service.Me reports the
+		// builder's error and answers without customClaims — and until this
+		// request has been made the assertion below is vacuous.
+		quiet := hooked.log.Len()
+		if resp := invoke(t, hooked.app, http.MethodGet, "/auth/me", bearer(token), nil, ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("/me during a claims-receiver outage returned %d, want 200 without customClaims (body %s)", resp.StatusCode, resp.Body)
+		}
+		if hooked.log.Len() == quiet {
+			t.Fatal("a /me against a hanging claims receiver logged nothing at all, so the leak this asserts against was never given a chance to happen")
+		}
+
+		out := hooked.log.String()
+		if out == "" {
+			t.Fatal("nothing was logged at all, so this test proves nothing")
+		}
+		posted := rec.requests()
+		if len(posted) == 0 {
+			t.Fatal("no claims request was captured, so this test proves nothing")
+		}
+		for _, req := range posted {
+			if strings.Contains(out, string(req.body)) {
+				t.Errorf("a posted claims request body appears in the log:\n%s", out)
+			}
+		}
+		// The address is inside every one of those bodies, and it is the part
+		// an operator would recognise as personal data.
+		if strings.Contains(out, owner) {
+			t.Errorf("the profile handed to the claims receiver appears in the log:\n%s", out)
+		}
+		if strings.Contains(out, testClaimsSecret) {
+			t.Errorf("the claims webhook's signing secret appears in the log:\n%s", out)
+		}
+		assertReceiverPathNotLogged(t, out, rec.srv.URL)
+	})
+}
+
+// capabilityPath is the path both test receivers are addressed at, and it
+// stands for the thing an operator actually puts there: a receiver behind a
+// gateway that cannot verify an HMAC is commonly given a capability token in
+// its URL instead, which is why internal/config refuses either webhook url
+// without quoting it (absoluteURLOrigin) and why the cold-start lines name only
+// webhookOrigin. A path that is merely "/hook" would let a leak through
+// unnoticed: the assertion has to search for something no other part of a log
+// line could contain.
+const capabilityPath = "/hook/PO4bBBH1vopHWFUxUn8vL8WZ"
+
+// assertReceiverPathNotLogged is the whole claim of the two subtests above
+// applied to the URL itself. origin is the receiver's scheme and host, which
+// may legitimately appear — the cold-start line names it deliberately — while
+// nothing may carry the path.
+//
+// The check is on the capability segment rather than on the full URL so that it
+// catches a leak through any rendering: net/http's *url.Error prints the URL
+// quoted inside a longer sentence, and a test that searched for the exact
+// string origin+capabilityPath would pass on a log line that broke it across a
+// JSON escape.
+func assertReceiverPathNotLogged(t *testing.T, out, origin string) {
+	t.Helper()
+	if !strings.Contains(out, origin) {
+		// Not a failure — nothing obliges a log line to name the receiver at
+		// all — but worth knowing, because it means the assertion below is
+		// weaker than it reads.
+		t.Logf("note: the receiver's origin %s never appears in the log either", origin)
+	}
+	if strings.Contains(out, strings.TrimPrefix(capabilityPath, "/hook/")) {
+		t.Errorf("the receiver's path reached the log, and a webhook path is where a capability token lives:\n%s", out)
+	}
 }
 
 // credentialsIn pulls the token or code out of one posted delivery, whatever
