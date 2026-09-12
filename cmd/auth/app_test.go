@@ -660,6 +660,52 @@ func TestEnabledStoresTracksTheSchema(t *testing.T) {
 	}
 }
 
+// TestCoreOptionSetsAreOrderedAndReserved pins the composition root's build
+// order and the slots reserved after it.
+//
+// Both halves are load-bearing. The order of the wired sets is observable
+// through their refusals — a document with two faults reports the first set that
+// refuses, and TestInvalidConfigAbortsInit depends on which — and the core's own
+// options are not commutative, so a reordering is a behaviour change that
+// nothing else would catch. The reserved tail is pinned so that the blocks
+// filling those slots find them where the roadmap says they are: a block that
+// renamed or reordered one would silently move another block's landing site.
+//
+// It also pins which slots are still empty, so that filling one is a visible
+// edit to this list rather than a line that appears in a diff nobody reads.
+func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
+	t.Parallel()
+
+	sets := coreOptionSets(context.Background(), config.Defaults(), Options{}, nil, nil, discardLogger())
+
+	var names []string
+	var empty []string
+	for _, s := range sets {
+		if s.name == "" {
+			t.Errorf("a core option set has no name; the name is what makes the reserved order checkable")
+		}
+		names = append(names, s.name)
+		if s.build == nil {
+			empty = append(empty, s.name)
+		}
+	}
+
+	wantOrder := []string{
+		"delivery", "email", "twoFactor", "claims", "oauth", "idp",
+		"settings", "docs", "ui", "admin", "tools",
+	}
+	if strings.Join(names, ",") != strings.Join(wantOrder, ",") {
+		t.Errorf("core option sets are %v, want %v", names, wantOrder)
+	}
+
+	// The slots no block has filled yet. Filling one means deleting its name
+	// from here in the same commit.
+	wantEmpty := []string{"settings", "docs", "ui", "admin", "tools"}
+	if strings.Join(empty, ",") != strings.Join(wantEmpty, ",") {
+		t.Errorf("unfilled core option slots are %v, want %v", empty, wantEmpty)
+	}
+}
+
 func TestLoadDocument(t *testing.T) {
 	t.Parallel()
 
