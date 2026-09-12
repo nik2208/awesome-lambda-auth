@@ -25,6 +25,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",
+		"ui-uploaded-assets-are-not-served",
 	}
 	var got []string
 	for _, d := range WireDeviations() {

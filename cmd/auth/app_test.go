@@ -701,12 +701,22 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	// The slots that contribute no option. Filling one means deleting its name
 	// from here in the same commit.
 	//
-	// `docs` is on this list for a different reason from the other three, and
-	// the difference is deliberate rather than pending: that block is wired, and
-	// it reaches the core entirely through HTTPConfig.Docs (docs.go, httpConfig),
-	// so there is no auth.Option for it to contribute and none was invented.
-	// If it ever leaves this list it must be because upstream grew an option,
-	// not because somebody assumed an empty slot meant unfinished work.
+	// **Two of these four are empty on purpose and two are still waiting**, and
+	// the list cannot tell them apart, so this comment has to.
+	//
+	// `docs` and `ui` are the deliberate ones. Both blocks are wired, and both
+	// reach the core entirely through HTTPConfig — DocsOptions for the two
+	// documentation routes (docs.go), UIOptions for the whole <prefix>/ui
+	// subtree (ui.go) — which the adapter reads at mount time. Neither has an
+	// auth.Option to contribute and neither had one invented for it: the UI's
+	// config document is built from the settings and template stores, and those
+	// were handed to the core by the `settings` slot and by emailOptions, not by
+	// this one. If either ever leaves this list it must be because upstream grew
+	// an option, not because somebody read an empty slot as unfinished work.
+	//
+	// `admin` and `tools` are the pending ones: their domains are still refused
+	// by internal/config/phases.go, and whether they contribute options is not
+	// yet known.
 	wantEmpty := []string{"docs", "ui", "admin", "tools"}
 	if strings.Join(empty, ",") != strings.Join(wantEmpty, ",") {
 		t.Errorf("unfilled core option slots are %v, want %v", empty, wantEmpty)
@@ -796,37 +806,67 @@ func TestSameSiteMapping(t *testing.T) {
 	}
 }
 
-// TestUIEnabledIsFalseUntilTheUIDomainIsWired makes a dependency visible that is
-// otherwise invisible: httpConfig reads ui.enabled, which decides whether every
-// emailed link points at <site><prefix>/ui/<path> or at the bare API route
-// (UILink, wire.go) — but `ui` is still in unwiredDomains(), so a document that
-// configures it refuses to start and the field can only ever be false.
+// TestTheUISwitchIsOneSwitchWithTwoSpellings pins the half of the UI wiring that
+// is invisible from either side on its own: `ui.enabled` decides both whether
+// the adapter mounts <prefix>/ui and whether every emailed link points at a UI
+// page or at the bare API route (UILink, wire.go), and the core carries two
+// names for that one switch.
 //
-// The wiring is kept deliberately, so that the link shape and the UI switch
-// cannot drift apart when P6 lands. This test is the price of keeping it: it
-// pins both halves, so that un-gating the domain fails here and whoever does it
-// is told that emailed links change shape the moment ui.enabled is settable.
-func TestUIEnabledIsFalseUntilTheUIDomainIsWired(t *testing.T) {
+// httpConfig sets UI.Enabled and deliberately leaves the deprecated UIEnabled
+// alias alone, which is the arrangement in which the two cannot be assigned from
+// different expressions and drift. This test is what makes that a fact about the
+// build rather than a comment about it: it asserts the alias stays unset *and*
+// that the link shape follows anyway, because the two together are the whole
+// claim. Setting the alias as well would pass the second assertion and hide the
+// day someone wired one of them from a different knob.
+//
+// It loads with AllowUnimplemented so that it says the same thing on both sides
+// of the phase gate: before `ui` leaves unwiredDomains() the flag is a warning,
+// after it is silence, and the wiring under test is identical either way.
+func TestTheUISwitchIsOneSwitchWithTwoSpellings(t *testing.T) {
 	t.Parallel()
 
-	// The gate: configuring the domain at all is refused, so there is no
-	// loadable document in which the field is true.
-	_, err := config.Load(context.Background(), config.Options{
-		Getenv: envFunc(with(baseEnv(), "AWESOME_AUTH_UI_ENABLED", "true")),
-	})
-	if err == nil {
-		t.Fatal("ui.enabled was accepted; it is no longer gated, and httpConfig now changes the shape of every emailed link")
-	}
-	if !strings.Contains(err.Error(), "ui") {
-		t.Errorf("the refusal does not name the ui domain:\n%v", err)
+	const site = "https://app.example.test"
+
+	load := func(t *testing.T, env map[string]string) auth.HTTPConfig {
+		t.Helper()
+		cfg, err := config.Load(context.Background(), config.Options{
+			Getenv:             envFunc(env),
+			AllowUnimplemented: true,
+		})
+		if err != nil {
+			t.Fatalf("config.Load: %v", err)
+		}
+		return httpConfig(cfg)
 	}
 
-	// And what the core is therefore handed, for a document that does load.
-	cfg, err := config.Load(context.Background(), config.Options{Getenv: envFunc(baseEnv())})
-	if err != nil {
-		t.Fatalf("config.Load: %v", err)
-	}
-	if httpConfig(cfg).UIEnabled {
-		t.Error("httpConfig reports UIEnabled for a configuration that cannot set it")
-	}
+	t.Run("off", func(t *testing.T) {
+		t.Parallel()
+		wire := load(t, baseEnv())
+		if wire.UI.Enabled {
+			t.Error("UI.Enabled is set for a document that does not enable the UI")
+		}
+		if got, want := wire.UILink(site, "/reset-password?token=t"), site+"/auth/reset-password?token=t"; got != want {
+			t.Errorf("UILink = %q, want the bare API route %q", got, want)
+		}
+	})
+
+	t.Run("on", func(t *testing.T) {
+		t.Parallel()
+		wire := load(t, with(baseEnv(), "AWESOME_AUTH_UI_ENABLED", "true"))
+		if !wire.UI.Enabled {
+			t.Error("UI.Enabled is not set for a document that enables the UI, so the adapter would mount no UI at all")
+		}
+		// The alias is the core's own deprecated spelling. Leaving it unset is
+		// the point: one switch, assigned once.
+		if wire.UIEnabled {
+			t.Error("httpConfig set the deprecated UIEnabled alias as well; the two must come from one assignment, not two")
+		}
+		// And the link follows the switch regardless, because UILink reads both
+		// spellings. This is what would silently regress if the alias were ever
+		// wired from a second expression.
+		if got, want := wire.UILink(site, "/reset-password?token=t"), site+"/auth/ui/reset-password?token=t"; got != want {
+			t.Errorf("UILink = %q, want the hosted UI page %q", got, want)
+		}
+	})
 }

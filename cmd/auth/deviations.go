@@ -226,6 +226,38 @@ func WireDeviations() []WireDeviation {
 				"TestTheShippedDefaultsAreTheOnesTheRegisterClaims fail the day this entry stops describing the product.",
 			Spec: "docs/spec/config-schema.md §1.16; docs/spec/data-model.md §1.5 row #61 and §2.3; docs/config-reference.md §13",
 		},
+		{
+			ID:      "ui-uploaded-assets-are-not-served",
+			Surface: "GET <prefix>/ui/assets/logo/* and GET <prefix>/ui/assets/uploads/*, and the ui.uploadDir knob behind them",
+			Behaviour: "Both paths answer 404, in every configuration. ui.uploadDir is accepted by the schema, reported at cold " +
+				"start as a knob this build does not honour, and reaches nothing: HTTPConfig.UI.Uploads is left nil, which is the " +
+				"core's own unconfigured state, so the two mounts do not exist rather than failing. Everything else the hosted UI " +
+				"serves is unaffected, and a deployment that wants a logo sets ui.branding.logoUrl to a URL it hosts elsewhere, " +
+				"which this build does honour and which the SSR injection writes into every page.",
+			Reference: "config.ui.uploadDir is a directory the admin router writes uploads into (admin.router.ts:656) and two " +
+				"express.static mounts read them back out of, under both the legacy /assets/logo path and the unified " +
+				"/assets/uploads one (ui.router.ts:185-191). With the option set, an uploaded logo is served from the auth origin.",
+			Why: "Three reasons, and the first is decisive on its own: there is no writer. The upload route is an admin route, this " +
+				"build mounts no admin router, and the `admin` domain is still refused by internal/config/phases.go -- so a read " +
+				"path built now would read an empty location on every deployment until the admin surface lands. The imported core " +
+				"made the same call for the same reason and says so: UIOptions.Uploads is read-only \"on purpose\", because the " +
+				"port has no UploadStore to write through yet.\n\n" +
+				"The second is that a directory is the wrong noun in this runtime. The knob names a filesystem path and a Lambda " +
+				"has none that survives a request: /var/task is read-only and /tmp is per execution environment, so a logo " +
+				"uploaded during one cold start would be invisible to the next and gone by the one after. The serverless shape is " +
+				"an S3 location, which config-schema.md §1.12 already records -- and that is a different thing behind the same " +
+				"knob, so what the value means has to be decided together with the writer rather than guessed at here.\n\n" +
+				"The third is cost, and it is why the seam was not filled speculatively. fs.FS has one operation, Open, so every " +
+				"request for an uploaded asset is a GetObject -- misses included, and misses are the common case, because the logo " +
+				"is requested by every page of the hosted UI whether or not anyone has ever uploaded one. Caching it per execution " +
+				"environment would trade that for an upload that does not appear until the next cold start, which is worse than " +
+				"not having the feature. The read path belongs beside the write path, where one design pays for both.\n\n" +
+				"The entry is registered rather than left as a comment because wiring the `ui` block is what makes the two paths " +
+				"reachable at all: before it, the whole subtree answered 404 and there was nothing to be surprised by. " +
+				"cmd/auth/ui_test.go TestUIOptionsCarryTheWholeBlock fails the day Uploads is filled, which is the day this entry " +
+				"is retired.",
+			Spec: "docs/spec/config-schema.md §1.12; docs/config-reference.md §15.4; upstream UIOptions.Uploads (awesome-go-auth ui_config.go)",
+		},
 	}
 }
 
