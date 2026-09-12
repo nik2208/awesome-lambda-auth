@@ -129,6 +129,7 @@ type Store struct {
 	log                  *slog.Logger
 	degradedOnce         sync.Once
 	unknownNamespaceOnce sync.Once
+	migrationScopeOnce   sync.Once
 }
 
 // New validates opts and returns a Store. It performs no I/O: the table is

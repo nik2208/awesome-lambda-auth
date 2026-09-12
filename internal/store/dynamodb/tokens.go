@@ -16,6 +16,35 @@ import (
 const attrFamily = "family"
 
 // UpdatePassword is part of UserPasswordStore.
+//
+// It also removes the migration marker, in the same write, and that is the
+// whole of how a migration ends. The three callers upstream are ResetPassword,
+// ChangePassword and the password-verifier seam's adoption step
+// (awesome-go-auth/password_verifier.go), and each of them means the same thing
+// about this account: from now on there is a local credential, chosen or
+// adopted here, and the old directory has nothing left to say about it.
+//
+// One write rather than two is the point, and it settles the concurrency
+// question the marker would otherwise raise. Two logins of one migrating user
+// can race: both find a hash that does not verify, both ask the old directory,
+// both are told yes, both hash the proven password at BcryptCost — producing two
+// different hashes of the same password, because bcrypt salts — and both arrive
+// here. Because setting the hash and dropping the marker are one atomic
+// UpdateItem, there is no interleaving in which the marker is gone while the
+// hash is still the imported empty one, which is the interleaving that would
+// lock the person out for good: no marker means the verifier answers
+// (false, false, nil), and an empty hash verifies nothing, so the account would
+// have no way back in short of a password reset. Adoption is therefore
+// IDEMPOTENT rather than exclusive: whichever write lands second wins, its hash
+// verifies the same password the first one did, and the loser's work is wasted
+// rather than wrong. internal/store/dynamodb TestConcurrentPasswordAdoption
+// pins it against DynamoDB Local.
+//
+// A conditional write that let exactly one adopter through was considered and
+// refused. It would have to answer the loser somehow, and every available answer
+// is worse: an error becomes a generic 500 for a login whose password was
+// correct, and a silent success would return before the winner's write is
+// visible to a reader on another connection.
 func (s *Store) UpdatePassword(ctx context.Context, userID, tenantID, passwordHash string) error {
 	if err := s.checkTenant(tenantID); err != nil {
 		return err
@@ -26,9 +55,9 @@ func (s *Store) UpdatePassword(ctx context.Context, userID, tenantID, passwordHa
 	_, err := s.api.UpdateItem(ctx, &awsddb.UpdateItemInput{
 		TableName:                aws.String(s.table),
 		Key:                      key(userPK(tenantID, userID), skProfile),
-		UpdateExpression:         aws.String("SET #passwordHash = :hash, #updatedAt = :now"),
+		UpdateExpression:         aws.String("SET #passwordHash = :hash, #updatedAt = :now REMOVE #migration"),
 		ConditionExpression:      aws.String("attribute_exists(#PK)"),
-		ExpressionAttributeNames: exprNames(attrPK, attrPasswordHash, attrUpdatedAt),
+		ExpressionAttributeNames: exprNames(attrPK, attrPasswordHash, attrUpdatedAt, attrMigration),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":hash": avS(passwordHash),
 			":now":  avS(formatTime(s.nowUTC())),

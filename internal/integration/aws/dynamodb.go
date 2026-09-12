@@ -29,6 +29,11 @@ type DynamoDBOptions struct {
 	// (stores.connection.endpoint), not a test hook: unit tests inject a fake
 	// dynamodb.API instead of talking to a socket.
 	Endpoint string
+
+	// Profile names a profile in the shared config file. Always empty in the
+	// Lambda; it exists for cmd/migrate, run from a workstation against a table
+	// whose account is not the one holding the pool being migrated.
+	Profile string
 }
 
 // NewDynamoDBClient builds a DynamoDB client from the ambient AWS
@@ -44,6 +49,9 @@ func NewDynamoDBClient(ctx context.Context, opts DynamoDBOptions) (*awsddb.Clien
 	var loadOpts []func(*awsconfig.LoadOptions) error
 	if opts.Region != "" {
 		loadOpts = append(loadOpts, awsconfig.WithRegion(opts.Region))
+	}
+	if opts.Profile != "" {
+		loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(opts.Profile))
 	}
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)

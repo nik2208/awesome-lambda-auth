@@ -32,6 +32,12 @@ const (
 	attrCreatedAt     = "createdAt"
 	attrUpdatedAt     = "updatedAt"
 
+	// attrImported carries the attributes an import brought across that no
+	// auth.User field has a home for. See ImportedAttributesKey. The migration
+	// marker is a separate attribute that deliberately never reaches auth.User
+	// at all; it lives in migration.go.
+	attrImported = "imported"
+
 	// OAuth linked-account and pending-link attributes. They live on their own
 	// item types, not on the profile, but the names belong in one place with the
 	// rest so a codec and a condition cannot disagree about one.
@@ -52,6 +58,71 @@ const (
 	attrSMSHash    = "smsHash"
 	attrSMSExp     = "smsExp"
 )
+
+// Why the marker is on the PROFILE item, and why it is the only thing about a
+// user this store reads without putting it on auth.User.
+//
+// The upstream password-verifier seam is handed the user record as the store
+// holds it and requires the verifier to key on a marker in that record before it
+// does anything at all — because the hook is reached for every account whose
+// stored hash failed to verify, including OAuth-only and magic-link-only
+// accounts that never had a password, from an unauthenticated route
+// (awesome-go-auth/password_verifier.go). So the marker has to be readable from
+// the single item the login path reads, and GetUserByEmail reads exactly one:
+// the profile. A marker on the META# item would cost a second
+// strongly-consistent GetItem on every single login to find out that almost
+// every login does not need it.
+//
+// Where it does NOT go is auth.User. The seam's own example reads
+// `u.Metadata["legacyIdP"]`, and that is the obvious place, but auth.User is
+// what auth.NewPublicUser serialises: a marker there is a marker GET /me hands
+// to the account holder, naming the source directory and the user pool id. So
+// the profile read files it on the request context instead and the verifier
+// takes it from there — see migration.go, which argues the carrier and cites the
+// core line that makes it correct.
+//
+// Why not a magic placeholder in passwordHash, which the upstream doc also
+// offers. It would be tidier — a placeholder can never verify, so the hook is
+// reached, and adoption overwrites it, so the marker clears itself with no
+// second write. It is refused because an imported Cognito user has no password
+// hash at all, and an EMPTY PasswordHash is load-bearing upstream: it is what
+// opens the passwordless initial-password path (wire_password_email.go:347). A
+// placeholder would close that path for exactly the population that most needs
+// it — a migrated person who has forgotten the password the old system held and
+// wants to set one here.
+
+// ImportedAttributesKey is the auth.User.Metadata key carrying the attributes an
+// import brought across that no auth.User field has a home for — in practice a
+// Cognito pool's `custom:*` schema.
+//
+// This is NOT this driver's implementation of UserMetadataStore, and the
+// distinction is the whole reason it is a second reserved key rather than a
+// general metadata round-trip. That interface is deliberately absent
+// (interfaces.go) because its item type is designed and unbuilt, and half of it
+// — persistence with no GetMetadata, no UpdateMetadata and no ClearMetadata —
+// would make the core's type assertion advertise a feature that fails on the
+// wire, which is the exact failure interfaces.go refuses. What this key is
+// instead is a one-way record: written once by an import, read back with the
+// user so a claims mapping or a support tool can see what the old directory
+// held, and modified by nothing here.
+//
+// Only string values survive the round trip, because that is what a Cognito
+// attribute is. A pool with a JSON blob in a custom attribute keeps the blob as
+// the string it already was.
+const ImportedAttributesKey = "imported"
+
+// reservedMetadataKeys are the auth.User.Metadata keys this driver persists on
+// the profile item, each under a profile attribute of the same name. Everything
+// else in Metadata is dropped on write and absent on read.
+//
+// One table rather than two code paths, so that the encoder and the decoder
+// cannot disagree about which keys are persisted, and so that the answer to
+// "what of Metadata survives here" is a list somebody can read. That the list
+// has one entry is the point: the migration marker is NOT on it, and cannot be
+// added to it without putting the marker back on the wire.
+var reservedMetadataKeys = []struct{ key, attr string }{
+	{ImportedAttributesKey, attrImported},
+}
 
 // maxUserCollectionItems caps the unconditioned Query over USER#<t>#<u>. The
 // collection is bounded by design — only META#, PROFILE and ROLE# live there —
@@ -90,12 +161,79 @@ func profileItem(u auth.User) item {
 	it.s(familyVerify.hashAttr, u.EmailVerificationTokenHash).tp(familyVerify.expAttr, u.EmailVerificationTokenExpiry)
 	it.s(familyEchg.hashAttr, u.EmailChangeTokenHash).tp(familyEchg.expAttr, u.EmailChangeTokenExpiry)
 	it.s(familySMS.hashAttr, u.SMSCodeHash).tp(familySMS.expAttr, u.SMSCodeExpiresAt)
+
+	// The reserved metadata keys, and nothing else out of Metadata.
+	// Round-tripping the whole map would put an unbounded, caller-supplied
+	// document on the item every login reads, and would silently become this
+	// driver's implementation of UserMetadataStore without any of that
+	// interface's semantics.
+	for _, r := range reservedMetadataKeys {
+		if mv := stringMapAV(u.Metadata[r.key]); mv != nil {
+			it.av(r.attr, mv)
+		}
+	}
 	return it
 }
 
-// userFromItem is the inverse. Metadata, Roles, Permissions and Tenants stay nil:
-// they live in other item types and the core fills them in through the optional
+// stringMapAV encodes one reserved metadata value as a DynamoDB map of strings,
+// or nil when there is nothing to write.
+//
+// Only string-valued entries survive, and a map with none is dropped rather than
+// written empty: the omission rule in §5 is what lets the REMOVE in
+// UpdatePassword and an attribute_not_exists condition mean what they say, and a
+// present-but-empty marker in particular would be a row that reads as
+// mid-migration forever while naming no directory to ask.
+func stringMapAV(v any) types.AttributeValue {
+	raw, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	fields := make(map[string]types.AttributeValue, len(raw))
+	for k, val := range raw {
+		s, ok := val.(string)
+		if !ok || s == "" {
+			continue
+		}
+		fields[k] = avS(s)
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	return &types.AttributeValueMemberM{Value: fields}
+}
+
+// stringMapFrom is the inverse: one reserved attribute as the map[string]any the
+// core hands a PasswordVerifier, or nil when the attribute is absent, is not a
+// map, or holds nothing this codec wrote.
+func stringMapFrom(m map[string]types.AttributeValue, attr string) map[string]any {
+	av, ok := m[attr].(*types.AttributeValueMemberM)
+	if !ok || len(av.Value) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(av.Value))
+	for k, v := range av.Value {
+		s, ok := v.(*types.AttributeValueMemberS)
+		if !ok {
+			continue
+		}
+		out[k] = s.Value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// userFromItem is the inverse. Roles, Permissions and Tenants stay nil: they
+// live in other item types and the core fills them in through the optional
 // stores, so inventing empty values here would hide a missing store.
+//
+// Metadata is the one that is no longer unconditionally nil: an imported user
+// carries ImportedAttributesKey, and nothing else ever does. It does NOT carry
+// the migration marker, which is read off the same item by GetUserByID and filed
+// on the request context instead — see migration.go for why the one thing this
+// codec reads without returning it is the one thing that must not reach a
+// response body.
 func userFromItem(m map[string]types.AttributeValue) (auth.User, error) {
 	if err := checkVersion(m, typeUser); err != nil {
 		return auth.User{}, err
@@ -120,6 +258,16 @@ func userFromItem(m map[string]types.AttributeValue) (auth.User, error) {
 		EmailVerificationTokenHash: getS(m, familyVerify.hashAttr),
 		EmailChangeTokenHash:       getS(m, familyEchg.hashAttr),
 		SMSCodeHash:                getS(m, familySMS.hashAttr),
+	}
+	for _, r := range reservedMetadataKeys {
+		got := stringMapFrom(m, r.attr)
+		if got == nil {
+			continue
+		}
+		if u.Metadata == nil {
+			u.Metadata = make(map[string]any, len(reservedMetadataKeys))
+		}
+		u.Metadata[r.key] = got
 	}
 
 	var err error
@@ -155,6 +303,33 @@ func userFromItem(m map[string]types.AttributeValue) (auth.User, error) {
 // exactly one winner is a separate item guarded by attribute_not_exists inside a
 // transaction. The loser gets ErrUserExists, matching memory_store.go:39-45.
 func (s *Store) CreateUser(ctx context.Context, user auth.User) (auth.User, error) {
+	return s.createUser(ctx, user, MigrationMarker{})
+}
+
+// CreateMigratedUser is CreateUser plus the migration marker, written into the
+// same profile item in the same transaction.
+//
+// It is a second method rather than a field on auth.User for the reason
+// migration.go gives at length: auth.NewPublicUser serialises everything on
+// auth.User, so a marker that could be *passed* on one would be a marker that
+// could be *returned* on one, and the separation this design depends on would
+// hold only by convention. Here it holds by signature — there is no way to write
+// a marker except by naming it, and no way to read one back except through the
+// request-scoped carrier.
+//
+// It also records the marker into that carrier, because the dual-read path
+// creates a row and then hands it straight to the verifier in the same request,
+// with no intervening profile read to do the recording.
+func (s *Store) CreateMigratedUser(ctx context.Context, user auth.User, marker MigrationMarker) (auth.User, error) {
+	created, err := s.createUser(ctx, user, marker)
+	if err != nil {
+		return auth.User{}, err
+	}
+	recordMigrationMarker(ctx, created.ID, marker)
+	return created, nil
+}
+
+func (s *Store) createUser(ctx context.Context, user auth.User, marker MigrationMarker) (auth.User, error) {
 	if err := s.checkTenant(user.TenantID); err != nil {
 		return auth.User{}, err
 	}
@@ -190,11 +365,16 @@ func (s *Store) CreateUser(ctx context.Context, user auth.User) (auth.User, erro
 		sAlways(attrGSI1SK, tenantPK(user.TenantID)).
 		t(attrCreatedAt, now)
 
+	profile := profileItem(user)
+	if mv := markerItem(marker); mv != nil {
+		profile.av(attrMigration, mv)
+	}
+
 	err := s.transactWrite(ctx, &awsddb.TransactWriteItemsInput{
 		TransactItems: []types.TransactWriteItem{
 			{Put: &types.Put{
 				TableName:                aws.String(s.table),
-				Item:                     profileItem(user),
+				Item:                     profile,
 				ConditionExpression:      aws.String(notExists),
 				ExpressionAttributeNames: names,
 			}},
@@ -275,6 +455,14 @@ func (s *Store) GetUserByID(ctx context.Context, id, tenantID string) (auth.User
 	if len(out.Item) == 0 {
 		return auth.User{}, ErrUserNotFound
 	}
+	// The migration marker is filed on the request context here and nowhere
+	// else, because this is the read the login path makes: GetUserByEmail
+	// resolves the uniqueness item and then comes straight here, so one profile
+	// GetItem serves both the user and the marker. It is recorded whether or not
+	// the profile carries one — "read, and there is none" is a different answer
+	// from "never read", and only the second is a wiring fault worth a log line.
+	// See migration.go.
+	recordMigrationMarker(ctx, id, markerFromItem(out.Item))
 	return userFromItem(out.Item)
 }
 

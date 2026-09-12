@@ -691,7 +691,7 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	}
 
 	wantOrder := []string{
-		"delivery", "email", "twoFactor", "claims", "oauth", "idp",
+		"delivery", "email", "twoFactor", "claims", "oauth", "idp", "migration",
 		"settings", "docs", "ui", "admin", "tools",
 	}
 	if strings.Join(names, ",") != strings.Join(wantOrder, ",") {

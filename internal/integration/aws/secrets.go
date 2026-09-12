@@ -110,6 +110,13 @@ func NewSecretResolvers(opts SecretResolverOptions) config.Resolvers {
 type lazyConfig struct {
 	region string
 
+	// profile selects a named profile out of the shared config file. It is
+	// always empty in the Lambda — the runtime supplies credentials through the
+	// environment and there is no shared config file to read — and it exists for
+	// cmd/migrate, which is an operator tool run from a workstation against two
+	// accounts at once. Empty keeps the default chain exactly as it was.
+	profile string
+
 	once sync.Once
 	cfg  awssdk.Config
 	err  error
@@ -120,6 +127,9 @@ func (l *lazyConfig) get(ctx context.Context) (awssdk.Config, error) {
 		var loadOpts []func(*awsconfig.LoadOptions) error
 		if l.region != "" {
 			loadOpts = append(loadOpts, awsconfig.WithRegion(l.region))
+		}
+		if l.profile != "" {
+			loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(l.profile))
 		}
 		l.cfg, l.err = awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 		if l.err != nil {

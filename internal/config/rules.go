@@ -37,7 +37,104 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS10FirstUser(c, capabilities, d)
 	checkRS11OAuthProviders(c, d)
 	checkRS12MemoryStore(c, d)
+	checkRS13Migration(c, capabilities, d)
 	checkStoreRequirements(c, d)
+}
+
+// checkRS13Migration: a migration block must describe a migration that can
+// actually happen.
+//
+// Not a §2 rule, because §2 was extracted from a reference that has no
+// migration of any kind; it takes the next free identifier for the reason
+// RuleMigrationIncomplete gives. Every clause below is a combination of
+// individually valid values whose failure would otherwise be discovered from a
+// person's failed login rather than from a failed deploy, which is the test
+// every rule in this table has to pass.
+//
+// The clauses, and what each of them is actually preventing:
+//
+//   - A knob set with no source. The source is the off switch, so a pool id, an
+//     app client or dual-read written without one is a block that reads as
+//     configured and does nothing. This is the shape of an operator who turned
+//     the migration off by deleting the wrong line, and the one clause where the
+//     deployment would otherwise come up looking healthy while the migration it
+//     was redeployed to perform is silently not running.
+//
+//   - A source with no pool id, and a pool id with no region. Both are the same
+//     failure seen twice: a directory this deployment cannot address. Without a
+//     region in particular, the SDK resolves AWS_REGION — this stack's own
+//     region — and a pool that lives in the account being migrated out of would
+//     answer "no such user" for every person, indistinguishably from an empty
+//     pool. The region is therefore demanded rather than inherited from
+//     stores.connection.region: they are the same value only by coincidence.
+//
+//   - dual-read on a driver that cannot hold the marker. Falling a miss through
+//     to the source is only worth anything if the row it creates is still there
+//     on the next request, and on the memory driver it is not: each execution
+//     environment would re-provision the same person from Cognito, forever, on
+//     an unauthenticated route. That is the amplifier the whole marker design
+//     exists to prevent, reintroduced by a store choice.
+//
+//   - A verifier configured with no store that can adopt the password. This is
+//     the clause the upstream seam asks for by name. With a client id set, a
+//     login reaches the verifier, the verifier answers ok=true migrated=true,
+//     and the core then requires the user store to be a UserPasswordStore or it
+//     answers a generic 500 (awesome-go-auth/password_verifier.go). It also
+//     requires the marker to have survived the write, which is the same
+//     capability. Refusing here turns a 500 per migrating login into a failed
+//     deploy.
+func checkRS13Migration(c *Config, capabilities func(string) StoreCapabilities, d *diagnostics) {
+	m := c.Stores.Migration
+
+	if !m.Active() {
+		// Only the knobs an operator has to have written by hand count as
+		// evidence of intent. The mode has a default, so it cannot distinguish
+		// "configured" from "untouched" and is compared against that default
+		// rather than against emptiness.
+		configured := make([]string, 0, 3)
+		if strings.TrimSpace(m.UserPoolID) != "" {
+			configured = append(configured, "stores.migration.userPoolId")
+		}
+		if strings.TrimSpace(m.ClientID) != "" {
+			configured = append(configured, "stores.migration.clientId")
+		}
+		if m.Mode != "" && m.Mode != MigrationModeImportOnly {
+			configured = append(configured, "stores.migration.mode")
+		}
+		if len(configured) > 0 {
+			d.errf(RuleMigrationIncomplete, "stores.migration.source",
+				fmt.Sprintf("the migration block is configured (%s) but names no source, and the source is the switch: nothing would be imported, no lookup would fall through and no password would be migrated",
+					strings.Join(configured, ", ")),
+				"set stores.migration.source: cognito, or remove the rest of the block")
+		}
+		return
+	}
+
+	if strings.TrimSpace(m.UserPoolID) == "" {
+		d.errf(RuleMigrationIncomplete, "stores.migration.userPoolId",
+			fmt.Sprintf("stores.migration.source is %q and no user pool is named, so there is no directory to migrate from", m.Source),
+			"set stores.migration.userPoolId to the pool being migrated away from, e.g. <region>_XXXXXXXXX")
+	} else if strings.TrimSpace(m.Region) == "" {
+		d.errf(RuleMigrationIncomplete, "stores.migration.region",
+			"a user pool is named with no region, so the calls would be addressed at this stack's own region and every lookup in a pool that lives elsewhere would answer \"no such user\" -- indistinguishable from an empty pool",
+			"set stores.migration.region to the region the pool lives in; it is not inherited from stores.connection.region, which is where this stack's table lives")
+	}
+
+	marker := capabilities(c.Stores.Driver).MigrationMarker
+
+	if m.DualRead() && !marker {
+		d.errf(RuleMigrationIncomplete, "stores.migration.mode",
+			fmt.Sprintf("dual-read needs to write the row it provisions somewhere that outlives the request, and the %q store driver cannot hold a migration marker -- every execution environment would re-provision the same person from the source, on an unauthenticated route",
+				c.Stores.Driver),
+			"use stores.driver: dynamodb, or set stores.migration.mode: import-only")
+	}
+
+	if m.VerifierConfigured() && !marker {
+		d.errf(RuleMigrationIncomplete, "stores.migration.clientId",
+			fmt.Sprintf("an app client is configured, so a login would ask the source about the password and the core would then adopt it locally, and the %q store driver cannot hold the marker that decides which accounts are asked about",
+				c.Stores.Driver),
+			"use stores.driver: dynamodb, or clear stores.migration.clientId to keep the import without the login-path dependency")
+	}
 }
 
 // checkRS1Secrets: the HS256 signing secrets must exist, be long enough, and

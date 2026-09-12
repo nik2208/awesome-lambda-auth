@@ -145,6 +145,10 @@ unconfigured deployment answers 404 on both. `docs.basePath` reaches the core
 unchanged and moves what the document describes, never where it is served. The
 four left on the list are `ui`, `admin`, `tools` and `rateLimit`.
 
+`stores.migration` (§13) never appeared on that list and never will: it is new in
+this release and is wired by the same change that declared it, so there was never
+a build that validated it and did nothing.
+
 `email.templatesDir` needs a template store and `runtimeSettings` needs a
 settings store, and both drivers now back both: the DynamoDB store keeps mail
 templates and UI translations on its `TEMPLATES` partition and the settings on
@@ -1007,8 +1011,85 @@ channels. If that is not good enough for your deployment — and on anything
 facing the internet it should not be — the answer is `docs.swagger: false`, or
 `auto` with `deployment.environment: production`, and reading the document from
 a checkout instead.
+## 13. `stores.migration.*` — where your users are coming from
 
-## 13. Two worked postures
+The one block in this schema with no counterpart anywhere in the reference: the
+reference is a library mounted in front of a store somebody already populated,
+and a deployable product has to answer the question of how the users got there.
+With the block unset — the default — nothing here is constructed and every route
+answers exactly what it answered before the block existed.
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `stores.migration.source` | `cognito` | none — **empty is the off switch** | `AWESOME_AUTH_STORES_MIGRATION_SOURCE` |
+| `stores.migration.userPoolId` | string | none; **required** with a source (RS-13) | `AWESOME_AUTH_STORES_MIGRATION_USER_POOL_ID` |
+| `stores.migration.region` | string | none; **required** with a pool id (RS-13) | `AWESOME_AUTH_STORES_MIGRATION_REGION` |
+| `stores.migration.clientId` | string | none — no client id, no login-path dependency | `AWESOME_AUTH_STORES_MIGRATION_CLIENT_ID` |
+| `stores.migration.mode` | `import-only`\|`dual-read` | `import-only` | `AWESOME_AUTH_STORES_MIGRATION_MODE` |
+
+**`source` is the switch, and nothing else is.** A pool id, an app client or a
+mode written without one is refused (`RS-13`), because a block that reads as
+configured and does nothing is the shape of an operator who turned the migration
+off by deleting the wrong line.
+
+**`region` is not inherited** from `stores.connection.region`. The commonest
+migration is out of a pool in another region or another account, and a pool
+addressed in the wrong region answers "no such user" for every single person —
+indistinguishable from an empty pool. It is demanded rather than guessed.
+
+**`clientId` is the second switch, and the one you clear first.** It names an
+app client in the pool, and it is what makes just-in-time password migration
+possible: `AdminInitiateAuth` is a client-scoped call. The app client must allow
+`ADMIN_USER_PASSWORD_AUTH` and must have **no client secret** — one with a secret
+needs a `SECRET_HASH` this product does not compute, and the failure is reported
+by name in the log rather than as "wrong password" on every login. With the
+client id empty the deployment still imports and still dual-reads; it simply
+never calls the pool from a login. That is the posture of a stack whose bulk
+import has finished.
+
+**`mode: dual-read` costs one `AdminGetUser` per lookup miss**, on
+unauthenticated routes, and is bounded per address and globally by a token
+bucket per execution environment. Use it while the bulk import is incomplete and
+turn it back to `import-only` afterwards.
+[cognito-migration.md](cognito-migration.md) §4 has the numbers and the
+reasoning.
+
+**Only the `dynamodb` driver.** The migration marker is a profile attribute, and
+there is nowhere else in this build it survives a cold start; `RS-13` refuses any
+other driver rather than letting a memory-backed stack re-provision the same
+person from Cognito on every execution environment, forever, on an
+unauthenticated route.
+
+**Nothing about the migration reaches the wire.** The marker is store-private: it
+never enters `auth.User`, so `GET <prefix>/me` cannot disclose it, and no
+deviation is registered for it. The one thing a migrated account does carry in
+its `metadata` is `imported` — the source attributes the import mapped there,
+which is your data and is opt-out per attribute in the map (§3 of the runbook).
+[cognito-comparison.md](cognito-comparison.md) §5 has the detail.
+
+The bulk import is `cmd/migrate`, an operator command and not part of the
+deployed artifact. The whole procedure, including what happens on a user that
+already exists, a paging failure halfway through and a record with no email, is
+[cognito-migration.md](cognito-migration.md).
+
+```json
+{
+  "stores": {
+    "driver": "dynamodb",
+    "connection": {"tableName": "awesome-auth", "region": "eu-west-1"},
+    "enable": {"users": true, "sessions": true, "tokens": true},
+    "migration": {
+      "source": "cognito",
+      "userPoolId": "<region>_XXXXXXXXX",
+      "region": "<pool region>",
+      "clientId": "<an app client with no secret>",
+      "mode": "dual-read"
+    }
+  }
+}
+```
+
+## 14. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that

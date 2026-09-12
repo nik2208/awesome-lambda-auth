@@ -48,13 +48,28 @@ type StoreCapabilities struct {
 	// ListUsers reports whether the driver can enumerate users, which
 	// admin.accessPolicy: first-user requires (RS-10).
 	ListUsers bool
+
+	// MigrationMarker reports whether the driver can persist, read back and
+	// clear the migration marker stores.migration keys on (RS-13).
+	//
+	// It is a capability rather than a driver comparison for the same reason
+	// ListUsers is: the truth about what a driver implements belongs to the
+	// store layer, and a rule written as `driver != "dynamodb"` would have to be
+	// found and edited the day a second driver grows the marker.
+	MigrationMarker bool
 }
 
 // builtinCapabilities is the P1 capability table. It is a var, not a const map,
 // so the store packages can register themselves as they land without this file
 // growing a dependency on them.
 var builtinCapabilities = map[string]StoreCapabilities{
-	StoreDriverDynamoDB: {ListUsers: true},
+	// Only the DynamoDB driver carries the migration marker. The marker is a
+	// profile attribute (internal/store/dynamodb/users.go) and there is nowhere
+	// else in this build that it survives a cold start: the memory driver's
+	// store is per execution environment, so an imported row written by
+	// cmd/migrate would simply not be there, and the postgres driver is a
+	// declared driver with no implementation behind it.
+	StoreDriverDynamoDB: {ListUsers: true, MigrationMarker: true},
 	StoreDriverPostgres: {ListUsers: true},
 	StoreDriverMemory:   {ListUsers: true},
 }

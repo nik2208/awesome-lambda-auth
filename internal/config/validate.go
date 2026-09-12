@@ -659,6 +659,21 @@ func validateStores(c *Config, d *diagnostics) {
 			"the users store is disabled, and nothing in the service works without it",
 			"remove the override: stores.enable.users cannot be turned off")
 	}
+	validateMigration(c, d)
+}
+
+// validateMigration checks the vocabulary of stores.migration.*. Which
+// combinations are usable is RS-13's question, in rules.go; this one only asks
+// whether each value is a value.
+//
+// The empty source is accepted here rather than enumerated, because empty is the
+// off switch and an enum listing it would read as though "" were a source.
+func validateMigration(c *Config, d *diagnostics) {
+	m := c.Stores.Migration
+	if strings.TrimSpace(m.Source) != "" {
+		enum(d, "stores.migration.source", m.Source, MigrationSourceCognito)
+	}
+	enum(d, "stores.migration.mode", m.Mode, MigrationModeImportOnly, MigrationModeDualRead)
 }
 
 func validateHTTPAndDocs(c *Config, d *diagnostics) {
