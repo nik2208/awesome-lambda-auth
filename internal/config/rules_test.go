@@ -643,3 +643,216 @@ func TestAllRulesAreReportedTogether(t *testing.T) {
 		}
 	}
 }
+
+// TestRS4KeySourceIsExactlyOne covers the half RS-4 grew when the KMS signer
+// landed: a PEM and a KMS key together are refused everywhere, and either one
+// alone satisfies the rule in production.
+//
+// Refused everywhere, not just in production, because the failure is not "no key
+// material" but "two, and no rule for which signs": the kid written into a token,
+// the key published in the JWKS document and the key that actually signed could
+// then disagree, and the symptom would be a relying party rejecting tokens that
+// are perfectly valid.
+func TestRS4KeySourceIsExactlyOne(t *testing.T) {
+	const pem = "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----"
+
+	t.Run("both sources set is refused in development too", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "deployment.environment", "development")
+		set(doc, "idProvider.enabled", true)
+		set(doc, "idProvider.kmsKeyId", "alias/awesome-auth-idp")
+		env := baseEnv()
+		env["AWESOME_AUTH_IDP_PRIVATE_KEY"] = pem
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		d := requireRule(t, err, RuleIDProviderKeys, "idProvider.kmsKeyId")
+		if !strings.Contains(d.Problem, "which of the two signs") {
+			t.Errorf("the diagnostic does not say what is ambiguous:\n%s", d.Problem)
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(Document)
+		env    func(map[string]string)
+	}{
+		{"a KMS key satisfies it", func(doc Document) {
+			set(doc, "idProvider.kmsKeyId", "arn:aws:kms:eu-west-1:000000000000:key/11111111-2222-3333-4444-555555555555")
+		}, nil},
+		{"a PEM satisfies it", func(doc Document) {
+			set(doc, "idProvider.enabled", true)
+		}, func(env map[string]string) { env["AWESOME_AUTH_IDP_PRIVATE_KEY"] = pem }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			set(doc, "deployment.environment", "production")
+			tc.mutate(doc)
+			env := baseEnv()
+			if tc.env != nil {
+				tc.env(env)
+			}
+
+			_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			requireNoRule(t, err, RuleIDProviderKeys)
+		})
+	}
+
+	// And the development fallback stays legal: the core generates an ephemeral
+	// key and cmd/auth warns about it, which is the right posture for a test
+	// stack and is refused in production by the case in TestRefuseToStartRules.
+	t.Run("no key material in development still loads", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "deployment.environment", "development")
+		set(doc, "idProvider.enabled", true)
+
+		if _, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())}); err != nil {
+			t.Fatalf("development may fall back to an ephemeral key:\n%v", err)
+		}
+	})
+}
+
+// TestIDProviderClientsAreValidated pins the client mistakes that are silent
+// otherwise: no secret (the token endpoint would accept an empty one), no
+// redirect URI (every authorization request is refused), a duplicate id (the
+// registry is a map and the last entry wins), and the two spellings of one
+// problem the duplicate check cannot see — ids that differ only in characters
+// the secret's environment variable cannot keep apart, so one relying party's
+// secret would authenticate another.
+func TestIDProviderClientsAreValidated(t *testing.T) {
+	client := func(fields map[string]any) []any { return []any{fields} }
+
+	t.Run("a client with no secret", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.clients", client(map[string]any{
+			"clientId":     "console",
+			"redirectUris": []any{"https://console.example.com/cb"},
+		}))
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		d := requireRule(t, err, "", "idProvider.clients.console.clientSecret")
+		if !strings.Contains(d.Remedy, "AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET") {
+			t.Errorf("the remedy does not name the variable that supplies the secret:\n%s", d.Remedy)
+		}
+	})
+
+	t.Run("a client with no redirect URIs", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.clients", client(map[string]any{"clientId": "console"}))
+		env := baseEnv()
+		env["AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET"] = "console-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		requireRule(t, err, "", "idProvider.clients[0].redirectUris")
+	})
+
+	t.Run("a duplicate client id", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.clients", []any{
+			map[string]any{"clientId": "console", "redirectUris": []any{"https://a.example.com/cb"}},
+			map[string]any{"clientId": "console", "redirectUris": []any{"https://b.example.com/cb"}},
+		})
+		env := baseEnv()
+		env["AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET"] = "console-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		requireRule(t, err, "", "idProvider.clients[1].clientId")
+	})
+
+	// "my-app", "my.app" and "my_app" are three distinct registry entries that
+	// all derive AWESOME_AUTH_IDP_CLIENT_MY_APP_SECRET. The first pair is closed
+	// by constraining the id, the second by comparing the derived names.
+	t.Run("a client id outside the alphabet the secret's variable can express", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.clients", client(map[string]any{
+			"clientId":     "my.app",
+			"redirectUris": []any{"https://a.example.com/cb"},
+		}))
+		env := baseEnv()
+		env["AWESOME_AUTH_IDP_CLIENT_MY_APP_SECRET"] = "one-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		d := requireRule(t, err, "", "idProvider.clients[0].clientId")
+		if !strings.Contains(d.Problem, "AWESOME_AUTH_IDP_CLIENT_<ID>_SECRET") {
+			t.Errorf("the diagnostic does not say which variable the id has to spell:\n%s", d.Problem)
+		}
+	})
+
+	t.Run("two client ids that derive one environment variable", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.clients", []any{
+			map[string]any{"clientId": "my-app", "redirectUris": []any{"https://a.example.com/cb"}},
+			map[string]any{"clientId": "my_app", "redirectUris": []any{"https://b.example.com/cb"}},
+		})
+		env := baseEnv()
+		env["AWESOME_AUTH_IDP_CLIENT_MY_APP_SECRET"] = "one-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		d := requireRule(t, err, "", "idProvider.clients[1].clientId")
+		if !strings.Contains(d.Problem, "AWESOME_AUTH_IDP_CLIENT_MY_APP_SECRET") {
+			t.Errorf("the diagnostic does not name the variable the two share:\n%s", d.Problem)
+		}
+		if !strings.Contains(d.Problem, "idProvider.clients[0]") {
+			t.Errorf("the diagnostic does not name the other client:\n%s", d.Problem)
+		}
+	})
+
+	t.Run("a plain http redirect URI off the loopback", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.clients", client(map[string]any{
+			"clientId":     "console",
+			"redirectUris": []any{"http://console.example.com/cb"},
+		}))
+		env := baseEnv()
+		env["AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET"] = "console-secret"
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		d := requireRule(t, err, "", "idProvider.clients[0].redirectUris[0]")
+		if !strings.Contains(d.Problem, "query string") {
+			t.Errorf("the diagnostic does not say what travels in the URL:\n%s", d.Problem)
+		}
+	})
+
+	t.Run("a loopback http redirect URI is accepted", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.clients", client(map[string]any{
+			"clientId":     "native-app",
+			"redirectUris": []any{"http://127.0.0.1:8765/callback", "https://app.example.com/cb"},
+		}))
+		env := baseEnv()
+		env["AWESOME_AUTH_IDP_CLIENT_NATIVE_APP_SECRET"] = "native-secret"
+
+		if _, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)}); err != nil {
+			t.Fatalf("RFC 8252 loopback redirects must load:\n%v", err)
+		}
+	})
+}
+
+// TestKMSPreviousKeyIDsAreValidated: a retired key listed twice, or equal to the
+// primary, would publish one key under one kid twice in the JWKS document, and a
+// retired list with no primary key has nothing to be published alongside.
+func TestKMSPreviousKeyIDsAreValidated(t *testing.T) {
+	t.Run("a retired key that repeats the primary", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.kmsKeyId", "alias/idp")
+		set(doc, "idProvider.kmsPreviousKeyIds", []any{"alias/idp"})
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		requireRule(t, err, "", "idProvider.kmsPreviousKeyIds[0]")
+	})
+
+	t.Run("retired keys with no primary", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "idProvider.enabled", true)
+		set(doc, "idProvider.kmsPreviousKeyIds", []any{"alias/old"})
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		requireRule(t, err, "", "idProvider.kmsPreviousKeyIds")
+	})
+}

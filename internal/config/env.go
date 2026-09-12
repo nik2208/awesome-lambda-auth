@@ -215,6 +215,12 @@ func envBindings() []envBinding {
 		envDuration("AWESOME_AUTH_IDP_ACCESS_TTL", "idProvider.accessTokenTtl", func(c *Config, v Duration) { c.IDProvider.AccessTokenTTL = v }),
 		envDuration("AWESOME_AUTH_IDP_REFRESH_TTL", "idProvider.refreshTokenTtl", func(c *Config, v Duration) { c.IDProvider.RefreshTokenTTL = v }),
 		envList("AWESOME_AUTH_IDP_JWKS_CORS_ORIGINS", "idProvider.jwksCorsOrigins", func(c *Config, v []string) { c.IDProvider.JWKSCorsOrigins = StringList{Values: v} }),
+		// The KMS signer (§1.10 addendum). Both are ordinary values, not
+		// secrets: a key id is a pointer to a key nobody can export, which is
+		// the whole reason it is preferable to a PEM. The stack template sets
+		// them from a CloudFormation parameter.
+		envString("AWESOME_AUTH_IDP_KMS_KEY_ID", "idProvider.kmsKeyId", func(c *Config, v string) { c.IDProvider.KMSKeyID = v }),
+		envList("AWESOME_AUTH_IDP_KMS_PREVIOUS_KEY_IDS", "idProvider.kmsPreviousKeyIds", func(c *Config, v []string) { c.IDProvider.KMSPreviousKeyIDs = v }),
 
 		// §1.11 resource server
 		envBool("AWESOME_AUTH_RS_ENABLED", "resourceServer.enabled", func(c *Config, v bool) { c.ResourceServer.Enabled = v }),

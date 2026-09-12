@@ -164,6 +164,22 @@ The four admin rows name the routes the reference serves (`admin.router.ts`); th
 - **Both lists come back in sort-key order**, which is by id and by page, where `MemoryTemplateStore` returns first-insertion order (`mailOrder`/`uiOrder`). Wire-visible through the two admin list routes once they are mounted, so it is in `CompatibilityNotes()` and in [deviations.md](../deviations.md). Restoring insertion order would mean storing a sequence number and sorting on it — a second attribute, written on every upsert, to reproduce an order the reference itself gets by accident from a `Map`. An empty directory is `[]`, never `null`. The lists are drained behind an interface with no cursor, capped at 1 000 and refusing rather than truncating (§8.6).
 - **A template body is caller-supplied and unbounded, so the item is capped at 300 KB** (`MaxTemplateBytes`), measured on the *merged* item — what the patch keeps plus what it sets — before anything is written. Two halves that each fit alone are refused together, with `ErrTemplateTooLarge` and the stored template untouched. The cap sits 100 KB under DynamoDB's 400 KB item limit, which is the margin that lets the size estimate be an estimate; its purpose is that an operator pasting a large HTML mail gets a typed refusal naming the limit instead of the SDK's `ValidationException`. The six reference templates are a few KB each (§6.3).
 
+### 1.7 OIDC authorization codes
+
+| # | Pattern | Trigger | Key condition | Index | Items |
+|---|---|---|---|---|---|
+| 68 | Store an authorization code | `AuthCodeStore.SaveCode` ← `GET/POST <prefix>/authorize`, once per authorization | PutItem `PK=OIDC#<sha256(code)>`, `SK=CODE`, unconditional | main | 1 w |
+| 69 | Redeem an authorization code | `AuthCodeStore.ConsumeCode` ← `POST <prefix>/token`, once per authorization | DeleteItem `OIDC#<sha256(code)>` if `attribute_exists(PK) AND (attribute_not_exists(expiresAt) OR expiresAt > :now)`, `ALL_OLD` | main | 1 w |
+
+Both are net-new: the reference ships no authorization server, so there is no reference behaviour to reproduce and the shape is chosen for the runtime (`store.go`, `AuthCodeStore`, is explicit that it is).
+
+*Notes, four.*
+
+- **The record is the item, not two attributes of a profile.** The four single-use token families (§1.3) hang a hash and an expiry off `USER#<t>#<u>/PROFILE` because that is where the constraint lives and because their lookup methods carry no tenant. An authorization code has no such home: it is a record in its own right — client, redirect URI, nonce, scope, PKCE challenge — and the only thing addressing it is the hash. So the hash is the partition key and the record is the item, which is also what makes #69 one conditional `DeleteItem` instead of a conditional `UpdateItem` that has to leave the rest of a profile alone.
+- **Keyed by the hash the core computes, never by the code.** `AuthCode.CodeHash` arrives as `hashToken(code)` and the clear-text code is never persisted, exactly as the refresh, reset, magic-link and verification partitions do it: a dump of this table cannot be redeemed at `/token`.
+- **#69 is `consumeItemOnce`, and it is the same primitive #57 uses.** The expiry is inside the condition rather than checked after the read (§4.5: TTL deletion is best-effort and lags by up to ~48 h, so a late item must read as absent), the comparison is lexicographic and therefore chronological only because `tsLayout` pads to nine digits, and exactly one of any number of concurrent redemptions can satisfy the condition. That last property is the one RFC 6749 §4.1.2 asks for by name — "the authorization code MUST NOT be used more than once" — and it is the one a read-then-delete cannot give: two Lambdas racing on a code read out of a browser history, a `Referer` header or an access log would both pass the read and both mint a session. `Options.NonAtomicSingleUseTokens` deliberately does not reach this store: that switch exists to imitate the reference, and the reference has no codes.
+- **A replay and an expiry are the same answer.** Both branches of `consumeItemOnce` map to `auth.ErrInvalidCode`, with the same rendered text, where §1.3's families distinguish them. The difference is that here the distinction would be an oracle: a caller who could tell "expired" from "never issued" could probe which codes were minted, and one who could tell "already redeemed" from "expired" would learn that the code they stole had been used — the single most useful fact to an attacker holding one. The core's handler maps every error to the same `400 invalid_grant`, so nothing on the wire is lost.
+
 ---
 
 ## 2. Key schema
@@ -189,6 +205,7 @@ The sketch proposed GSI1 for email/phone, GSI2 for tenant scan, GSI3 for `provid
 | Refresh pointer | `REFRESH#<h>` | `REFRESH` | — | — | yes |
 | Single-use pointer | `{RESET\|MAGIC\|VERIFY\|ECHG}#<h>` | `TOKEN` | — | — | yes |
 | Pending OAuth link | `PLINK#<state>` | `PLINK` | — | — | yes |
+| OIDC authorization code | `OIDC#<sha256(code)>` | `CODE` | — | — | yes |
 | Linked account | `OAUTH#<provider>#<providerId>` | `OAUTH` | `USERID#<u>` | `OAUTH#<provider>#<providerId>` | no |
 | Link id pointer | `LINKID#<linkId>` | `LINKID` | — | — | no |
 | API key | `APIKEY#<prefix>` | `APIKEY` | — | — | optional |
@@ -411,6 +428,8 @@ Types are DynamoDB attribute types. Timestamps are `S`, RFC 3339 in UTC with a *
 
 **API key** — `_t: "apikey"`, `keyId` S, `prefix` S, `name` S, `serviceId` S, `keyHash` S (bcrypt), `scopes` SS?, `allowedIPs` SS?, `isActive` BOOL, `expiresAt` S?, `lastUsedAt` S?, `createdAt` S.
 
+**OIDC authorization code** — `_t: "authcode"`, `userId` S?, `tenantId` S?, `clientId` S?, `redirectUri` S?, `nonce` S?, `scope` S?, `codeChallenge` S?, `codeChallengeMethod` S?, `expiresAt` S (driving the consume condition), `createdAt` S, `ttl` N. No `codeHash` attribute: the hash is the partition key, and a second copy of it would be a value with nothing keeping the two in step. The PKCE pair and the scope are recorded as plain data the core does not verify yet, so that it can start verifying them without a schema change. Everything but the two timestamps is optional, because the omission rule means an absent field round-trips as the zero value rather than as `NULL`.
+
 ### GSI1 projection
 
 **`INCLUDE` of exactly `_t`, `linkId`, `createdAt`.** Everything else is fetched by `BatchGetItem` against the main table.
@@ -526,6 +545,8 @@ Two mounted routes still cannot complete, and **neither is a store gap**:
 The five families are five `tokenFamily` values in `keys.go` and one implementation in `tokens.go` — `issueSingleUseToken`, `consumeSingleUseToken`, `clearSingleUseToken` — with the twelve interface methods in `feature_tokens.go` doing nothing but binding a family to a name. That is a deliberate constraint rather than brevity for its own sake: these are the only "issue a secret, spend it once" paths in the port, and a reviewer who has checked one conditional write has checked all five. The two methods that are *not* token-shaped, `MarkEmailVerified` (#8) and `ApplyEmailChange` (#22), are the only ones with bodies of their own. A family differs in exactly four things: key prefix (empty ⇒ no pointer item), the two profile attribute names, the attributes that travel with the token, and the error a lost condition maps to.
 
 **The consume-once shape is one pattern in two places, not two patterns.** `consumeSingleUseToken` and `consumeItemOnce` (both in `tokens.go`, deliberately adjacent) differ in exactly one respect that cannot be parameterised: for a token family the secret is an attribute of a user profile that must survive the consume, so the write is a conditional `UpdateItem` that `REMOVE`s two attributes and returns the profile; for a pending link the secret *is* the partition key, so the write is a conditional `DeleteItem` of the whole item. Everything that makes either one correct is identical and kept identical — the expiry inside the condition rather than trusted to TTL, the lexicographic comparison that only works because `tsLayout` pads, the `ALL_OLD` pre-image, and `ConditionalCheckFailedException` as the *only* error that becomes an authentication outcome.
+
+`consumeItemOnce` now has a second caller, and it landed without a line of new consume logic: `ConsumeCode` (§1.7 #69, `auth_codes.go`) is the same conditional `DeleteItem` against the same expiry clause. It differs from `PendingLinks.Get` in one deliberate way — both failure branches map to one error, because here the distinction is an oracle — and in one that is absent: `Options.NonAtomicSingleUseTokens` does not reach it, since the flag exists to imitate a reference that has no authorization codes at all.
 
 Behaviours worth knowing before reading the code:
 

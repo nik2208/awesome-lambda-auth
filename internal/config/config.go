@@ -395,6 +395,60 @@ type IDProvider struct {
 	AccessTokenTTL  Duration   `json:"accessTokenTtl"`
 	RefreshTokenTTL Duration   `json:"refreshTokenTtl"`
 	JWKSCorsOrigins StringList `json:"jwksCorsOrigins"`
+
+	// KMSKeyID names an AWS KMS asymmetric key (RSA, SIGN_VERIFY) that signs
+	// every RS256 token instead of PrivateKey. Product addition, §1.10
+	// addendum: the reference has no notion of a signer that keeps the private
+	// key elsewhere, and a Lambda has nowhere safe to keep one — a PEM in
+	// Secrets Manager is a key the function can read, copy and leak, while a KMS
+	// key is one it can only ask to sign.
+	//
+	// A key id, an alias (alias/awesome-auth-idp) or a full ARN; an ARN is what
+	// a cross-account or cross-region key needs. RS-4 refuses a deployment that
+	// sets both this and PrivateKey — two keys and no rule for which one signs
+	// is worse than neither.
+	KMSKeyID string `json:"kmsKeyId"`
+
+	// KMSPreviousKeyIDs are keys whose tokens are still in circulation. They
+	// sign nothing; they are published in the JWKS document after the primary
+	// key so that a token minted before a rotation keeps verifying until it
+	// expires. A rotation is therefore additive — add the new key, make it
+	// primary, and drop the old id one access-token lifetime later.
+	KMSPreviousKeyIDs []string `json:"kmsPreviousKeyIds"`
+
+	// Clients is the OIDC client registry. File-only, because a client is a
+	// redirect-URI allowlist and a secret rather than a scalar, and because
+	// dynamic client registration is deliberately out of scope for v1
+	// (decisions.md D-3). Each entry's clientSecret is a secret reference like
+	// every other, under idProvider.clients.<clientId>.clientSecret.
+	Clients []IDPClient `json:"clients"`
+}
+
+// IDPClient is one registered OIDC relying party (spec §1.10 addendum).
+//
+// The shape is the core's auth.IDPClient, which is the reference's absence
+// rather than its presence: awesome-node-auth publishes a JWKS and signs, and
+// has no authorization server, so there is no reference client registry to
+// reproduce. What the core needs is exactly these four values.
+type IDPClient struct {
+	// ClientID is the public identifier the relying party sends as client_id.
+	// It is also the key of the client's secret slot, so it has to be stable:
+	// renaming it renames the environment variable the secret can arrive in.
+	ClientID string `json:"clientId"`
+
+	// ClientSecret authenticates the relying party at the token endpoint
+	// (client_secret_post, the only method the core advertises). Required: the
+	// core compares the posted secret against this one, so an empty value would
+	// let anyone holding a stolen authorization code redeem it.
+	ClientSecret Secret `json:"clientSecret"`
+
+	// RedirectURIs is the exact-match allowlist the authorization endpoint
+	// resolves redirect_uri against. At least one is required, and each must be
+	// https or a loopback http URL (RFC 8252 §7.3).
+	RedirectURIs []string `json:"redirectUris"`
+
+	// Name is what a consent screen would show. Cosmetic today.
+	Name string `json:"name"`
 }
 
 // active reports whether identity-provider mode is on. The reference activates
@@ -402,8 +456,12 @@ type IDProvider struct {
 // (src/services/token.service.ts:42, src/router/auth.router.ts:473), and that
 // implicit activation is preserved so a config that only supplies a key still
 // trips RS-4's sibling checks.
+//
+// kmsKeyId counts as key material for the same reason privateKey does: it is
+// the operator saying which key signs, and a document that names one and
+// forgets `enabled` must not come up with the IdP silently off.
 func (i IDProvider) active() bool {
-	return i.Enabled || i.PrivateKey.configured()
+	return i.Enabled || i.PrivateKey.configured() || strings.TrimSpace(i.KMSKeyID) != ""
 }
 
 // ResourceServer covers resourceServer.* (spec §1.11). When enabled the product
@@ -886,6 +944,13 @@ func (c *Config) RedirectOrigins() []string {
 	}
 	return out
 }
+
+// IDProviderActive reports whether identity-provider mode is on, by the same
+// predicate RS-4 and the phase table use. Exported because the composition root
+// decides whether to build a signer, an authorization-code store and the OIDC
+// endpoints from it, and a second definition of "is the IdP on" in cmd/auth
+// could drift away from the rule that refuses a keyless production deployment.
+func (c *Config) IDProviderActive() bool { return c.IDProvider.active() }
 
 // CookieDeliveryActive reports whether the stack issues auth cookies at all.
 // Bearer versus cookie is a per-request client choice (X-Auth-Strategy), so the

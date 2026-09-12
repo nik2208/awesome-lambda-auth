@@ -17,6 +17,7 @@ import (
 func TestWireDeviationIDsArePinned(t *testing.T) {
 	want := []string{
 		"csrf-enabled-by-default",
+		"idp-kid-derived-from-key-material",
 		"oauth-callback-skips-the-second-factor",
 		"production-by-default",
 		"refresh-token-families",

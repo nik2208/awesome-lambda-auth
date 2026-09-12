@@ -45,6 +45,15 @@ var (
 	_ auth.LinkedAccountStore = (*LinkedAccounts)(nil)
 	_ auth.PendingLinkStore   = (*PendingLinks)(nil)
 
+	// The OIDC authorization-code store (auth_codes.go). Like the template
+	// store it is on *Store directly — SaveCode and ConsumeCode collide with
+	// nothing — and like it the core does not discover it by type assertion:
+	// IDPConfig.Codes is an explicit field, and a nil one silently selects an
+	// in-process map that is wrong on every multi-instance runtime. Store.AuthCodes()
+	// is what cmd/auth hands over, and this assertion is what keeps the two
+	// methods in the shape the core will call.
+	_ auth.AuthCodeStore = (*Store)(nil)
+
 	// The template store (template_store.go) is on *Store directly. The view
 	// pattern above exists for one reason — a method-name collision — and none
 	// of TemplateStore's six names collides with anything here, so a view would

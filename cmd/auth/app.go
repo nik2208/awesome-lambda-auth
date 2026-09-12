@@ -15,7 +15,6 @@ import (
 
 	"github.com/aws/aws-lambda-go/lambdacontext"
 	auth "github.com/nik2208/awesome-go-auth"
-	"github.com/nik2208/awesome-go-auth/adapter/nethttp"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
 	awsintegration "github.com/nik2208/awesome-lambda-auth/internal/integration/aws"
@@ -71,11 +70,27 @@ type Options struct {
 	Mail auth.MailerTransport
 	SMS  auth.SMSTransport
 
+	// IDPKeySource injects the identity provider's signing key, for the same
+	// reason Mail and SMS are injectable: a composition that signs with a key
+	// held in AWS has to be provable without an AWS account. Nil builds the real
+	// KMS-backed one (awsintegration.NewKMSKeySource), lazily. Injecting it
+	// switches nothing on — whether an RS256 signer is built at all is a
+	// question about idProvider.kmsKeyId (idp.go).
+	//
+	// It is a factory of a crypto.Signer, and deliberately not the KMS client
+	// itself: awsintegration.KMSAPI speaks the AWS SDK's types, and the product
+	// rule is that the SDK appears only under internal/integration/aws and
+	// internal/store/dynamodb. A seam typed in SDK terms would export that
+	// dependency to every implementor, this package's tests included — which is
+	// why Mail and SMS are auth.MailerTransport and auth.SMSTransport rather
+	// than SESAPI and SNSAPI, and why this one is IDPKeySource.
+	IDPKeySource IDPKeySourceFactory
+
 	// HTTPClient issues every outbound HTTP request this binary makes on a
-	// route's behalf: the delivery webhook and the claims webhook. Nil, the
-	// zero value, is http.DefaultClient. Injected so a test can point either at
-	// a TLS httptest server it trusts; like Mail and SMS, injecting it switches
-	// nothing on.
+	// route's behalf: the delivery webhook, the claims webhook, and the JWKS
+	// fetch of resource-server mode. Nil, the zero value, is http.DefaultClient.
+	// Injected so a test can point any of them at a TLS httptest server it
+	// trusts; like Mail and SMS, injecting it switches nothing on.
 	HTTPClient *http.Client
 }
 
@@ -99,6 +114,23 @@ type App struct {
 	// Handler is the fully wrapped HTTP surface, exposed so a test can drive it
 	// directly as well as through a synthetic Lambda event.
 	Handler http.Handler
+
+	// ResourceServerGuard verifies an RS256 bearer token against the issuer's
+	// JWKS — or this instance's own access-token cookie — and puts the principal
+	// on the request context. Nil unless resourceServer.enabled.
+	//
+	// NOTHING IN THIS ARTIFACT MOUNTS IT. It guards the routes of whatever
+	// serves alongside it, and this binary has none of those: every route under
+	// the api prefix belongs to the imported adapter, which verifies the local
+	// HS256 session, and the commonest resource-server deployment is the hybrid
+	// that keeps doing exactly that. So the guard is an export — for a host that
+	// embeds this package, or for a future authorizer binary — and not a
+	// middleware this cold start installs. See the header of idp.go.
+	//
+	// What resource-server mode does do to the deployed artifact is subtract:
+	// HTTPConfig.ResourceServer unmounts all nineteen credential routes. That is
+	// immediate and total, and it is the whole of the knob's effect here.
+	ResourceServerGuard func(http.Handler) http.Handler
 
 	adapter *lambdahttp.Adapter
 }
@@ -170,6 +202,12 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err := checkStoreSupport(cfg); err != nil {
 		return nil, err
 	}
+	// Before the core is built, because the core is what would otherwise fail,
+	// with a message about a knob resource-server mode told the operator to
+	// leave unset. See checkResourceServerSupport.
+	if err := checkResourceServerSupport(cfg); err != nil {
+		return nil, err
+	}
 
 	users, sessions, err := newStores(ctx, cfg, log)
 	if err != nil {
@@ -214,6 +252,15 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 	coreOpts = append(coreOpts, oauthOpts...)
+	// Identity-provider mode. The second option set that can do I/O at cold
+	// start — a KMS signer fetches its public key here — and it refuses for a
+	// driver with no authorization-code store, for the same reason emailOptions
+	// refuses for one with no template store.
+	idpOpts, err := idpOptions(ctx, cfg, users, opts.IDPKeySource, log)
+	if err != nil {
+		return nil, err
+	}
+	coreOpts = append(coreOpts, idpOpts...)
 
 	core, err := auth.New(coreOpts...)
 	if err != nil {
@@ -225,7 +272,15 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// The auth surface comes entirely from the imported adapter. Nothing in this
 	// binary may add a route under the api prefix: a route that exists here and
 	// not in the other family ports is a wire divergence by construction.
-	nethttp.MountWithConfig(mux, core, httpConfig(cfg))
+	// In identity-provider mode this also mounts the OIDC endpoints the adapter
+	// does not own — discovery, authorize, token and userinfo, all of them the
+	// core's own handlers at the core's own paths, while the JWKS document stays
+	// the adapter's. It returns an error rather than panicking on the one
+	// configuration that can register a pattern twice (idp.go,
+	// mountAuthSurface).
+	if err := mountAuthSurface(mux, core, cfg); err != nil {
+		return nil, err
+	}
 
 	var handler http.Handler = mux
 	// Refresh-token rotation replay detection needs a per-request precondition
@@ -244,6 +299,18 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	handler = accessLog(log, handler)
 
 	app := &App{Config: cfg, Logger: log, Handler: handler}
+
+	// Resource-server mode. Built after the core because the verifier's cookie
+	// path needs it, and built at cold start so a JWKS endpoint the client
+	// cannot use is a failed deployment rather than a 401 per request.
+	if cfg.ResourceServer.Enabled {
+		guard, err := newResourceServerGuard(core, resourceServerConfig(cfg, opts.HTTPClient), log)
+		if err != nil {
+			return nil, err
+		}
+		app.ResourceServerGuard = guard
+	}
+
 	app.adapter = lambdahttp.New(handler, lambdahttp.Options{
 		// deployment.stage exists precisely so the event layer can strip the
 		// stage segment an execute-api URL puts in front of every path
@@ -260,7 +327,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		slog.String("apiPrefix", cfg.HTTP.APIPrefix),
 		slog.Bool("csrfEnabled", cfg.Security.CSRF.Enabled),
 		slog.Bool("cookiesSecure", cfg.Cookies.Secure),
-		slog.String("sessionCheckOn", cfg.Sessions.CheckOn))
+		slog.String("sessionCheckOn", cfg.Sessions.CheckOn),
+		slog.Bool("identityProvider", core.IDP() != nil),
+		slog.Bool("resourceServer", cfg.ResourceServer.Enabled))
 
 	return app, nil
 }
@@ -376,6 +445,12 @@ func httpConfig(cfg *config.Config) auth.HTTPConfig {
 		},
 		CSRF:      auth.CSRFConfig{Enabled: cfg.Security.CSRF.Enabled},
 		UIEnabled: cfg.UI.Enabled,
+		// Resource-server mode: the adapter registers none of the nineteen
+		// routes that create, prove, deliver or change a credential, so each of
+		// them answers 404 rather than reaching a handler with no issuer behind
+		// it (auth.ResourceServerGatedRoutes). This is the half of the knob that
+		// changes the mounted surface; the verifier is App.ResourceServerGuard.
+		ResourceServer: cfg.ResourceServer.Enabled,
 	}
 }
 
@@ -443,6 +518,7 @@ type memoryStoreBundle struct {
 	links     auth.LinkedAccountStore
 	pending   auth.PendingLinkStore
 	templates auth.TemplateStore
+	codes     auth.AuthCodeStore
 }
 
 // newMemoryStoreBundle is the one place the development driver's bundle is
@@ -454,12 +530,21 @@ func newMemoryStoreBundle() memoryStoreBundle {
 		links:           auth.NewMemoryLinkedAccounts(),
 		pending:         auth.NewMemoryPendingLinks(),
 		templates:       auth.NewMemoryTemplateStore(),
+		// Per execution environment, like everything else on this driver, and
+		// with a consequence worth knowing on Lambda even in development: an
+		// authorization code minted by one environment is unknown to the next,
+		// so an OIDC round trip only completes when /authorize and /token land
+		// on the same one. RS-12 already refuses this driver in production; the
+		// dynamodb store (internal/store/dynamodb/auth_codes.go) is what makes
+		// the flow work across instances.
+		codes: auth.NewMemoryAuthCodeStore(),
 	}
 }
 
 func (m memoryStoreBundle) LinkedAccounts() auth.LinkedAccountStore { return m.links }
 func (m memoryStoreBundle) PendingLinks() auth.PendingLinkStore     { return m.pending }
 func (m memoryStoreBundle) Templates() auth.TemplateStore           { return m.templates }
+func (m memoryStoreBundle) AuthCodes() auth.AuthCodeStore           { return m.codes }
 
 // driverStores lists the stores.enable.<store> keys each driver can actually
 // back. A key that is enabled and absent from its driver's set is a knob that
@@ -635,6 +720,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 
 	gaps = append(gaps, deliveryKnobGaps(cfg)...)
 	gaps = append(gaps, oauthKnobGaps(cfg)...)
+	gaps = append(gaps, idpKnobGaps(cfg)...)
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

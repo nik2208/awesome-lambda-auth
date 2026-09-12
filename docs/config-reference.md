@@ -128,6 +128,11 @@ no longer trips the gate, because it is read.
 So do `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook`
 (§6, §7). Nothing under `security.` is refused any more either.
 
+`idProvider` and `resourceServer` left it too (§9 and §10). Configuring either is
+now a deployment that behaves differently rather than one that refuses: the first
+mounts the OIDC surface and publishes a JWKS document, the second unmounts the
+credential surface and verifies another issuer's tokens.
+
 `email.templatesDir` needs a template store, and both drivers now back one: the
 DynamoDB store keeps mail templates and UI translations on its `TEMPLATES`
 partition, the memory driver holds them per execution environment (§5.3). A
@@ -648,7 +653,146 @@ halves — that `POST /login` on such an account does answer the challenge, and
 that the callback does not — so the test fails the day upstream grows the
 branch, which is the signal to delete this paragraph and the register entry.
 
-## 9. Two worked postures
+## 9. `idProvider.*`, knob by knob
+
+Identity-provider mode makes the deployment an OIDC issuer. The full surface —
+what it serves, what it deliberately does not do, and how a key is rotated — is
+[docs/oidc.md](oidc.md); this section is the knobs.
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `idProvider.enabled` | boolean | `false` | `AWESOME_AUTH_IDP_ENABLED` |
+| `idProvider.kmsKeyId` | string | none | `AWESOME_AUTH_IDP_KMS_KEY_ID` |
+| `idProvider.kmsPreviousKeyIds` | string[] | none | `AWESOME_AUTH_IDP_KMS_PREVIOUS_KEY_IDS` |
+| `idProvider.privateKey` | secret (PEM) | none | `AWESOME_AUTH_IDP_PRIVATE_KEY` |
+| `idProvider.issuer` | string (https) | `deployment.publicUrl` + `http.apiPrefix` | `AWESOME_AUTH_IDP_ISSUER` |
+| `idProvider.jwksPath` | absolute path | `/.well-known/jwks.json` | `AWESOME_AUTH_IDP_JWKS_PATH` |
+| `idProvider.jwksCorsOrigins` | string \| string[] | `"*"` | `AWESOME_AUTH_IDP_JWKS_CORS_ORIGINS` |
+| `idProvider.clients[]` | object[] | none | — (file-only) |
+| `idProvider.accessTokenTtl` | ms-syntax | `30d` | reported as unwired, see below |
+| `idProvider.refreshTokenTtl` | ms-syntax | `90d` | reported as unwired, see below |
+| `idProvider.publicKey` | PEM | none | reported as unwired, see below |
+
+**The switch is the same one the reference uses.** Mode is on when `enabled` is
+true *or* key material is present, so a document that names a key and forgets the
+flag does not come up with the IdP silently off. `kmsKeyId` counts as key
+material for the same reason `privateKey` does.
+
+### 9.1 The signing key: `kmsKeyId` or `privateKey`, never both
+
+Rule RS-4 refuses a deployment that sets both, in every environment — nothing
+would decide which key signs, and the `kid` in a token, the key in the JWKS
+document and the key that actually signed could all disagree. In production it
+refuses a deployment that sets neither; in development the core generates an
+ephemeral key and the cold-start log says what that costs (every token becomes
+unverifiable at the next cold start).
+
+`kmsKeyId` is the production path, and the reason is not ceremony: a PEM is a
+value the function reads and holds, so anything that can make it emit a string
+takes the issuer's identity with it. A KMS key cannot be exported — the function
+holds `kms:Sign` on one ARN, `kms:GetPublicKey` on that one and on the keys being
+retired (§9.2), and nothing else at all. The SAM template creates one and
+scopes the policy to it; the key costs **USD 1.00 per month**, plus about USD
+3.00 per million tokens signed.
+
+Identity-provider mode and `resourceServer.enabled` are mutually exclusive (§10).
+
+### 9.2 `kmsPreviousKeyIds` — rotating without a flag day
+
+Keys listed here sign nothing and are published in the JWKS document after the
+current one, so a token minted before a rotation keeps verifying until it
+expires. The `kid` is derived from the key material rather than being the
+reference's fixed constant, which is what makes the whole rotation additive; the
+procedure is [oidc.md](oidc.md) §3, and the divergence is registered as
+`idp-kid-derived-from-key-material`.
+
+Each id here is read with `kms:GetPublicKey` at cold start, so the function's
+policy has to cover it: an ARN listed but not granted fails the init naming
+`idProvider.kmsPreviousKeyIds`, rather than serving an incomplete document. On
+the SAM stack, one parameter does both halves (`IdpPreviousKmsKeyArns`).
+
+### 9.3 `idProvider.clients[]` — the relying parties
+
+File-only: a client is an array of objects and no environment variable expresses
+one.
+
+```json
+{"idProvider": {
+  "enabled": true,
+  "kmsKeyId": "arn:aws:kms:eu-west-1:000000000000:key/11111111-2222-3333-4444-555555555555",
+  "clients": [{
+    "clientId": "console",
+    "name": "Ops console",
+    "clientSecret": {"secretsManager": "awesome-auth/prod/idp-console"},
+    "redirectUris": ["https://console.example.com/callback"]
+  }]
+}}
+```
+
+Each client's secret is an ordinary secret knob keyed by **client id**, not by
+position: `AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET`, or its `_SECRETSMANAGER`
+form. Inserting a client at the top of the list therefore does not move any other
+client's variable.
+
+Refused at start: a client with no secret, a client with no redirect URI, a
+duplicate client id, and a redirect URI that is neither https nor http on a
+loopback host. [oidc.md](oidc.md) §5 says what each of those would otherwise
+break. No clients at all is a **warning**, not a refusal — publishing a signing
+key and nothing else is exactly what the reference's `idProvider` block is for.
+
+### 9.4 The three knobs that are reported rather than honoured
+
+`idProvider.accessTokenTtl` and `idProvider.refreshTokenTtl` govern the RS256
+token pair `auth.IssueIdPTokenPair` mints, and no mounted route calls it — the
+OIDC token endpoint returns the HS256 session pair, which is decision D-3 and the
+reference's own posture. Set `security.jwt.accessTokenTtl` instead; that is the
+lifetime `/token` reports as `expires_in` and the one the token really has.
+`idProvider.publicKey` is never read because the JWKS document is built from the
+signing key's own public half. All three are named, with their paths, in the
+cold-start log.
+
+## 10. `resourceServer.*`, knob by knob
+
+The mirror image: this deployment mints nothing and verifies tokens another
+issuer signed.
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `resourceServer.enabled` | boolean | `false` | `AWESOME_AUTH_RS_ENABLED` |
+| `resourceServer.jwksUrl` | string (https) | none; **required** when enabled (RS-8) | `AWESOME_AUTH_RS_JWKS_URL` |
+| `resourceServer.issuer` | string | none; unset means `iss` is not checked | `AWESOME_AUTH_RS_ISSUER` |
+| `resourceServer.jwksCacheTtlMs` | integer > 0 | `3600000` | `AWESOME_AUTH_RS_JWKS_CACHE_TTL_MS` |
+| `resourceServer.jwksFetchTimeoutMs` | integer > 0 | `5000` | `AWESOME_AUTH_RS_JWKS_FETCH_TIMEOUT_MS` |
+
+**Turning it on unmounts the credential surface.** All nineteen routes that
+create, prove, deliver or change a credential — `/register` and `/login` among
+them — answer 404. Do not turn it on for a stack that is supposed to log people
+in.
+
+**Not together with identity-provider mode.** Both on is refused at cold start by
+rule `IDENTITY`, naming `resourceServer.enabled` and the three knobs that make
+the IdP active. The identity provider mounts `POST <prefix>/authorize`, which
+takes an email and a password, so the combination would serve a credential route
+from a deployment whose configuration says it has none. To publish a signing key
+without logging anyone in, run the identity provider with no clients (§9.3).
+
+**The verifier guards your routes, not these** — and in this artifact, nothing.
+It is built at cold start with the cache and timeout above and exposed as
+`App.ResourceServerGuard`, and the auth routes that remain keep verifying this
+instance's own HS256 session, because the commonest resource-server deployment is
+the hybrid that needs exactly that. `cmd/auth` mounts the guard on nothing: every
+route it serves is the imported adapter's, and there is no second binary and no
+SAM wiring that consults it. So on a deployed stack this knob removes nineteen
+routes and adds no verification; the export is for a host that embeds this
+package, and the cold-start log line says exactly that. [oidc.md](oidc.md) §4 has
+the reasoning.
+
+**`security.jwt.accessTokenSecret` is still required**, even though RS-1 exempts
+it here: the auth core needs one to build, and the verifier's cookie path reads
+it. The cold start refuses by name rather than letting the core complain about a
+knob you were told to leave out.
+
+## 11. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that

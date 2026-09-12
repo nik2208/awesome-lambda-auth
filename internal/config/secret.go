@@ -264,6 +264,41 @@ func secretSlots(c *Config) []secretSlot {
 			get:  func(c *Config) Secret { return c.OAuth.Providers[name].ClientSecret },
 		})
 	}
+	// The OIDC clients, keyed by client id exactly as the OAuth providers are
+	// keyed by provider name. The id and not the position in the list:
+	// idProvider.clients is an array, and keying by index would move every
+	// client's environment variable the first time somebody inserts one at the
+	// top. A duplicate id would produce two slots with one path, which
+	// validateIDProvider refuses.
+	//
+	// get searches by id rather than closing over the index, because the
+	// *Config a slot is read against is not guaranteed to be the one it was
+	// built from — SecretEnvNames and SecretRefEnvNames build the slot table
+	// from Defaults(), which has no clients at all — and an index into a
+	// shorter slice would panic. envNameFor is the caller that does NOT do
+	// that: it builds the slots from the live document (rules.go), precisely so
+	// that a per-client slot, which exists only once a client is configured, has
+	// a variable name a diagnostic can report.
+	for _, client := range c.IDProvider.Clients {
+		id := strings.TrimSpace(client.ClientID)
+		if id == "" {
+			// Reported by validateIDProvider with its path; a slot with no id
+			// would claim the path "idProvider.clients..clientSecret".
+			continue
+		}
+		slots = append(slots, secretSlot{
+			path: "idProvider.clients." + id + ".clientSecret",
+			env:  "AWESOME_AUTH_IDP_CLIENT_" + upperSnake(id) + "_SECRET",
+			get: func(c *Config) Secret {
+				for _, candidate := range c.IDProvider.Clients {
+					if strings.TrimSpace(candidate.ClientID) == id {
+						return candidate.ClientSecret
+					}
+				}
+				return Secret{}
+			},
+		})
+	}
 	return slots
 }
 

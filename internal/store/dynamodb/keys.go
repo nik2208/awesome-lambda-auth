@@ -50,6 +50,13 @@ const (
 	// inferring type from the sort-key prefix.
 	typeMailTemplate  = "template"
 	typeUITranslation = "uitranslation"
+
+	// typeAuthCode is one OIDC authorization code (data-model.md §1.7). Its own
+	// type rather than typeToken: a token pointer resolves a hash to a user and
+	// is a hint the profile can outlive, while an authorization code IS the
+	// record — it carries the client, the redirect URI and the PKCE challenge —
+	// and a sweep over the two has nothing in common.
+	typeAuthCode = "authcode"
 )
 
 // Sort keys and partition-key prefixes for the item types this package writes.
@@ -74,6 +81,12 @@ const (
 	// core composes (oauth_wire.go:417-426).
 	pkPendingLinkPrefix = "PLINK" + keySep
 
+	// pkOIDCPrefix keys an OIDC authorization code by the sha256 of the code the
+	// client was handed. The hash is the core's own (AuthCode.CodeHash,
+	// hashToken), so a dump of this table cannot be redeemed at /token — the
+	// same property the refresh, reset and magic-link partitions have.
+	pkOIDCPrefix = "OIDC" + keySep
+
 	// gsi1UserIDPrefix keys the tenant-less by-owner fan-outs. It is distinct
 	// from pkUserPrefix because the items that use it (memberships, linked
 	// accounts) are reachable from methods that carry no tenant id.
@@ -90,6 +103,11 @@ const (
 	// against idPattern, so neither can be forged into the other.
 	skMailTemplatePrefix  = "MAIL" + keySep
 	skUITranslationPrefix = "UI" + keySep
+
+	// skAuthCode is the single sort key of the OIDC partition. The partition
+	// holds exactly one item — the code — so the sort key is a constant, as
+	// SESSION's and PLINK's are.
+	skAuthCode = "CODE"
 
 	skProfile      = "PROFILE"
 	skEmail        = "EMAIL"
@@ -293,6 +311,12 @@ func oauthGSI1SK(provider, providerID string) string {
 func linkIDPK(linkID string) string { return pkLinkIDPrefix + linkID }
 
 func pendingLinkPK(state string) string { return pkPendingLinkPrefix + state }
+
+// authCodePK keys an authorization code by its hash. The hash is the only
+// variable segment of the partition key, so '#' inside it is unambiguous and
+// need not be rejected; an empty one is refused by checkHash, because OIDC# is a
+// key every other empty-hash caller would also build.
+func authCodePK(codeHash string) string { return pkOIDCPrefix + codeHash }
 
 // mailTemplateSK and uiTranslationSK key the two entries of the template
 // directory under templatesPK. The id and the page are validated with checkID

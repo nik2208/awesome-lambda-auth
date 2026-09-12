@@ -434,10 +434,17 @@ func derive(cfg *Config) {
 // operator should read in the deployment log but that do not justify refusing to
 // start.
 func collectWarnings(cfg *Config) {
-	if cfg.IDProvider.active() && cfg.IDProvider.Issuer == "" {
+	// The issuer is derivable: cmd/auth falls back to deployment.publicUrl, else
+	// the canonical site URL, plus the api prefix (idpIssuer, cmd/auth/idp.go).
+	// So the warning is about having nothing to derive it from, not about the
+	// knob being unset — warning on the knob alone would fire on every
+	// single-host deployment, which is the configuration that needs no issuer
+	// written out at all.
+	if cfg.IDProvider.active() && cfg.IDProvider.Issuer == "" &&
+		strings.TrimSpace(cfg.Deployment.PublicURL) == "" && len(cfg.Email.SiteURLs) == 0 {
 		cfg.warn("idProvider.issuer",
-			"identity-provider mode is active with no issuer, so minted tokens carry no iss claim",
-			"set idProvider.issuer to the public https URL of this deployment")
+			"identity-provider mode is active with no issuer and nothing to derive one from, so minted tokens carry no iss claim and the discovery document points at no host",
+			"set idProvider.issuer to the public https URL this deployment is reached at, including the api prefix, or set deployment.publicUrl")
 	}
 	if cfg.ResourceServer.Enabled && cfg.ResourceServer.Issuer == "" {
 		cfg.warn("resourceServer.issuer",

@@ -104,18 +104,41 @@ func (c *Client) DELETE(t *testing.T, path string, opts ...reqOpt) *Resp {
 	return c.do(t, http.MethodDelete, path, nil, opts)
 }
 
+// form posts an application/x-www-form-urlencoded body.
+//
+// It is the one request shape in this suite that is not JSON, and it exists for
+// one surface: the OIDC token endpoint takes client_secret_post, which RFC 6749
+// §4.1.3 defines as form parameters, and the authorization endpoint's login post
+// is a form submission. Sending JSON there would be refused for the wrong
+// reason and would prove nothing about the endpoint.
+func (c *Client) form(t *testing.T, path string, values url.Values) *Resp {
+	t.Helper()
+	return c.send(t, http.MethodPost, path, []byte(values.Encode()), "application/x-www-form-urlencoded", nil)
+}
+
 func (c *Client) do(t *testing.T, method, path string, b body, opts []reqOpt) *Resp {
 	t.Helper()
-	target := c.env.URL(path)
-
-	var reader io.Reader
 	var raw []byte
+	contentType := ""
 	if b != nil {
 		var err error
 		raw, err = json.Marshal(b)
 		if err != nil {
-			t.Fatalf("marshal request body for %s %s: %v", method, target, err)
+			t.Fatalf("marshal request body for %s %s: %v", method, c.env.URL(path), err)
 		}
+		contentType = "application/json"
+	}
+	return c.send(t, method, path, raw, contentType, opts)
+}
+
+// send is the one place a request is built and issued. body is nil for "send no
+// body at all", which is a distinct case on the wire.
+func (c *Client) send(t *testing.T, method, path string, raw []byte, contentType string, opts []reqOpt) *Resp {
+	t.Helper()
+	target := c.env.URL(path)
+
+	var reader io.Reader
+	if raw != nil {
 		reader = bytes.NewReader(raw)
 	}
 
@@ -123,8 +146,8 @@ func (c *Client) do(t *testing.T, method, path string, b body, opts []reqOpt) *R
 	if err != nil {
 		t.Fatalf("build request %s %s: %v", method, target, err)
 	}
-	if b != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set("Accept", "application/json")
 	for _, o := range opts {

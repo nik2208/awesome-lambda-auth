@@ -22,6 +22,14 @@ There is nothing to inherit: the reference ships no limiter. Every limited outco
 
 Only the OIDC surface: `id_token` and the OIDC `access_token` from `/oidc/token`, RS256 through KMS or an injected PEM key. Session tokens from `/login` and `/refresh` stay HS256, exactly as in the reference (`reference-issues.md` N35). Version 1 issues no OIDC `refresh_token`; clients are configured, not registered dynamically. Reversal cost: medium, but the reference points the same way.
 
+Amended when it was wired (P5), on three points the entry above left open or got wrong.
+
+- **The token endpoint's `access_token` is the HS256 session token, not an RS256 one.** The core's `/token` answers with `newSessionTokens` plus an RS256 `id_token` (`idp.go`), and that is the right shape for this product: the `access_token` it returns is the credential every route of this deployment already accepts, so a client completing an OIDC flow ends up with a session it can actually use against `/me` and the account routes. The RS256 pair the entry above imagined is `auth.IssueIdPTokenPair`, a host-level API no mounted route calls. `idProvider.accessTokenTtl` and `idProvider.refreshTokenTtl` govern only that unreachable pair, so both are reported by `unwiredKnobs` at cold start rather than left to look wired, and `expires_in` is `security.jwt.accessTokenTtl`.
+- **The endpoints are mounted under the api prefix, not at `/oidc/*`.** They are the core's own: `<prefix>/.well-known/openid-configuration`, `<prefix>/authorize`, `<prefix>/token`, `<prefix>/userinfo`, plus the JWKS document at `<prefix><idProvider.jwksPath>` and the core's deprecated `<prefix>/jwks` alias of it. Nothing is invented and nothing is renamed.
+- **The `kid` is derived from the key material** — `base64url(sha256(SPKI DER))[:16]` — rather than being the reference's constant `provisioner-key-1`, because a rotation has to be additive. Registered as `idp-kid-derived-from-key-material` (`deviations.md`). KMS is the production key source and the PEM stays supported; RS-4 refuses a deployment that configures both, in any environment.
+
+The rest of D-3 stands: no OIDC `refresh_token` in v1, and clients come from the configuration document rather than dynamic registration. The whole surface is specified in `docs/oidc.md`, including what it deliberately does not do.
+
 ## D-4 — Temporary 2FA token
 
 Kept as the upstream registered deviation `temp-token-is-typed-not-an-access-token`: a five-minute HS256 JWT with `typ: "temp"`, refused as a session credential by every protected route, `INVALID_TEMP_TOKEN` everywhere. Reversal cost: low.

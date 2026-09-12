@@ -32,7 +32,7 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 
 All three are passed through `scripts/toolchain.sh` into the container.
 
@@ -199,6 +199,33 @@ of that route's oddity — it answers `INVALID_ACCESS_TOKEN` where its magic-lin
 and SMS siblings answer `INVALID_TEMP_TOKEN` for the same failure, which is the
 reference's own inconsistency, reproduced rather than harmonised.
 
+**The OIDC surface is the one area with no reference wire to cite, and `idp` is
+its capability.** `awesome-node-auth`'s `idProvider` block is RS256 signing and
+JWKS publication and nothing else — no `/authorize`, `/token`, `/userinfo` or
+discovery document exists anywhere in its source
+([parity-gap-node-vs-go.md](../../docs/spec/parity-gap-node-vs-go.md) #27) — so
+`cases_idp_test.go` checks the JWKS route against the reference, down to its
+`Cache-Control: public, max-age=3600`, and everything else against
+[docs/oidc.md](../../docs/oidc.md) and the RFCs it commits to.
+
+The probe is `GET <prefix>/.well-known/jwks.json`, fetched **anonymously**: that
+route is public by construction, so probing it with a session would hide a
+deployment that had put it behind one. A deployment with no `idProvider` block
+answers 404, which is the documented absence, and the four cases skip.
+
+None of them needs a registered client — a deployment may enable the IdP purely
+to publish a signing key — and the two error cases accept the core's own bodies
+rather than the family `{error,code}` envelope, because these endpoints have no
+family client to stay compatible with. That boundary is stated in
+[docs/oidc.md](../../docs/oidc.md) §6.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `idp/jwks-document-shape` | 200 with `Cache-Control: public, max-age=3600`; every key carries **exactly** `kty,use,alg,kid,n,e` (a private member here would publish the signing key itself), `kty:"RSA"`, `use:"sig"`, `alg:"RS256"`, `kid` non-empty and unique across the document, `n`/`e` unpadded base64url (RFC 7518 §6.3.1); no `Set-Cookie` on a route served from a shared cache | `idp` |
+| `idp/discovery-document-shape` | an absolute `issuer`; `authorization_endpoint`, `token_endpoint`, `userinfo_endpoint` and `jwks_uri` all rooted at it; `RS256`, `code`, `public` and `client_secret_post` advertised; and the advertised `jwks_uri` really serves the JWKS document | `idp` |
+| `idp/token-refuses-a-code-nobody-issued` | `POST /token` with a well-formed `authorization_code` grant and an unissued code is a refusal naming `invalid_grant` (or `invalid_client`, since the suite cannot know which clients are registered) and never contains a token | `idp` |
+| `idp/authorize-refuses-an-unknown-client` | an unregistered `client_id` is refused **without a redirect** — an unvalidated `client_id` has no validated `redirect_uri` to send an error to, so a redirect there is an open one — and the refusal does not echo the requested URI back | `idp` |
+
 `me/known-gaps-against-the-reference` changed with awesome-go-auth v0.4.0: the
 profile now carries `loginProvider` unconditionally (`"local"` for a password
 account, the reference's `?? 'local'`), and the case that used to record its
@@ -251,10 +278,17 @@ redirecting, `/forgot-password` accepting `emailLang`), and the browser-visible
 half of OAuth: the authorization redirect and its query, the unknown-provider
 404, and the callback's JSON-not-a-redirect failure shape.
 
+The OIDC surface joins that list as far as it can be seen without a registered
+client: the JWKS document's shape and caching, the discovery document, and the
+two refusals that must not leak a token or a redirect.
+
 Not covered: the OAuth round trip itself — the suite cannot consent at a real
 provider — so the exchange, the provisioning policy and the account-conflict
 redirect are pinned against an httptest provider in `cmd/auth/oauth_test.go`
-instead. Also not covered: the admin router, the tools/SSE router, and the
-email/SMS token round trips — a token minted by one route and spent by another —
-because the suite has no mailbox to read it from. Nothing stops a case being
-added for them the day the deployment has what they need.
+instead; the OIDC authorization round trip, which needs a client id and secret
+the suite cannot register for itself (`cmd/auth/idp_test.go` drives that one end
+to end against a synthetic deployment instead); and the admin router, the
+tools/SSE router and the email/SMS token round trips — a token minted by one
+route and spent by another — because the suite has no mailbox to read it from.
+Nothing stops a case being added for them the day the deployment has what they
+need.

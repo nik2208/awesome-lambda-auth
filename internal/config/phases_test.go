@@ -14,12 +14,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		domain string
 		mutate func(Document)
 	}{
-		{"idProvider", func(doc Document) {
-			set(doc, "idProvider.issuer", "https://auth.example.com")
-		}},
-		{"resourceServer", func(doc Document) {
-			set(doc, "resourceServer.jwksCacheTtlMs", 60000)
-		}},
 		{"ui", func(doc Document) {
 			set(doc, "ui.branding.siteName", "Example")
 		}},
@@ -72,12 +66,16 @@ func TestUnwiredDomainViaEnvIsAlsoRefused(t *testing.T) {
 // TestUnwiredDomainViaSecretIsAlsoRefused: a secret supplied through its
 // documented variable leaves no trace in the Config tree, so the check also looks
 // at what actually resolved.
+//
+// The admin bootstrap secret stands in for what used to be idProvider.privateKey
+// here: that domain is wired now, and this test needs a domain that still has a
+// secretPrefix.
 func TestUnwiredDomainViaSecretIsAlsoRefused(t *testing.T) {
 	env := baseEnv()
-	env["AWESOME_AUTH_IDP_PRIVATE_KEY"] = "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----"
+	env["AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET"] = "admin-bootstrap-secret-value"
 
 	_, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
-	requireRule(t, err, RuleUnimplemented, "idProvider")
+	requireRule(t, err, RuleUnimplemented, "admin")
 }
 
 // TestAllowUnimplementedDowngradesToWarning: the gap stays visible in the
@@ -262,6 +260,91 @@ func TestEmailFlowDomainsAreWired(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestIdentityDomainsAreWired is the P5 counterpart: `idProvider` and
+// `resourceServer` load instead of tripping the phase gap, in each of the three
+// postures a deployment can take — a KMS signer, a PEM signer, and
+// resource-server mode.
+//
+// Each block is written the way the schema requires it, so the test also pins
+// that un-gating relaxed nothing: a client needs its secret and a redirect URI,
+// resource-server mode needs an https JWKS URL (RS-8). What cmd/auth then does
+// with them — mount the OIDC endpoints, publish the JWKS, verify a bearer
+// against a remote issuer — is its own tests' business.
+func TestIdentityDomainsAreWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+		env    func(map[string]string)
+	}{
+		{"idProvider with a KMS signer", func(doc Document) {
+			set(doc, "idProvider.enabled", true)
+			set(doc, "idProvider.kmsKeyId", "alias/awesome-auth-idp")
+			set(doc, "idProvider.issuer", "https://auth.example.com/auth")
+		}, nil},
+		{"idProvider with a PEM signer", func(doc Document) {
+			set(doc, "idProvider.enabled", true)
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_IDP_PRIVATE_KEY"] = "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----"
+		}},
+		{"idProvider with a client registry", func(doc Document) {
+			set(doc, "idProvider.kmsKeyId", "alias/awesome-auth-idp")
+			set(doc, "idProvider.kmsPreviousKeyIds", []any{"alias/awesome-auth-idp-2025"})
+			set(doc, "idProvider.clients", []any{map[string]any{
+				"clientId":     "console",
+				"name":         "Ops console",
+				"redirectUris": []any{"https://console.example.com/callback", "http://localhost:4200/callback"},
+			}})
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET"] = "console-client-secret"
+		}},
+		{"resourceServer", func(doc Document) {
+			set(doc, "resourceServer.enabled", true)
+			set(doc, "resourceServer.jwksUrl", "https://idp.example.com/.well-known/jwks.json")
+			set(doc, "resourceServer.issuer", "https://idp.example.com")
+			set(doc, "resourceServer.jwksCacheTtlMs", 60000)
+		}, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+			env := baseEnv()
+			if tc.env != nil {
+				tc.env(env)
+			}
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if err != nil {
+				t.Fatalf("the identity domains are wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if (w.Path == "idProvider" || w.Path == "resourceServer") && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("%s is still reported as an unwired domain: %s", w.Path, w.Problem)
+				}
+			}
+			for _, path := range []string{"idProvider", "resourceServer"} {
+				if _, gated := UnwiredDomains()[path]; gated {
+					t.Errorf("%s is still listed by UnwiredDomains", path)
+				}
+			}
+		})
+	}
+}
+
+// TestIdentitySecretsNoLongerTripThePhaseGap is the idProvider half of
+// TestDeliverySecretsNoLongerTripThePhaseGap: the domain had a secretPrefix, and
+// removing the domain has to remove that cover too, or an operator who puts the
+// signing key in Secrets Manager gets a refusal for a block that works.
+func TestIdentitySecretsNoLongerTripThePhaseGap(t *testing.T) {
+	env := baseEnv()
+	env["AWESOME_AUTH_IDP_PRIVATE_KEY"] = "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----"
+
+	if _, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)}); err != nil {
+		t.Fatalf("an idProvider secret must not reopen the phase gap:\n%v", err)
 	}
 }
 

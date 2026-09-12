@@ -79,6 +79,22 @@ func WireDeviations() []WireDeviation {
 			Spec: "docs/spec/data-model.md §4.3; docs/spec/decisions.md D-7 (signed off 2026-09-11)",
 		},
 		{
+			ID:      "idp-kid-derived-from-key-material",
+			Surface: "the kid header of every RS256 token the IdP signs, and the kid of every key in GET <prefix>/.well-known/jwks.json",
+			Behaviour: "The kid is base64url(sha256(SPKI DER))[:16] of the key that signed — derived from the " +
+				"key material, so it is stable for a key, different for a different key, and identical " +
+				"whether the key is held in KMS or supplied as a PEM.",
+			Reference: "The kid is the constant \"provisioner-key-1\" for every deployment and every key " +
+				"(src/services/token.service.ts:78, src/services/jwks.service.ts:184).",
+			Why: "A rotation has to be additive. With a derived kid the old and new keys are published " +
+				"together under different kids and a token minted before the rotation still selects the " +
+				"key that signed it; with one constant kid the JWKS document can only ever describe one " +
+				"key, so every rotation invalidates every token in flight. A relying party reads the kid " +
+				"out of the token and looks it up in the document, so nothing that follows the protocol " +
+				"can tell the difference — only something that hardcoded the reference's constant could.",
+			Spec: "docs/oidc.md; docs/spec/config-schema.md §1.10 addendum; docs/spec/decisions.md D-3",
+		},
+		{
 			ID:      "templates-dir-only-seeds-absent-ids",
 			Surface: "email.templatesDir, and the body and subject of every mail rendered from a stored template",
 			Behaviour: "The directory is read once, at cold start, and writes only the template ids " +
@@ -110,7 +126,7 @@ func WireDeviations() []WireDeviation {
 				"than from an incident. cmd/auth/oauth_test.go " +
 				"TestOAuthCallbackIssuesASessionEvenForATwoFactorAccount fails the day upstream " +
 				"grows the branch, which is when this entry is retired.",
-			Spec: "docs/spec/wire-contract.md §3 (the tempToken) and §4; docs/config-reference.md §6.4",
+			Spec: "docs/spec/wire-contract.md §3 (the tempToken) and §4; docs/config-reference.md §8.4",
 		},
 	}
 }

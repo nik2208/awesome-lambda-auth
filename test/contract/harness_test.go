@@ -65,6 +65,13 @@ const (
 	CapLinkedAccounts Capability = "linked-accounts"
 	CapCookieSecure   Capability = "secure-cookies"
 	CapOAuthGoogle    Capability = "oauth-google"
+
+	// CapIDP is identity-provider mode: the deployment publishes a JWKS document
+	// and mounts the OIDC endpoints. Probed on the JWKS route, which is the one
+	// endpoint of the set that is public by construction and answers without any
+	// client being registered — so the probe cannot be confused by an IdP that is
+	// on but has no clients.
+	CapIDP Capability = "idp"
 )
 
 // capState is the three-way answer a probe can get, and the distinction the
@@ -207,7 +214,7 @@ func readRequired(t *testing.T) required {
 	known := map[Capability]bool{
 		CapRegister: true, CapCSRF: true, CapSessions: true,
 		CapTOTP: true, CapLinkedAccounts: true, CapCookieSecure: true,
-		CapOAuthGoogle: true,
+		CapOAuthGoogle: true, CapIDP: true,
 	}
 	for _, f := range strings.Split(raw, ",") {
 		f = strings.TrimSpace(f)
@@ -219,7 +226,7 @@ func readRequired(t *testing.T) required {
 			continue
 		}
 		if !known[Capability(f)] {
-			t.Fatalf("%s names an unknown capability %q; known: register, csrf, sessions, totp, linked-accounts, secure-cookies, oauth-google, all",
+			t.Fatalf("%s names an unknown capability %q; known: register, csrf, sessions, totp, linked-accounts, secure-cookies, oauth-google, idp, all",
 				RequireEnv, f)
 		}
 		req.set[Capability(f)] = true
@@ -404,6 +411,12 @@ a stack answering 500 to every route exited 0.`, e.Prefix, reg.Status, reg.snipp
 	// The OAuth entry point reads no credential (§4: "Auth gate: none"), so the
 	// anonymous client is the honest probe for it.
 	e.Caps[CapOAuthGoogle] = classifyOAuth(anon.GET(t, "/oauth/google"))
+
+	// Identity-provider mode, probed anonymously on purpose: the JWKS document is
+	// public by construction — a relying party fetches it with no credential of
+	// any kind — so probing it with the logged-in client would hide a deployment
+	// that had put it behind a session.
+	e.Caps[CapIDP] = classify(anon.GET(t, "/.well-known/jwks.json"))
 
 	names := make([]string, 0, len(e.Caps))
 	for k := range e.Caps {

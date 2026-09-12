@@ -11,7 +11,7 @@ The stack deploys and the two official clients, unmodified, register, log in, re
 | Area | State |
 |---|---|
 | Event normalisation (`internal/lambdahttp`) | API Gateway HTTP v2 and REST v1, Function URL, ALB; multi-cookie round trips tested per shape |
-| Declarative configuration (`internal/config`) | JSON document + `AWESOME_AUTH_*` environment, refuse-to-start rules RS-1…RS-12, secrets from Secrets Manager → SSM → env |
+| Declarative configuration (`internal/config`) | JSON document + `AWESOME_AUTH_*` environment, refuse-to-start rules RS-1…RS-12 plus the product rules `PHASE` and `IDENTITY`, secrets from Secrets Manager → SSM → env |
 | Stores (`internal/store/dynamodb`) | users, sessions with refresh-token families, single-use tokens, TOTP, linked accounts, pending links, on one table with TTL |
 | Credential delivery (`internal/integration/aws`) | SES for mail, SNS for SMS, behind the core's sender seams; or a signed delivery webhook that takes every credential seam instead |
 | Email flows (`cmd/auth/email.go`) | `email.siteUrls` resolves every emailed link per request against the allowlist it forms with `http.cors.origins`; `email.templatesDir` seeds the template store from the artifact without ever overwriting a runtime edit |
@@ -19,11 +19,13 @@ The stack deploys and the two official clients, unmodified, register, log in, re
 | Second factor (`cmd/auth/twofactor.go`) | `twoFactor.appName` is the issuer an authenticator app labels a TOTP enrolment with |
 | OAuth (`cmd/auth/oauth.go`) | `oauth.providers` builds the registry — Google and GitHub over the core's presets, any other name as a generic provider with its own endpoints and a declarative `profileMap` — with signed state, PKCE S256 and a redirect allowlist RS-11 refuses to start without; `oauth.provisioning` decides create, link, conflict or refuse |
 | Auth surface | every route `awesome-go-auth` mounts: register, login, refresh, logout, me (now carrying `loginProvider`), sessions, password and email flows, magic link, SMS OTP, TOTP, account linking |
+| Identity provider (`cmd/auth/idp.go`) | OIDC issuer: JWKS, discovery, authorize, token, userinfo under the api prefix, signed by an AWS KMS asymmetric key (or a PEM), with additive key rotation and authorization codes in DynamoDB. Session tokens stay HS256 — see [docs/oidc.md](docs/oidc.md) |
+| Resource server (`cmd/auth/idp.go`) | unmounts this deployment's whole credential surface, and builds an RS256 verifier for another issuer's tokens — stale-while-revalidate JWKS cache, exported as `App.ResourceServerGuard` for a host that embeds this package, mounted on nothing here. Refused alongside the identity provider (rule `IDENTITY`) |
 | Infrastructure (`infra/sam`) | HTTP API + Lambda (`provided.al2023`, arm64) + DynamoDB + Secrets Manager, deployed with the plain AWS CLI |
 | Contract suite (`test/contract`) | black-box, parametrised on a base URL, runs against this stack or the reference Express app |
 | Examples | `examples/angular-client` (ng-awesome-node-auth from npm) and `examples/flutter-client` (awesome_node_auth_flutter from pub.dev), unmodified |
 
-Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `idProvider`, `resourceServer`, `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it. Four entries left it in this round: `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook` with the token-claims block, and the whole `oauth` domain — `oauth.providers` and `oauth.provisioning`, secret prefix included — with the OAuth block. The whole `email` and `security` domains now load too; `email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the three before them.
+Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it. Six entries left it in this round: `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook` with the token-claims block; the whole `oauth` domain — `oauth.providers` and `oauth.provisioning`, secret prefix included — with the OAuth block; and `idProvider` and `resourceServer`, secret prefix included, with the identity surface. The whole `email` and `security` domains now load too; `email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the three before them.
 
 ## Configuration
 
@@ -81,6 +83,7 @@ AWESOME_AUTH_CONTRACT_REQUIRE=register,csrf,secure-cookies,sessions,totp \
 |---|---|
 | [docs/PROGRESS.md](docs/PROGRESS.md) | task board and per-block ledger of the build-out |
 | [docs/deviations.md](docs/deviations.md) | index of the three deviation registers (product, store, core), pinned by a test |
+| [docs/oidc.md](docs/oidc.md) | the OIDC surface: what identity-provider and resource-server mode serve, how a signing key is rotated, and what v1 deliberately does not do |
 | [docs/spec/decisions.md](docs/spec/decisions.md) | decisions the reference does not settle, with reversal cost |
 | [docs/spec/wire-contract.md](docs/spec/wire-contract.md) | the HTTP contract extracted from the reference source, which this port is forbidden to break |
 | [docs/spec/config-schema.md](docs/spec/config-schema.md) | declarative configuration schema and refuse-to-start rules |

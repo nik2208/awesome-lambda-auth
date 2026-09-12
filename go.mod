@@ -7,10 +7,12 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.43.6
 	github.com/aws/aws-sdk-go-v2/config v1.32.34
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.62.3
+	github.com/aws/aws-sdk-go-v2/service/kms v1.55.5
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.3
 	github.com/aws/aws-sdk-go-v2/service/sesv2 v1.66.6
 	github.com/aws/aws-sdk-go-v2/service/sns v1.42.6
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.73.3
+	github.com/aws/smithy-go v1.27.8
 	github.com/nik2208/awesome-go-auth v0.6.0
 )
 
@@ -27,6 +29,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.3 // indirect
-	github.com/aws/smithy-go v1.27.8 // indirect
 	golang.org/x/crypto v0.51.0 // indirect
 )

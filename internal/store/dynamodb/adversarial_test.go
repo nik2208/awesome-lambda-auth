@@ -514,6 +514,64 @@ func TestAdvHighIterationPendingLinkConsume(t *testing.T) {
 	}
 }
 
+// TestAdvHighIterationAuthCodeConsume is the same guarantee for an OIDC
+// authorization code, and it is the one credential in this store whose
+// single-use property is a written requirement rather than an inference: RFC
+// 6749 §4.1.2 says the code "MUST NOT be used more than once", and the core's
+// own interface spells out that ConsumeCode "must be atomic (a conditional
+// delete, a row lock, or a DEL-and-check pipeline, not a read followed by a
+// delete)".
+//
+// The threat is concrete. A code travels in a redirect's query string, so it
+// lands in browser history, in a Referer header and in every access log between
+// the user and the client; an attacker who reads one out of any of those wins if
+// and only if they can redeem it a second time. The loser count is asserted
+// exactly, so one extra winner anywhere in 200 rounds fails the test.
+//
+// The winner is also checked for content: a consume that answered success with
+// an empty record would send the token endpoint to GetUserByID("") and hand out
+// a session for nobody.
+func TestAdvHighIterationAuthCodeConsume(t *testing.T) {
+	t.Parallel()
+	store, _ := newStore(t)
+	ctx := context.Background()
+
+	totalWinners := 0
+	for round := range advRounds {
+		code := sampleAuthCode(hashOf(uniqueID("oidc")))
+		if err := store.SaveCode(ctx, code); err != nil {
+			t.Fatalf("round %d save: %v", round, err)
+		}
+
+		var mu sync.Mutex
+		var got []auth.AuthCode
+		results := runRace(advRacers, func() error {
+			redeemed, err := store.ConsumeCode(ctx, code.CodeHash)
+			if err == nil {
+				mu.Lock()
+				got = append(got, redeemed)
+				mu.Unlock()
+			}
+			return err
+		})
+		winners, losers, unexpected := tally(results, auth.ErrInvalidCode)
+		totalWinners += winners
+		if winners != 1 || losers != advRacers-1 {
+			t.Fatalf("round %d: %d winners and %d losers over %d racers, want 1 and %d (unexpected: %v)",
+				round, winners, losers, advRacers, advRacers-1, unexpected)
+		}
+		if len(got) == 1 && (got[0].UserID != code.UserID || got[0].ClientID != code.ClientID) {
+			t.Fatalf("round %d: winner received %+v, want UserID=%q ClientID=%q",
+				round, got[0], code.UserID, code.ClientID)
+		}
+	}
+	if totalWinners != advRounds {
+		t.Errorf("%d redemptions over %d rounds, want exactly %d", totalWinners, advRounds, advRounds)
+	}
+	t.Logf("authorization code: %d rounds x %d racers = %d redemption attempts, %d redemptions",
+		advRounds, advRacers, advRounds*advRacers, totalWinners)
+}
+
 // TestAdvHighIterationEmailChangeConfirm reruns the transactional confirm race.
 // The invariant is one winner and, afterwards, one address resolving to the user
 // with no uniqueness item left behind for the address it replaced.

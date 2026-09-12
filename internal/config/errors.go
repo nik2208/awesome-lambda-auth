@@ -56,6 +56,12 @@ const (
 	// RulePlaintextSecret marks a secret written literally into the
 	// configuration document, which the secrets rule of spec §1 forbids.
 	RulePlaintextSecret = "SECRET"
+
+	// RuleIdentityModeConflict marks the one pair of domains that cannot both
+	// describe one deployment: identity-provider mode, which mounts an
+	// endpoint that takes a password and mints tokens, and resource-server
+	// mode, whose whole purpose is that no such endpoint exists here.
+	RuleIdentityModeConflict = "IDENTITY"
 )
 
 // Diagnostic is one configuration problem, aimed at an operator reading a single

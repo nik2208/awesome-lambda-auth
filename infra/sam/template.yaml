@@ -62,6 +62,10 @@ Metadata:
         Parameters: [TotpIssuer, ClaimsWebhookUrl, ClaimsWebhookTimeoutMs, ClaimsWebhookSecretArn]
       - Label: {default: OAuth providers}
         Parameters: [OAuthGoogleClientId, OAuthGoogleClientSecretArn, OAuthGithubClientId, OAuthGithubClientSecretArn]
+      - Label: {default: Identity provider (OIDC)}
+        Parameters: [EnableIdp, IdpIssuer, IdpKmsKeyId, IdpPreviousKmsKeyArns, IdpJwksPath]
+      - Label: {default: Resource server}
+        Parameters: [EnableResourceServer, ResourceServerJwksUrl, ResourceServerIssuer]
       - Label: {default: Configuration document}
         Parameters: [ConfigFile]
       - Label: {default: Storage}
@@ -450,9 +454,151 @@ Parameters:
       never generated, and read by the function at cold start.
 
   # -----------------------------------------------------------------------
+  # Identity provider (config-schema.md §1.10 and its P5 addendum).
+  #
+  # Turning this on makes the deployment an OIDC issuer: it publishes a JWKS
+  # document at <ApiPrefix>/.well-known/jwks.json, serves a discovery document
+  # beside it, and mounts /authorize, /token and /userinfo. It changes nothing
+  # about /login and /refresh, which keep issuing the HS256 session tokens every
+  # client in the family reads (decisions.md D-3).
+  #
+  # The signing key is a KMS asymmetric key, and the stack creates one unless you
+  # name your own. That is the whole reason this block exists as infrastructure
+  # rather than as one more secret: an RSA private key in Secrets Manager is a
+  # value the function reads at cold start and can leak, while a KMS key is one
+  # it can only ask to sign — the private half never exists outside KMS, every
+  # signature is a CloudTrail event, and revoking the capability is an IAM edit.
+  #
+  # RELYING PARTIES ARE CONFIGURED IN THE DOCUMENT, not here. A client is a
+  # client id, a secret reference and a redirect-URI allowlist — an array of
+  # objects, which no environment variable can express — so `idProvider.clients`
+  # is file-only and arrives through ConfigFile. Each client's secret is an
+  # ordinary secret knob: AWESOME_AUTH_IDP_CLIENT_<CLIENTID>_SECRETSMANAGER
+  # names the Secrets Manager entry, and the role needs a read on it (add a
+  # statement like ReadDeliveryWebhookSigningSecret below).
+  #
+  # Leaving EnableIdp false costs nothing and creates nothing.
+  # -----------------------------------------------------------------------
+
+  EnableIdp:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_IDP_ENABLED. "true" mounts the OIDC surface and creates a KMS
+      signing key unless IdpKmsKeyId names one. See the KMS key's own cost note:
+      a customer managed key is billed monthly whether or not it signs anything.
+
+  IdpIssuer:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://.+$'
+    Description: >-
+      AWESOME_AUTH_IDP_ISSUER — the iss claim and the base of every endpoint in
+      the discovery document. Empty derives it from PublicUrl + ApiPrefix, which
+      is right for a custom domain and impossible on a raw execute-api URL (the
+      function cannot know its own endpoint; see the note on
+      AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL). On a raw execute-api URL, deploy once,
+      read the ApiEndpoint output, and set this to <ApiEndpoint><ApiPrefix>.
+      Placeholder is deliberately empty; never commit a real domain.
+
+  IdpKmsKeyId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:kms:[a-z0-9-]+:[0-9]{12}:key/.+$'
+    Description: >-
+      ARN of an existing KMS asymmetric key (KeySpec RSA_2048 or larger,
+      KeyUsage SIGN_VERIFY) that signs every RS256 token. Empty (the default)
+      creates one inside the stack. A KEY ARN and not an alias: the same value is
+      the IAM policy's Resource, and IAM matches key ARNs — a grant on an alias
+      ARN authorises nothing. Retired keys, whose tokens are still in flight, go
+      in IdpPreviousKmsKeyArns below.
+
+  IdpPreviousKmsKeyArns:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_IDP_KMS_PREVIOUS_KEY_IDS — key ARNs that no longer sign but
+      whose tokens are still in flight, published in the JWKS document beside
+      the current key so those tokens keep verifying. Empty (the default) is one
+      key and no rotation. THIS IS STEP 1 OF A ROTATION AND IT IS NOT OPTIONAL:
+      the function calls kms:GetPublicKey on every id listed here at cold start,
+      so an id the policy does not cover fails the init with AccessDeniedException
+      naming idProvider.kmsPreviousKeyIds. Listing them here is what grants that
+      read — kms:Sign stays on the current key alone, because a retired key must
+      not be able to sign. Key ARNs, not aliases, for the same reason as
+      IdpKmsKeyId. Drop an id once the last token it signed has expired; see
+      docs/oidc.md §3.
+
+  IdpJwksPath:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^/.*$'
+    Description: >-
+      AWESOME_AUTH_IDP_JWKS_PATH — where the JWKS document is served, relative to
+      the api prefix. Empty (the default) is /.well-known/jwks.json, which is
+      what the reference serves and what the JwksUrl output assumes. Set it here
+      rather than in ConfigFile if you move it, so that the output keeps naming
+      the URL that answers; whatever the path, the discovery document's jwks_uri
+      is the authority.
+
+  # -----------------------------------------------------------------------
+  # Resource server (config-schema.md §1.11).
+  #
+  # The mirror image of the block above: this deployment mints nothing and
+  # verifies tokens another issuer signed, against that issuer's JWKS. Turning it
+  # on UNMOUNTS the whole credential surface — all nineteen routes that create,
+  # prove, deliver or change a credential, /register and /login among them — so
+  # do not turn it on for a stack that is supposed to log people in.
+  #
+  # NOT TOGETHER WITH EnableIdp. The two describe opposite deployments, and the
+  # function refuses to start when both are on (rule IDENTITY): the identity
+  # provider mounts POST <prefix>/authorize, which takes an email and a password,
+  # so a stack with both would serve a credential route while claiming to have
+  # removed every one of them. CloudFormation cannot see that — the refusal is at
+  # init, and a stack deployed with both looks successful until the first request
+  # 500s and the log names the rule.
+  #
+  # The verifier it builds is NOT mounted on anything in this artifact: this
+  # function serves the imported adapter's route table and nothing else, and the
+  # guard is exported (App.ResourceServerGuard) for a host that embeds the
+  # package. In this stack, turning the knob on removes nineteen routes and adds
+  # no verification to the ones that remain. docs/oidc.md §4.
+  # -----------------------------------------------------------------------
+
+  EnableResourceServer:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      AWESOME_AUTH_RS_ENABLED. "true" unmounts every credential route and builds
+      the RS256 verifier the deployment's own routes are guarded with.
+      ResourceServerJwksUrl is required with it (RS-8 refuses an empty or
+      non-https one at startup).
+
+  ResourceServerJwksUrl:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^https://.+$'
+    Description: >-
+      AWESOME_AUTH_RS_JWKS_URL — the issuer's JWKS endpoint, e.g.
+      https://auth.example.com/auth/.well-known/jwks.json. Fetched with a bounded
+      timeout and cached for an hour; an issuer that is briefly unreachable keeps
+      serving from the stale document rather than taking this stack down.
+
+  ResourceServerIssuer:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_RS_ISSUER — the exact iss claim to require. Empty means the
+      claim is not checked, which is the reference's behaviour and one this stack
+      warns about at cold start: any issuer whose key ends up in that JWKS
+      document would then be accepted.
+
+  # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
-  # OAuth profile maps, rate-limit scopes) have no environment variable by
-  # design; they arrive as a JSON document baked into the artifact by
+  # OAuth profile maps, OIDC clients, rate-limit scopes) have no environment
+  # variable by design; they arrive as a JSON document baked into the artifact by
   # scripts/build-lambda.sh CONFIG_FILE=… and named here.
   # -----------------------------------------------------------------------
 
@@ -552,6 +698,24 @@ Conditions:
   HasOAuthGoogle: !Not [!Equals [!Ref OAuthGoogleClientId, '']]
   HasOAuthGithub: !Not [!Equals [!Ref OAuthGithubClientId, '']]
   HasAnyOAuthProvider: !Or [!Condition HasOAuthGoogle, !Condition HasOAuthGithub]
+
+  IdpEnabled: !Equals [!Ref EnableIdp, 'true']
+  HasIdpIssuer: !Not [!Equals [!Ref IdpIssuer, '']]
+  HasIdpKmsKeyId: !Not [!Equals [!Ref IdpKmsKeyId, '']]
+  # A CommaDelimitedList has no empty test of its own: joining it with no
+  # separator turns the empty list into the empty string, and any non-empty list
+  # into something that is not.
+  HasIdpPreviousKmsKeyArns: !Not [!Equals [!Join ['', !Ref IdpPreviousKmsKeyArns], '']]
+  RotatingIdpKeys: !And [!Condition IdpEnabled, !Condition HasIdpPreviousKmsKeyArns]
+  HasIdpJwksPath: !Not [!Equals [!Ref IdpJwksPath, '']]
+  # The stack owns a signing key only when the IdP is on and the operator did
+  # not bring one. Both halves matter: creating a key for a disabled IdP would
+  # bill a dollar a month for nothing, and creating one alongside a supplied ARN
+  # would leave two keys and no rule for which signs (RS-4 refuses that shape in
+  # the configuration; this keeps the stack from producing it).
+  CreateIdpSigningKey: !And [!Condition IdpEnabled, !Not [!Condition HasIdpKmsKeyId]]
+  ResourceServerEnabled: !Equals [!Ref EnableResourceServer, 'true']
+  HasResourceServerIssuer: !Not [!Equals [!Ref ResourceServerIssuer, '']]
   # A named stage on the raw execute-api URL puts /<stage> in front of every
   # path the browser sees, so the Path-scoped refresh cookie has to match.
   NeedsStagePrefixedCookiePath: !And
@@ -770,6 +934,76 @@ Resources:
         GenerateStringKey: accessTokenSecret
         PasswordLength: 64
         ExcludePunctuation: true
+
+  # ---------------------------------------------------------------------
+  # The IdP's signing key
+  #
+  # An asymmetric KMS key whose private half never leaves KMS. The function is
+  # granted exactly two actions on exactly this key ARN — kms:Sign and
+  # kms:GetPublicKey — and can do nothing else with it and nothing at all with
+  # any other key in the account.
+  #
+  # ---- cost -------------------------------------------------------------
+  # USD 1.00 per month for the key, plus USD 0.03 per 10,000 requests for an
+  # RSA-2048 asymmetric operation — about USD 3.00 per million tokens signed.
+  # kms:GetPublicKey is called once per execution environment (the public key is
+  # memoised for the life of the process), so it rounds to nothing. Prices are
+  # eu-west-1 at the time of writing and vary by region; the monthly dollar is
+  # billed whether or not the key ever signs, which is why the key is created
+  # only when EnableIdp is true.
+  #
+  # ---- what is NOT set, and why ----------------------------------------
+  # * EnableKeyRotation: automatic rotation is a symmetric-key feature. AWS will
+  #   not rotate an asymmetric key for you, and it should not: rotating a signing
+  #   key changes the JWKS document every relying party caches, so it is a
+  #   deliberate act — create a second key, list the old one in
+  #   IdpPreviousKmsKeyArns (which sets idProvider.kmsPreviousKeyIds and grants
+  #   the kms:GetPublicKey the JWKS document needs on it), point IdpKmsKeyId at
+  #   the new one, and drop the old ARN once the last token it signed has
+  #   expired. The kid is
+  #   derived from the key material, so all of that is additive and no relying
+  #   party sees a gap (deviations.md, idp-kid-derived-from-key-material).
+  # * MultiRegion: a multi-region key would let a second stack in another region
+  #   sign with the same identity. That is a real pattern and a decision with
+  #   blast radius; it is not the quickstart's to make.
+  # * DeletionPolicy: left at the default. Deleting a KMS key is a SCHEDULED
+  #   deletion — PendingWindowInDays below — and it is cancellable for that whole
+  #   window, which is the safety net a Retain would otherwise provide. Note that
+  #   the key keeps costing its monthly dollar until the window closes.
+  # ---------------------------------------------------------------------
+
+  IdpSigningKey:
+    Type: AWS::KMS::Key
+    Condition: CreateIdpSigningKey
+    Properties:
+      Description: !Sub 'RS256 signing key for the ${AWS::StackName} identity provider'
+      KeySpec: RSA_2048
+      KeyUsage: SIGN_VERIFY
+      # The shortest window AWS allows. A key nobody can sign with is a dead
+      # identity provider, so a long window protects little; and the tokens it
+      # signed are minutes old, not days.
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # The account's own administrative access. Written out rather than
+          # left to the implicit default, because a key policy that does not
+          # grant it can be made unmanageable by anyone: without this statement
+          # IAM policies do not apply to the key at all, and a mistake in the
+          # next one is unrecoverable.
+          - Sid: EnableIAMPoliciesForThisAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  IdpSigningKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateIdpSigningKey
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-idp'
+      TargetKeyId: !Ref IdpSigningKey
 
   # ---------------------------------------------------------------------
   # Single table — docs/spec/data-model.md §2
@@ -1043,6 +1277,36 @@ Resources:
             - !Ref OAuthGithubClientSecretArn
             - !Ref 'AWS::NoValue'
 
+          # --- identity provider -----------------------------------------
+          # The key id is an ARN — the stack's own key, or the one the operator
+          # brought — and it is not a secret: it names a key nobody can export,
+          # which is the whole reason it is preferable to a PEM in the
+          # environment. AWESOME_AUTH_IDP_PRIVATE_KEY is deliberately absent;
+          # RS-4 refuses a deployment that sets both.
+          AWESOME_AUTH_IDP_ENABLED: !Ref EnableIdp
+          AWESOME_AUTH_IDP_KMS_KEY_ID: !If
+            - IdpEnabled
+            - !If [CreateIdpSigningKey, !GetAtt IdpSigningKey.Arn, !Ref IdpKmsKeyId]
+            - !Ref 'AWS::NoValue'
+          # The retired keys, comma-separated, exactly as the config layer's list
+          # binding reads them. Each one is a kms:GetPublicKey at cold start, and
+          # the IAM statement below grants that read on these same ARNs — the two
+          # come from one parameter so a rotation cannot be half-configured.
+          AWESOME_AUTH_IDP_KMS_PREVIOUS_KEY_IDS: !If
+            - RotatingIdpKeys
+            - !Join [',', !Ref IdpPreviousKmsKeyArns]
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_IDP_ISSUER: !If [HasIdpIssuer, !Ref IdpIssuer, !Ref 'AWS::NoValue']
+          # Absent unless moved, so the core's own default path stands and a
+          # jwksPath set in ConfigFile is not overridden by an environment
+          # variable the operator never set.
+          AWESOME_AUTH_IDP_JWKS_PATH: !If [HasIdpJwksPath, !Ref IdpJwksPath, !Ref 'AWS::NoValue']
+
+          # --- resource server -------------------------------------------
+          AWESOME_AUTH_RS_ENABLED: !Ref EnableResourceServer
+          AWESOME_AUTH_RS_JWKS_URL: !If [ResourceServerEnabled, !Ref ResourceServerJwksUrl, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_RS_ISSUER: !If [HasResourceServerIssuer, !Ref ResourceServerIssuer, !Ref 'AWS::NoValue']
+
           # --- configuration document ------------------------------------
           # A path inside the artifact, never a value: the document is part of
           # the reproducible zip, so what the function reads is what was built.
@@ -1299,6 +1563,61 @@ Resources:
                 NotResource: !Sub 'arn:${AWS::Partition}:sns:*:*:*'
           - !Ref 'AWS::NoValue'
 
+        # -----------------------------------------------------------------
+        # The IdP's signing key. Two actions on the current key, and nothing
+        # else in the account except a read on the keys being retired.
+        #
+        #   * kms:Sign produces the RS256 signature of every token the IdP
+        #     issues. The request carries the 32-byte SHA-256 of the token's
+        #     signing input and nothing else (MessageType: DIGEST), so the
+        #     claims never reach the service.
+        #   * kms:GetPublicKey is what the JWKS document is built from, once per
+        #     execution environment.
+        #
+        # The second statement is the rotation, and it exists because the first
+        # one cannot carry it: KMSSigner.JWKS calls GetPublicKey for every id in
+        # idProvider.kmsPreviousKeyIds at cold start, so a retired ARN the policy
+        # does not cover fails the init rather than one request. It grants
+        # GetPublicKey and NOT Sign: a key that has been retired must not be able
+        # to mint anything, and the JWKS document is the only thing it is still
+        # there for. It is absent entirely while IdpPreviousKmsKeyArns is empty.
+        #
+        # No kms:CreateKey, no kms:ScheduleKeyDeletion, no kms:PutKeyPolicy: an
+        # auth router that can delete its own signing key, or grant a third
+        # party the use of it, is a bad example that propagates. No kms:Decrypt
+        # or kms:Encrypt either — this key's usage is SIGN_VERIFY and those
+        # actions would be refused anyway, so granting them would say something
+        # untrue about what the function does.
+        #
+        # A KEY ARN and not an alias ARN, for both halves of IdpKmsKeyId: IAM
+        # evaluates kms actions against the key's own ARN, and a statement whose
+        # Resource is an alias matches nothing at all — a failure that shows up
+        # as AccessDeniedException on the first token, long after the deploy
+        # that looked successful.
+        # -----------------------------------------------------------------
+        - !If
+          - IdpEnabled
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: SignWithTheIdentityProviderKey
+                Effect: Allow
+                Action:
+                  - kms:Sign
+                  - kms:GetPublicKey
+                Resource: !If [CreateIdpSigningKey, !GetAtt IdpSigningKey.Arn, !Ref IdpKmsKeyId]
+          - !Ref 'AWS::NoValue'
+
+        - !If
+          - RotatingIdpKeys
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadTheRetiredIdentityProviderKeys
+                Effect: Allow
+                Action:
+                  - kms:GetPublicKey
+                Resource: !Ref IdpPreviousKmsKeyArns
+          - !Ref 'AWS::NoValue'
+
       Events:
         Root:
           Type: HttpApi
@@ -1337,3 +1656,49 @@ Outputs:
     Value: !Ref AuthFunction
     Export:
       Name: !Sub '${AWS::StackName}-FunctionName'
+
+  # The two URLs a relying party is configured with. They are outputs rather
+  # than something to assemble by hand because getting either wrong is a
+  # deployment that looks healthy and verifies nothing: a discovery document
+  # served at one issuer and advertised under another is exactly the failure
+  # nobody notices until the first client tries.
+  #
+  # The sentinel value is deliberate. With neither IdpIssuer nor PublicUrl the
+  # function derives no issuer at all, says so at cold start, and mints tokens
+  # with no iss claim — so an output that guessed the execute-api URL here would
+  # be the one place in this stack that lies about what is deployed.
+
+  IssuerUrl:
+    Condition: IdpEnabled
+    Description: >-
+      OIDC issuer this deployment advertises. Discovery lives at
+      <IssuerUrl>/.well-known/openid-configuration.
+    Value: !If
+      - HasIdpIssuer
+      - !Ref IdpIssuer
+      - !If
+        - HasPublicUrl
+        - !Sub '${PublicUrl}${ApiPrefix}'
+        - '(none: the function derived no issuer — set IdpIssuer, or PublicUrl, and redeploy)'
+    Export:
+      Name: !Sub '${AWS::StackName}-IssuerUrl'
+
+  JwksUrl:
+    Condition: IdpEnabled
+    Description: >-
+      JWKS endpoint a resource server verifies this deployment's tokens against.
+      The path is IdpJwksPath, defaulting to /.well-known/jwks.json; a jwksPath
+      moved in ConfigFile instead of here is not visible to CloudFormation, and
+      then the discovery document's jwks_uri is the authority.
+    Value: !Sub
+      - '${Base}${Path}'
+      - Base: !If
+          - HasIdpIssuer
+          - !Ref IdpIssuer
+          - !If
+            - HasPublicUrl
+            - !Sub '${PublicUrl}${ApiPrefix}'
+            - '(none: the function derived no issuer — set IdpIssuer, or PublicUrl, and redeploy)'
+        Path: !If [HasIdpJwksPath, !Ref IdpJwksPath, '/.well-known/jwks.json']
+    Export:
+      Name: !Sub '${AWS::StackName}-JwksUrl'

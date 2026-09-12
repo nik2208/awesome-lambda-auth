@@ -224,7 +224,7 @@ func validateSignedWebhook(c *Config, d *diagnostics, w signedWebhook) {
 	}
 	if c.SecretValue(secretPath) == "" {
 		d.errf("", secretPath, w.noSecret,
-			"reference it from a store -- "+secretPath+": {secretsManager: <id>} -- or set "+envNameFor(secretPath)+" for development")
+			"reference it from a store -- "+secretPath+": {secretsManager: <id>} -- or set "+envNameFor(c, secretPath)+" for development")
 	}
 }
 
@@ -337,6 +337,186 @@ func validateIDProvider(c *Config, d *diagnostics) {
 			"the public key is not in PEM form",
 			"supply the PEM block, beginning with -----BEGIN PUBLIC KEY-----")
 	}
+	validateIDProviderKMS(c, d)
+	validateIDProviderClients(c, d)
+}
+
+// validateIDProviderKMS checks the shape of the KMS key references (§1.10
+// addendum). Which of privateKey and kmsKeyId may be set is RS-4's question,
+// not this one's; this only asks whether the values are usable identifiers.
+//
+// The check is deliberately shallow. A KMS key can be named as a key id, an
+// alias or an ARN, and the three have nothing in common but "no whitespace, not
+// empty"; anything stricter would reject a legitimate ARN from a partition
+// nobody here has seen. What is worth catching is the mistake that produces a
+// silent failure: a duplicate between the primary key and the previous list,
+// which would publish the same key twice in the JWKS document under one kid.
+func validateIDProviderKMS(c *Config, d *diagnostics) {
+	primary := strings.TrimSpace(c.IDProvider.KMSKeyID)
+	if primary != c.IDProvider.KMSKeyID || strings.ContainsAny(c.IDProvider.KMSKeyID, " \t\n") {
+		d.errf("", "idProvider.kmsKeyId",
+			"the key reference carries whitespace",
+			"use a bare key id, an alias such as alias/awesome-auth-idp, or the key's ARN")
+	}
+	seen := map[string]bool{}
+	if primary != "" {
+		seen[primary] = true
+	}
+	for i, raw := range c.IDProvider.KMSPreviousKeyIDs {
+		path := fmt.Sprintf("idProvider.kmsPreviousKeyIds[%d]", i)
+		id := strings.TrimSpace(raw)
+		switch {
+		case id == "":
+			d.errf("", path,
+				"the entry is empty",
+				"remove it; an empty key reference publishes nothing and fails the JWKS build at cold start")
+		case seen[id]:
+			d.errf("", path,
+				fmt.Sprintf("%q is already listed, or is idProvider.kmsKeyId itself", id),
+				"list each retired key once; the primary key is published first and does not belong here")
+		default:
+			seen[id] = true
+		}
+	}
+	if len(c.IDProvider.KMSPreviousKeyIDs) > 0 && primary == "" {
+		d.errf("", "idProvider.kmsPreviousKeyIds",
+			"retired KMS keys are listed but idProvider.kmsKeyId is unset, so there is no KMS signer to publish them alongside",
+			"set idProvider.kmsKeyId to the key that signs now, or remove the retired list")
+	}
+}
+
+// validateIDProviderClients checks the OIDC client registry (§1.10 addendum).
+//
+// Five things are refused, and each of them is a silent failure otherwise:
+//
+//   - a client with no secret, because the core's token endpoint compares the
+//     posted client_secret against the configured one and an empty configured
+//     value is satisfied by an empty posted one — anyone holding a stolen
+//     authorization code could then redeem it;
+//   - a client with no redirect URI, because the authorization endpoint
+//     resolves redirect_uri against an exact-match allowlist and an empty one
+//     matches nothing, so every authorization request answers 400;
+//   - a duplicate client id, because the registry is a map in the core
+//     (NewIDP) and the last entry would silently win, taking its secret and its
+//     redirect allowlist with it;
+//   - a client id outside [A-Za-z0-9_-], and
+//   - two client ids that differ only in characters the environment-variable
+//     name cannot keep apart.
+//
+// The last two are one problem. Each client's secret has its own variable,
+// "AWESOME_AUTH_IDP_CLIENT_" + upperSnake(id) + "_SECRET" (secret.go), and
+// upperSnake maps every byte that is not a letter or a digit to '_'. So
+// "my-app", "my.app" and "my_app" are three registry entries — distinct to the
+// core, distinct to the duplicate check above — that share one variable, and
+// the value meant for one relying party would authenticate another at the token
+// endpoint. Constraining the id keeps the two spellings that collide from
+// being spellable at all, and the equality check below catches the pair that
+// survives the constraint ("my-app" and "my_app").
+//
+// A redirect URI must be https, or http on a loopback host: that is RFC 8252
+// §7.3 for native apps, and it is the only http exception, because the
+// authorization code travels in the query string of whatever this names.
+func validateIDProviderClients(c *Config, d *diagnostics) {
+	seen := map[string]int{}
+	envNames := map[string]int{}
+	for i, client := range c.IDProvider.Clients {
+		base := fmt.Sprintf("idProvider.clients[%d]", i)
+		id := strings.TrimSpace(client.ClientID)
+		if id == "" {
+			d.errf("", base+".clientId",
+				"the client entry has no clientId",
+				"set clientId to the identifier the relying party sends, or remove the entry")
+			continue
+		}
+		if first, dup := seen[id]; dup {
+			d.errf("", base+".clientId",
+				fmt.Sprintf("client id %q is already defined by idProvider.clients[%d]", id, first),
+				"give each client its own id; the registry is keyed by id and the last entry would silently win")
+			continue
+		}
+		seen[id] = i
+
+		if !isClientIDSafe(id) {
+			d.errf("", base+".clientId",
+				fmt.Sprintf("client id %q contains a character outside A-Z a-z 0-9 _ -, and the client's secret is read from AWESOME_AUTH_IDP_CLIENT_<ID>_SECRET, where every such character becomes an underscore -- two ids that differ only there would share one secret", id),
+				"use letters, digits, underscores and hyphens only, e.g. \"console\" or \"ops-console\"")
+			continue
+		}
+		envName := "AWESOME_AUTH_IDP_CLIENT_" + upperSnake(id) + "_SECRET"
+		if first, clash := envNames[envName]; clash {
+			d.errf("", base+".clientId",
+				fmt.Sprintf("client id %q and the id of idProvider.clients[%d] both derive the environment variable %s, so one relying party's secret would authenticate the other at the token endpoint", id, first, envName),
+				"rename one of the two so the ids differ by more than a hyphen or an underscore")
+			continue
+		}
+		envNames[envName] = i
+
+		secretPath := "idProvider.clients." + id + ".clientSecret"
+		if !c.secretFailed(secretPath) && c.SecretValue(secretPath) == "" {
+			d.errf("", secretPath,
+				fmt.Sprintf("client %q has no client secret, and the token endpoint would then accept an empty one from anybody holding an authorization code", id),
+				"reference it from a store -- "+secretPath+": {secretsManager: <id>} -- or set "+envNameFor(c, secretPath)+" for development")
+		}
+
+		if len(client.RedirectURIs) == 0 {
+			d.errf("", base+".redirectUris",
+				fmt.Sprintf("client %q has no redirect URIs, and the authorization endpoint matches redirect_uri against this list exactly, so every request would be refused", id),
+				"list the exact URIs the relying party redirects to")
+			continue
+		}
+		for j, uri := range client.RedirectURIs {
+			redirectURI(d, fmt.Sprintf("%s.redirectUris[%d]", base, j), uri)
+		}
+	}
+}
+
+// redirectURI accepts an https URL, or an http one on a loopback host. The
+// authorization code is delivered in this URL's query string, so plain http to
+// anywhere else puts a credential on the wire in clear; the loopback exception
+// is RFC 8252 §7.3, where the "network" is the user's own machine.
+func redirectURI(d *diagnostics, path, raw string) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		d.errf("", path,
+			fmt.Sprintf("%q is not an absolute URL", raw),
+			"use a full URL including the scheme, e.g. https://app.example.com/callback")
+		return
+	}
+	if u.Scheme == "https" {
+		return
+	}
+	if u.Scheme == "http" && isLoopbackHost(u.Hostname()) {
+		return
+	}
+	d.errf("", path,
+		fmt.Sprintf("%q is neither https nor http on a loopback address, and the authorization code arrives in this URL's query string", raw),
+		"use https; plain http is accepted only for http://localhost or http://127.0.0.1, the native-app exception of RFC 8252 §7.3")
+}
+
+// isClientIDSafe reports whether a client id survives the trip through
+// upperSnake unambiguously: letters, digits, '_' and '-' only. A hyphen is
+// allowed because it is the conventional spelling of a client id and because
+// the pair it can still collide with ("ops-console" and "ops_console") is
+// caught by name, with both indices reported.
+func isClientIDSafe(id string) bool {
+	for i := 0; i < len(id); i++ {
+		ch := id[i]
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+		case ch == '_' || ch == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isLoopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 func validateResourceServer(c *Config, d *diagnostics) {

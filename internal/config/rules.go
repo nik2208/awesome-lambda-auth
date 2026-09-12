@@ -33,6 +33,7 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS5SameSite(c, d)
 	checkRS6AdminGuard(c, d)
 	checkRS8ResourceServerJWKS(c, d)
+	checkIdentityModeConflict(c, d)
 	checkRS10FirstUser(c, capabilities, d)
 	checkRS11OAuthProviders(c, d)
 	checkRS12MemoryStore(c, d)
@@ -74,7 +75,7 @@ func checkRS1Secrets(c *Config, d *diagnostics) {
 		case value == "":
 			d.errf(RuleSecrets, path,
 				"the HS256 signing secret is missing, so the first login would fail with a 500 instead of signing a token",
-				"reference it from a store -- "+path+": {secretsManager: <id>} -- or set "+envNameFor(path)+" for development")
+				"reference it from a store -- "+path+": {secretsManager: <id>} -- or set "+envNameFor(c, path)+" for development")
 		case len(value) < minHS256SecretLength:
 			d.errf(RuleSecrets, path,
 				fmt.Sprintf("the HS256 signing secret is %d characters, below the %d-character minimum", len(value), minHS256SecretLength),
@@ -136,18 +137,41 @@ func checkRS3CSRF(c *Config, d *diagnostics) {
 }
 
 // checkRS4IDProviderKeys: identity-provider mode needs externally supplied key
-// material in production.
+// material in production, and never more than one source of it.
 //
 // The reference generates an ephemeral RSA keypair and warns that "all tokens
 // will be invalidated on restart"
 // (src/services/token.service.ts:50-63). Under Lambda a restart is every cold
 // start, and there are many concurrently, so the warning describes a service that
 // does not work rather than one that is inconvenient.
+//
+// The product adds a second source — idProvider.kmsKeyId, a KMS asymmetric key
+// that signs without ever handing the private key to the function — and with two
+// sources the rule grows a second half. Exactly one of them may be set, in every
+// environment: two keys and no rule for which signs would mean the kid in a
+// token, the key in the JWKS document and the key that actually signed could all
+// disagree, and the failure would surface as a relying party rejecting valid
+// tokens rather than as a misconfiguration.
+//
+// Neither is refused in production only. In development the core generates an
+// ephemeral RSA-2048 key and warns, once, through the cold-start log (cmd/auth
+// idp.go): every token minted becomes unverifiable on the next cold start, which
+// is exactly right for `sam local` and a test stack and exactly wrong for
+// anything with users.
 func checkRS4IDProviderKeys(c *Config, d *diagnostics) {
 	if !c.IDProvider.active() {
 		return
 	}
-	if c.SecretValue("idProvider.privateKey") != "" {
+	pem := c.SecretValue("idProvider.privateKey") != ""
+	kms := strings.TrimSpace(c.IDProvider.KMSKeyID) != ""
+
+	if pem && kms {
+		d.errf(RuleIDProviderKeys, "idProvider.kmsKeyId",
+			"identity-provider mode is configured with both a PEM private key and a KMS key, and nothing decides which of the two signs",
+			"keep exactly one: idProvider.kmsKeyId for a key the function can only ask to sign, or idProvider.privateKey for a PEM it reads at cold start")
+		return
+	}
+	if pem || kms {
 		return
 	}
 	if !c.IsProduction() {
@@ -155,7 +179,7 @@ func checkRS4IDProviderKeys(c *Config, d *diagnostics) {
 	}
 	d.errf(RuleIDProviderKeys, "idProvider.privateKey",
 		"identity-provider mode is active in production with no signing key supplied, and generating an ephemeral one would invalidate every token on each cold start",
-		"reference a stored RSA private key -- idProvider.privateKey: {secretsManager: <id>} -- or turn idProvider.enabled off")
+		"set idProvider.kmsKeyId to an RSA SIGN_VERIFY key, or reference a stored RSA private key -- idProvider.privateKey: {secretsManager: <id>} -- or turn idProvider.enabled off")
 }
 
 // checkRS5SameSite: SameSite=None requires Secure.
@@ -215,6 +239,43 @@ func checkRS8ResourceServerJWKS(c *Config, d *diagnostics) {
 			fmt.Sprintf("%q is not a well-formed https URL, and the reference would only discover that at the first token verification", raw),
 			"use the full https URL, e.g. https://idp.example.com/.well-known/jwks.json")
 	}
+}
+
+// checkIdentityModeConflict: a deployment is an identity provider or a resource
+// server, never both.
+//
+// Not a §2 rule — the reference wires neither mode to anything that could
+// conflict — but a product refusal with the same posture, because the
+// combination is a deployment that contradicts its own configuration in the one
+// direction that matters.
+//
+// Resource-server mode exists to remove the credential surface: all nineteen
+// routes that create, prove, deliver or change a credential answer 404, and
+// every document in this product says so in those words. Identity-provider mode
+// mounts POST <prefix>/authorize, which takes an email and a password and
+// performs a full login, and POST <prefix>/token, which hands back this
+// deployment's own session pair. Both mounted, the knob that promises no
+// credential can be presented here serves two routes that take one — and
+// nothing in the product's own documentation would warn the operator, because
+// every sentence of it says the opposite.
+//
+// The combination is refused rather than trimmed (mounting the JWKS document
+// and the discovery document while dropping the other three) because a
+// discovery document that advertises an authorization endpoint answering 404 is
+// a second way to be untrue, and because the deployment that wants to publish a
+// signing key for others to verify against is an identity provider: it just has
+// no clients, which idProvider allows and warns about (cmd/auth/idp.go,
+// idpClients).
+func checkIdentityModeConflict(c *Config, d *diagnostics) {
+	if !c.ResourceServer.Enabled || !c.IDProvider.active() {
+		return
+	}
+	d.errf(RuleIdentityModeConflict, "resourceServer.enabled",
+		"resourceServer.enabled is on and identity-provider mode is active as well (idProvider.enabled, or key material in idProvider.kmsKeyId or idProvider.privateKey), "+
+			"and the two describe opposite deployments: resource-server mode unmounts every credential route so that no password can be presented here, "+
+			"while the identity provider mounts POST <prefix>/authorize, which takes an email and a password and logs the user in, and POST <prefix>/token, which returns this deployment's session pair",
+		"keep exactly one: turn resourceServer.enabled off for a stack that issues credentials, "+
+			"or turn idProvider.enabled off and clear idProvider.kmsKeyId and idProvider.privateKey for one that only verifies another issuer's tokens")
 }
 
 // checkRS10FirstUser: the first-user policy needs a driver that can list users.
@@ -426,8 +487,14 @@ func hostOf(raw string) string {
 
 // envNameFor returns the documented AWESOME_AUTH_* variable for a secret path, so
 // a diagnostic can tell the operator exactly what to set in development.
-func envNameFor(path string) string {
-	for _, slot := range secretSlots(Defaults()) {
+//
+// The slots are built from the *configured* document rather than from Defaults,
+// because two families of them do not exist until something is configured: one
+// slot per OAuth provider and one per OIDC client. Reading them off Defaults
+// would answer "the documented AWESOME_AUTH_* variable" for exactly the knobs
+// whose variable name an operator cannot guess.
+func envNameFor(c *Config, path string) string {
+	for _, slot := range secretSlots(c) {
 		if slot.path == path {
 			return slot.env
 		}

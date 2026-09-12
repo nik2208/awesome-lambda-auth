@@ -71,27 +71,28 @@ type domain struct {
 // documented environment variable therefore no longer needs a secretPrefix to
 // be noticed: it is read, and RS-11 refuses the provider that has none.
 //
+// The identity surface (P5) closed the last two of the token domains.
+// `idProvider` mounts the core's OIDC endpoints — discovery, authorize, token,
+// userinfo — and publishes a JWKS document signed either by an AWS KMS
+// asymmetric key (`idProvider.kmsKeyId`, internal/integration/aws kms.go) or by
+// a PEM from `idProvider.privateKey`; `resourceServer` points this deployment at
+// another issuer's JWKS, unmounts the whole credential surface and exposes the
+// RS256 verifier the deployment's own routes are guarded with (cmd/auth idp.go).
+// Neither is refused any more, and `idProvider.`'s secretPrefix goes with them:
+// the private key and every client secret belong to a wired domain now.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
 // key end up, since SES is reached by API and not by URL, and where
 // `oauth.providers.<name>.projectId` ends up, since the core's provider has no
-// field for it.
+// field for it, and where `idProvider.refreshTokenTtl` ends up, since the
+// OIDC token endpoint issues no refresh token of its own in v1 (decisions.md
+// D-3).
 //
 // Everything below is defined, validated and refused.
 func unwiredDomains() []domain {
 	return []domain{
-		{
-			path:         "idProvider",
-			phase:        "P5 (identity provider and JWKS)",
-			get:          func(c *Config) any { return c.IDProvider },
-			secretPrefix: "idProvider.",
-		},
-		{
-			path:  "resourceServer",
-			phase: "P5 (identity provider and JWKS)",
-			get:   func(c *Config) any { return c.ResourceServer },
-		},
 		{
 			path:  "ui",
 			phase: "P6 (hosted UI)",
