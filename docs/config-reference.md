@@ -156,6 +156,35 @@ its `SETTINGS` one, the memory driver holds both per execution environment (§5.
 §11). A driver that backs neither is still refused by `checkStoreSupport` at cold
 start, by name — a store gap rather than a phase gap.
 
+
+### 4.1 Six `stores.enable.*` flags the DynamoDB driver can now back, and still refuses
+
+`stores.enable.metadata`, `.rbac`, `.tenants`, `.apiKeys`, `.webhooks` and
+`.telemetry` are still refused by `checkStoreSupport` on both drivers, and that
+is deliberate rather than pending.
+
+The DynamoDB store *implements* all six as of the admin-store block — metadata
+entries, role definitions and assignments, the tenant directory, API keys with
+their id pointers, the webhook directory and telemetry events all have item
+types, key schemas and tests. What has not happened is the other half: the auth
+core takes every one of those six **by name** rather than discovering it by type
+assertion, so none of them reaches a route until the composition root hands it
+over, and that lands with the admin surface.
+
+`driverStores` therefore answers a narrower question than "can the driver store
+this": it answers "does turning the flag on change what the deployment does".
+Listing the six today would let an operator enable a knob that validates, starts
+cleanly, and does nothing — which is the exact misconfiguration §1.17 exists to
+refuse, and the reason the refusal names the driver rather than shrugging.
+
+Nothing else about these six is waiting on a decision. When the admin surface
+mounts, each flag becomes a real switch and the refusal disappears for it alone.
+
+The three admin listers that arrived with the same block — the user, session and
+role enumerations the admin tables page through — need no flag at all and have
+none: the core finds them by type-asserting the user, session and RBAC stores it
+was already given, so they are live wherever those are.
+
 ## 5. `email.*`, knob by knob
 
 | Path | Type | Default | Env var |

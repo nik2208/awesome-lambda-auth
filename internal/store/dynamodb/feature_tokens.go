@@ -23,6 +23,17 @@ import (
 // family: v0.2.0 keeps that token in PendingLinkStore under the
 // "link-token:<sha256>" namespace rather than on the profile, so it is
 // pending_links.go's business and data-model.md §8.5 is withdrawn.
+//
+// All four are invisible to the compiler at the call site, which is exactly why
+// they are pinned here: a signature that drifted would turn into a 500 on the
+// wire ("store does not implement …") with nothing failing to build. See
+// interfaces.go for the convention.
+var (
+	_ auth.MagicLinkStore         = (*Store)(nil)
+	_ auth.SMSStore               = (*Store)(nil)
+	_ auth.EmailVerificationStore = (*Store)(nil)
+	_ auth.EmailChangeStore       = (*Store)(nil)
+)
 
 // UpdateMagicLinkToken is part of MagicLinkStore.
 func (s *Store) UpdateMagicLinkToken(ctx context.Context, userID, tenantID, tokenHash string, expiry time.Time) error {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	auth "github.com/nik2208/awesome-go-auth"
 )
@@ -26,6 +27,14 @@ const (
 // string, so a tenant id containing '#' would let one tenant forge another
 // tenant's partition key.
 const keySep = "#"
+
+// keySepSuccessor is the byte immediately after keySep. It is the upper bound of
+// a range query over every key of the form "<fixed-width prefix><keySep><tail>",
+// whatever the tail: every such key sorts below it, and every key with a larger
+// fixed-width prefix sorts above it. Appending a maximal *character* instead
+// would depend on what bytes the tail may contain, which for a caller-supplied
+// id is not this package's to assume.
+const keySepSuccessor = "$"
 
 // schemaVersion is stamped into _v on every item this build writes. Readers
 // accept anything at or below it and must tolerate unknown attributes (§7).
@@ -57,6 +66,41 @@ const (
 	// record — it carries the client, the redirect URI and the PKCE challenge —
 	// and a sweep over the two has nothing in common.
 	typeAuthCode = "authcode"
+
+	// typeSessionIndex is the session's directory entry: a second, tiny item in
+	// the session's own partition whose only job is to carry a *constant* GSI1
+	// partition key, so that SessionLister.GetAllSessions is a Query.
+	//
+	// Its own type rather than a second "session": a migration sweep that wanted
+	// every session would otherwise have to read twice as many items and throw
+	// half of them away, and the two have nothing in common but the key prefix.
+	typeSessionIndex = "sessionidx"
+
+	// typeAPIKey is the canonical API-key record, keyed by prefix, and
+	// typeAPIKeyID its by-id pointer (data-model.md §1.5 #48).
+	typeAPIKey   = "apikey"
+	typeAPIKeyID = "keyid"
+
+	// typeRole is a role definition and typeRoleAssignment one user's hold on
+	// one role in one tenant (§1.4 #29-#37). Two types, because the definition
+	// is deployment-global and the assignment is tenant-scoped — CreateRole
+	// carries no tenant and AddRoleToUser does.
+	typeRole           = "role"
+	typeRoleAssignment = "roleassign"
+
+	// typeMeta is one key of one user's metadata (§1.4 #26-#28).
+	typeMeta = "meta"
+
+	// typeTenant is a tenant directory entry (§1.4 #38-#42). The membership item
+	// that pairs with it is typeMember and predates this: CreateUser has always
+	// written one.
+	typeTenant = "tenant"
+
+	// typeWebhook is one webhook subscription, outgoing or inbound (§1.5 #72).
+	typeWebhook = "webhook"
+
+	// typeTelemetry is one recorded auth event (§1.5 #59).
+	typeTelemetry = "telemetry"
 
 	// typeSettings is the deployment's runtime settings document
 	// (data-model.md §1.8). There is exactly one of them in the table, which is
@@ -138,8 +182,120 @@ const (
 	// SESSION's and PLINK's are.
 	skAuthCode = "CODE"
 
-	skProfile      = "PROFILE"
-	skEmail        = "EMAIL"
+	// The four constant GSI1 partition keys of the directory indexes, and the one
+	// prefixed one. Each exists because an interface the core added in v0.8.0
+	// enumerates a whole entity type, and a key-value store can only do that as a
+	// Query — which needs one partition to query.
+	//
+	// A constant partition key is a hot key under write load, and that is the
+	// honest cost of every one of them: every registration writes to
+	// gsi1AllUsersPK, every login to gsi1AllSessionsPK. Sharding (USER#0..USER#n,
+	// picked by a hash of the id) is the usual answer and costs an n-way merge on
+	// every read to keep the order; it is not done here, because the alternative
+	// on the read side is worse and because a deployment that outgrows a single
+	// GSI partition's write throughput has a shape this store should be told
+	// about rather than guess at. §6.2 carries the numbers.
+	//
+	// None of them can collide with the prefixed GSI1PK values other item types
+	// write — a session's USER#<t>#<u>, a membership's USERID#<u> — because a
+	// partition key is only ever matched by equality: a Query for "USER" cannot
+	// reach "USER#acme#usr_1", and there is no such thing as a begins_with on a
+	// partition key.
+	gsi1AllUsersPK    = "USER"
+	gsi1AllSessionsPK = "SESSION"
+	gsi1AllAPIKeysPK  = "APIKEY"
+
+	// gsi1APIKeyServicePrefix keys the by-service fan-out of
+	// APIKeyServiceIndexStore. It is on the *pointer* item rather than on the
+	// canonical one, because the canonical one already spends its single GSI1
+	// key pair on the all-keys directory; see api_keys.go.
+	gsi1APIKeyServicePrefix = "APIKEYSVC" + keySep
+
+	// gsi1RolePrefix keys a role's assignments, so DeleteRole can find every
+	// user holding it without a Scan (§1.4 #33).
+	gsi1RolePrefix = "ROLE" + keySep
+
+	// rolesPK is the directory partition every role definition lives in, exactly
+	// as tenantsPK is for tenants and templatesPK for templates.
+	//
+	// data-model.md §1.4 originally keyed a definition at PK=ROLE#<role>, one
+	// partition each. That was correct for every method that names a role, and
+	// impossible for the one that does not: RoleLister.GetAllRoles (core v0.8.0)
+	// enumerates the set, and a per-role partition can only be enumerated by a
+	// table Scan. The definitions are a bounded, human-authored set written by an
+	// administrator, so one partition costs nothing and buys the Query. §2.3's
+	// argument for the tenant directory is this argument.
+	rolesPK = "ROLES"
+
+	// skRolePrefix is both the sort key of a definition under rolesPK and the
+	// sort key of an assignment under USER#<t>#<u>. One constant, because the
+	// role name is the tail of both and a second declaration of the same string
+	// is what lets a codec and a condition drift apart.
+	skRolePrefix = "ROLE" + keySep
+
+	// tenantsPK is the tenant directory partition (§2.2). Its entries' sort key
+	// is tenantPK(id) — the same TENANT#<t> string the membership item already
+	// carries as its GSI1SK, which is what makes GetTenantsForUser a Query
+	// followed by a BatchGet with no key rewriting in between.
+	tenantsPK = "TENANTS"
+
+	// pkUserMetaPrefix is the partition of one user's metadata.
+	//
+	// Not USER#<t>#<u>, which is where data-model.md §1.4 #26-#28 put it, and the
+	// correction is forced rather than chosen: UserMetadataStore's three methods
+	// take (ctx, userID) and no tenant (core store.go), so no implementation can
+	// name the tenant segment of that key. §8.1 recorded this as an open question
+	// with "read the tenant off the request-scoped principal" as the interim and
+	// an upstream signature widening as the fix. Neither is needed. The
+	// linked-account item already solves the same problem the same way — it is
+	// keyed globally and carries no tenantId, "deliberately absent", because
+	// FindByProvider, ListForUser and Delete all lack a tenant too (§5) — and a
+	// user id is unique across tenants by construction, so a partition keyed by
+	// it alone is exactly as isolating as one keyed by both. §8.1 is closed by
+	// this, not deferred.
+	pkUserMetaPrefix = "USERMETA" + keySep
+
+	// skMetaPrefix is the sort key of one metadata entry. Per key, not one item
+	// holding a map: that is what makes UpdateMetadata's merge a write with no
+	// read (§2.3).
+	skMetaPrefix = "META" + keySep
+
+	// pkAPIKeyPrefix keys the canonical API-key record by its prefix, because
+	// FindByPrefix is the hot path and must be one GetItem; pkKeyIDPrefix is the
+	// by-id pointer the four cold methods need, since Revoke, UpdateLastUsed,
+	// FindByID and Delete all carry an id and nothing else (§2.3).
+	pkAPIKeyPrefix = "APIKEY" + keySep
+	pkKeyIDPrefix  = "KEYID" + keySep
+
+	// webhooksPK is the webhook directory partition. One partition, like
+	// TEMPLATES, and for the same reasons: the set is bounded and
+	// administrator-authored, every read of it is a whole-partition Query, and a
+	// strongly-consistent one means the admin who just saved a subscription sees
+	// it in the next listing.
+	webhooksPK = "WEBHOOKS"
+
+	// skWebhookPrefix is the sort key namespace under it. The tail is the store's
+	// own id, so a configuration is addressable by the id UpdateWebhook and
+	// RemoveWebhook carry without a second pointer item.
+	skWebhookPrefix = "WHK" + keySep
+
+	// pkTelemetryPrefix keys one day of one tenant's events (§1.5 #59). Day
+	// buckets rather than one partition per tenant, because the filter's only
+	// mandatory-shaped dimension is a time range and an unbucketed tenant
+	// partition would grow without bound.
+	pkTelemetryPrefix = "TEL" + keySep
+
+	skProfile = "PROFILE"
+	skEmail   = "EMAIL"
+
+	// skSessionIndex is the sort key of the session's directory entry, in the
+	// session's own partition. Chosen to sort *after* skSession ("SIDX" >
+	// "SESSION") so that a future unconditioned Query of a session partition
+	// returns the session first.
+	skSessionIndex = "SIDX"
+
+	skAPIKey       = "APIKEY"
+	skKeyID        = "KEYID"
 	skSession      = "SESSION"
 	skRefresh      = "REFRESH"
 	skToken        = "TOKEN"
@@ -215,6 +371,56 @@ func checkHash(kind, hash string) error {
 	return nil
 }
 
+// Bounds on the caller-supplied values that occupy the only variable segment of
+// a key. DynamoDB's own limits are 2048 bytes for a partition key and 1024 for a
+// sort key; these are far below both, and are here so a value that cannot work
+// is refused at the boundary with a typed error rather than deep inside the SDK.
+//
+// They are generous because none of these three is this package's to define: a
+// role name, a metadata key and an API key's service id are all whatever the
+// deployment says they are.
+const (
+	maxRoleNameLen  = 256
+	maxMetaKeyLen   = 256
+	maxServiceIDLen = 256
+
+	// maxAPIKeyPrefixLen is generous for the same reason and tighter for one
+	// more: the core mints an 11-character prefix (`ak_` plus 8 hex, api_keys.go)
+	// and nothing longer is reachable through it, so this bound exists only to
+	// stop a hand-built record from producing a key DynamoDB refuses.
+	maxAPIKeyPrefixLen = 128
+)
+
+// checkOpaque validates a caller-supplied value that occupies the *only*
+// variable segment of its key. '#' inside such a value is unambiguous and is
+// therefore allowed — the rule checkProviderAccountID and checkStateKey already
+// apply — so exactly three shapes are refused: the empty string, because every
+// other empty-valued caller would build the same key; a value long enough to
+// risk DynamoDB's key limit; and a control character, which would otherwise
+// surface as an opaque ValidationException.
+func checkOpaque(kind, v string, max int) error {
+	switch {
+	case v == "":
+		return fmt.Errorf("%w: empty %s", ErrInvalidIdentifier, kind)
+	case len(v) > max:
+		return fmt.Errorf("%w: %s longer than %d bytes", ErrInvalidIdentifier, kind, max)
+	case strings.ContainsAny(v, "\x00\n\r"):
+		return fmt.Errorf("%w: %s contains a control character", ErrInvalidIdentifier, kind)
+	}
+	return nil
+}
+
+// checkServiceID is checkOpaque with the empty string allowed, because
+// APIKeyRecord.ServiceID is optional: the reference's listByServiceId("") is a
+// query for exactly the keys that left it unset, and refusing "" here would make
+// those keys unreachable through the interface that exists to reach them.
+func checkServiceID(serviceID string) error {
+	if serviceID == "" {
+		return nil
+	}
+	return checkOpaque("service id", serviceID, maxServiceIDLen)
+}
+
 // normalizeEmail mirrors the core's normalization (service.go:58) so the key
 // this store computes is the key the core expects. It is duplicated rather than
 // imported because it is unexported there.
@@ -253,6 +459,88 @@ func refreshPK(hash string) string { return pkRefreshPrefix + hash }
 func tenantPK(tenantID string) string { return pkTenantPrefix + tenantID }
 
 func memberSK(userID string) string { return skMemberPrefix + userID }
+
+// userGSI1SK is the admin user directory's sort key: <tenantID>#<id>.
+//
+// It is the shape the upstream author designed AdminUserStore.ListUsers against
+// (core store.go), and both forms of the method fall out of it — the unscoped
+// one as a Query with no sort-key condition, the scoped one as a begins_with on
+// tenantID+"#". Deliberately not partitioned by tenant: that would serve the
+// scoped form and force a cross-partition Scan for the unscoped one, which is
+// the form both of the reference's own consumers use.
+//
+// The tenant segment is '#'-free (idPattern), so begins_with("acme#") cannot
+// reach tenant "acmecorp", and the split is unambiguous however odd the user id
+// is.
+//
+// The order this produces for the unscoped listing is (TenantID, ID) rather than
+// ID alone. That is a deviation from the core's normative order, the upstream
+// author predicted it — "and that is the downstream store's to register" — and
+// CompatibilityNotes registers it.
+func userGSI1SK(tenantID, userID string) string {
+	return tenantID + keySep + userID
+}
+
+// roleSK is the sort key of a role definition under rolesPK and of a role
+// assignment under a user partition.
+func roleSK(role string) string { return skRolePrefix + role }
+
+// roleFromSK is the inverse. The role name is not duplicated into an attribute
+// of its own on the assignment item, so the sort key is the one place it lives.
+func roleFromSK(sk string) (string, bool) { return strings.CutPrefix(sk, skRolePrefix) }
+
+// gsi1Role keys a role's assignments for the DeleteRole sweep.
+func gsi1Role(role string) string { return gsi1RolePrefix + role }
+
+// userMetaPK is the partition of one user's metadata; see pkUserMetaPrefix for
+// why the tenant is not in it.
+func userMetaPK(userID string) string { return pkUserMetaPrefix + userID }
+
+func metaSK(key string) string { return skMetaPrefix + key }
+
+func metaKeyFromSK(sk string) (string, bool) { return strings.CutPrefix(sk, skMetaPrefix) }
+
+// tenantDirSK is the sort key of a tenant directory entry. It is tenantPK's
+// string by construction rather than by coincidence: the membership item's
+// GSI1SK already carries it, and GetTenantsForUser reads that value straight out
+// of the index and uses it as this key.
+func tenantDirSK(tenantID string) string { return tenantPK(tenantID) }
+
+func apiKeyPK(prefix string) string { return pkAPIKeyPrefix + prefix }
+
+func keyIDPK(keyID string) string { return pkKeyIDPrefix + keyID }
+
+// gsi1APIKeyService keys one service identity's API keys. The service id is the
+// trailing segment of a partition key, so '#' inside it is unambiguous; an empty
+// one is a real value here, because APIKeyRecord.ServiceID is optional and the
+// reference's listByServiceId("") would return exactly the keys that left it
+// unset.
+func gsi1APIKeyService(serviceID string) string { return gsi1APIKeyServicePrefix + serviceID }
+
+func webhookSK(id string) string { return skWebhookPrefix + id }
+
+func webhookIDFromSK(sk string) (string, bool) { return strings.CutPrefix(sk, skWebhookPrefix) }
+
+// telemetryPK buckets one tenant's events by UTC day. The day is derived from
+// the event's own timestamp, so a Query has to visit one partition per day of
+// the requested range — which is what bounds TelemetryStore.Query and why the
+// filter's time range is the one dimension this store insists on.
+func telemetryPK(tenantID string, day time.Time) string {
+	return pkTelemetryPrefix + tenantID + keySep + day.UTC().Format(telemetryDayLayout)
+}
+
+// telemetryDayLayout is the bucket granularity. A day rather than an hour or a
+// month: an hour multiplies the per-query fan-out by 24 for no gain on a range
+// anyone actually asks for, and a month makes one partition hold a month of a
+// busy tenant's events, which is the hot-partition shape §6.2 warns about.
+const telemetryDayLayout = "2006-01-02"
+
+// telemetrySK orders one day's events by instant, then by id so the order is
+// total. The timestamp is the same padded layout every other sort key in this
+// table uses, for the reason tsLayout gives: DynamoDB compares bytewise.
+func telemetrySK(at time.Time, eventID string) string {
+	return formatTime(at) + keySep + eventID
+}
 
 func gsi1UserID(userID string) string { return gsi1UserIDPrefix + userID }
 

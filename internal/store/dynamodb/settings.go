@@ -145,9 +145,18 @@ var (
 	ErrSettingsConflict = errors.New("dynamodb: settings were patched concurrently too many times")
 )
 
+// SettingsStore is the third capability the core does not discover by type
+// assertion — Config.Settings is set explicitly, by auth.WithSettingsStore — and
+// the consequence of drifting out of shape is not a build failure but a
+// deployment where POST /2fa/disable silently stops honouring a stored
+// require2FA, because the core skips the settings check altogether when
+// Config.Settings is nil. See interfaces.go for the convention.
+var _ auth.SettingsStore = (*Store)(nil)
+
 // Settings returns this store as the auth.SettingsStore the composition root
-// hands to auth.WithSettingsStore. The methods are on *Store itself
-// (interfaces.go); the accessor exists so cmd/auth can find the capability
+// hands to auth.WithSettingsStore. The methods are on *Store itself; the
+// assertion above is what pins their shape, and the accessor exists so cmd/auth
+// can find the capability
 // structurally, the way it finds Templates() and AuthCodes(), without importing
 // this package's types into its own vocabulary.
 func (s *Store) Settings() auth.SettingsStore { return s }

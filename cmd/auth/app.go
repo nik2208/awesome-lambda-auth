@@ -741,12 +741,6 @@ func (m memoryStoreBundle) AuthCodes() auth.AuthCodeStore           { return m.c
 func driverStores(driver string) (map[string]bool, bool) {
 	switch driver {
 	case config.StoreDriverDynamoDB:
-		// internal/store/dynamodb implements UserStore, UserAccountStore,
-		// UserPasswordStore, SessionStore, SessionLookupStore, SessionAdminStore,
-		// the four single-use token stores, TOTPStore, LinkedAccountStore and
-		// PendingLinkStore. Everything else is deliberately absent — see that
-		// package's interfaces.go.
-		//
 		// "templates" joined the set when the store gained its TEMPLATES
 		// partition: mail templates and UI translations are readable and
 		// patchable on this driver, so email.templatesDir seeds a store that
@@ -754,6 +748,27 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// with the SETTINGS singleton (data-model.md §1.8): a require2FA an
 		// administrator switches on is seen by every execution environment and
 		// survives a redeploy.
+		//
+		// **This set is deliberately narrower than what the driver implements.**
+		// internal/store/dynamodb now also implements UserMetadataStore,
+		// RolesPermissionsStore, TenantStore, APIKeyStore, the three webhook
+		// stores and TelemetryStore, with item types and tests for all of them.
+		// None of them is listed here, because this map answers a different
+		// question: not "can the driver store this" but "does enabling the flag
+		// change what the deployment does". The core takes every one of those six
+		// by name — auth.WithMetadataProvider, auth.WithRBACProvider,
+		// auth.WithTenantProvider, and the API key, webhook and telemetry stores
+		// through their own callers — so none of them reaches a route until this
+		// composition root hands it over, and that happens with the admin surface.
+		// Listing them now would let an operator turn on a knob that validates
+		// and then does nothing, which is exactly the misconfiguration this map
+		// exists to refuse.
+		//
+		// The three v0.8.0 admin listers are the exception that proves the rule
+		// and need no flag: AdminUserStore, SessionLister and RoleLister are
+		// discovered by type assertion on the user, session and RBAC stores, so
+		// they are live the moment those are, and there is no separate
+		// stores.enable key for them.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,

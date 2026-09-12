@@ -19,6 +19,10 @@ import (
 // comment there.
 type PendingLinks struct{ store *Store }
 
+// The second of the two view-borne assertions; see LinkedAccounts' for why the
+// view exists and what a drift here costs. See interfaces.go for the convention.
+var _ auth.PendingLinkStore = (*PendingLinks)(nil)
+
 // PendingLinks returns the auth.PendingLinkStore view of this store.
 func (s *Store) PendingLinks() auth.PendingLinkStore { return &PendingLinks{store: s} }
 

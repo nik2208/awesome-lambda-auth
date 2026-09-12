@@ -1,85 +1,74 @@
 package dynamodb
 
-import auth "github.com/nik2208/awesome-go-auth"
-
-// The P1 subset, asserted at compile time. The auth core discovers the optional
-// interfaces by type assertion on the concrete store, so a signature that drifts
-// out of shape would otherwise fail silently — Service would simply stop offering
-// the feature and return ErrFeatureNotSupported at runtime.
-var (
-	_ auth.UserStore          = (*Store)(nil)
-	_ auth.UserAccountStore   = (*Store)(nil)
-	_ auth.UserPasswordStore  = (*Store)(nil)
-	_ auth.SessionStore       = (*Store)(nil)
-	_ auth.SessionLookupStore = (*Store)(nil)
-	_ auth.SessionAdminStore  = (*Store)(nil)
-
-	// The four single-use token stores, plus TOTP. They are optional to the core
-	// and therefore invisible to the compiler at the call site, which is exactly
-	// why they are pinned here: a signature that drifts would turn into a 500 on
-	// the wire ("store does not implement …") with nothing failing to build.
-	_ auth.MagicLinkStore         = (*Store)(nil)
-	_ auth.SMSStore               = (*Store)(nil)
-	_ auth.EmailVerificationStore = (*Store)(nil)
-	_ auth.EmailChangeStore       = (*Store)(nil)
-	_ auth.TOTPStore              = (*Store)(nil)
-
-	// UserPhoneStore is declared in account.go rather than store.go, beside the
-	// POST /add-phone route that needs it, which is why a derivation that read
-	// store.go, oauth.go, api_keys.go and telemetry.go missed it entirely. It was
-	// found by driving the routes (cmd/auth's store sweep), not by reading, and it
-	// is pinned here so it cannot be lost again.
-	_ auth.UserPhoneStore = (*Store)(nil)
-
-	// The two OAuth stores. They cannot be methods on *Store, because
-	// auth.LinkedAccountStore and auth.PendingLinkStore both declare Save — with
-	// different signatures — and both declare Delete(ctx, string) error, with two
-	// different meanings. One type physically cannot satisfy both, so each gets a
-	// view constructed from a Store: Store.LinkedAccounts() and
-	// Store.PendingLinks().
-	//
-	// These two are also the only stores here the core does not discover by type
-	// assertion. They are handed to it explicitly, through auth.WithOAuth
-	// (oauth_wire.go:226-233), which is why the composition root has to pass them
-	// and why cmd/auth tests that the routes above them work.
-	_ auth.LinkedAccountStore = (*LinkedAccounts)(nil)
-	_ auth.PendingLinkStore   = (*PendingLinks)(nil)
-
-	// The OIDC authorization-code store (auth_codes.go). Like the template
-	// store it is on *Store directly — SaveCode and ConsumeCode collide with
-	// nothing — and like it the core does not discover it by type assertion:
-	// IDPConfig.Codes is an explicit field, and a nil one silently selects an
-	// in-process map that is wrong on every multi-instance runtime. Store.AuthCodes()
-	// is what cmd/auth hands over, and this assertion is what keeps the two
-	// methods in the shape the core will call.
-	_ auth.AuthCodeStore = (*Store)(nil)
-
-	// The template store (template_store.go) is on *Store directly. The view
-	// pattern above exists for one reason — a method-name collision — and none
-	// of TemplateStore's six names collides with anything here, so a view would
-	// be a third type carrying nothing but an indirection. It shares one thing
-	// with the two OAuth stores: the core does not discover it by type assertion
-	// either, it is handed over explicitly through auth.WithTemplateStore, which
-	// is what Store.Templates() exists for and why cmd/auth pins the shape.
-	_ auth.TemplateStore = (*Store)(nil)
-
-	// The runtime settings store (settings_store.go), on *Store directly for the
-	// same reason the template store is: GetSettings and UpdateSettings collide
-	// with nothing here. It is the third capability the core does not discover by
-	// type assertion — Config.Settings is set explicitly, by
-	// auth.WithSettingsStore — and the consequence of drifting out of shape is
-	// not a build failure but a deployment where POST /2fa/disable silently
-	// stops honouring a stored require2FA, because the core skips the settings
-	// check altogether when Config.Settings is nil. Store.Settings() is what
-	// cmd/auth hands over, and this assertion is what keeps the two methods in
-	// the shape the core will call.
-	_ auth.SettingsStore = (*Store)(nil)
-)
-
-// Interfaces deliberately NOT implemented yet, listed so their absence reads as a
-// decision rather than an omission: UserMetadataStore, RolesPermissionsStore,
-// TenantStore, APIKeyStore, TelemetryStore. Every one of them has its item type
-// designed in docs/spec/data-model.md §1.4-§1.5 and reuses the helpers here;
-// stubbing them to return "not implemented" would be worse than leaving them out,
-// because the core's type assertions would then advertise features that fail on
-// the wire.
+// This file used to hold every compile-time interface assertion this package
+// makes, in one block. It now holds none of them: each assertion lives in the
+// file that implements the interface it pins, immediately above the methods it
+// is about, and the prose that explains why a particular one matters travels
+// with it.
+//
+// What is left here is the argument for having the assertions at all, which is
+// the same for all of them and belonged in one place even when the list did,
+// plus the register of what this package deliberately does not implement.
+//
+// # Why every interface is pinned
+//
+// The auth core discovers most of its optional capabilities by type assertion on
+// the concrete store (Service.ListSessions asserts SessionAdminStore,
+// Service.ListUsers asserts AdminUserStore, and so on). A method whose signature
+// drifts out of shape therefore does not fail to build: the assertion simply
+// stops succeeding, Service stops offering the feature, and the route answers
+// ErrFeatureNotSupported — a 501 on the wire, from a binary that compiled
+// cleanly and whose store tests all passed. The assertion is what turns that
+// into a build failure.
+//
+// Three capabilities are worse than that, because the core does not even
+// type-assert them: TemplateStore, SettingsStore and AuthCodeStore are handed
+// over explicitly (auth.WithTemplateStore, auth.WithSettingsStore,
+// IDPConfig.Codes). A drifted signature there is not a failed assertion but a
+// composition root that no longer compiles — if it names the interface — or, if
+// it does not, a nil capability that silently selects the core's in-process
+// default. Each of those three is pinned in its own file and reached through an
+// accessor (Templates(), Settings(), AuthCodes()) that cmd/auth pins as well.
+//
+// # Why one per file rather than one block
+//
+// A central block is a file every store touches. This package gains a store per
+// roadmap block, each on its own branch, and the block made every one of them
+// conflict with every other for a reason that has nothing to do with the code:
+// two assertions appended to one list. Beside the implementation there is no
+// shared line to contend for, and the explanatory paragraph — which is the
+// valuable half — sits next to the methods it explains instead of a screen away
+// from them.
+//
+// The convention, so a later block does not have to infer it: put
+//
+//	var _ auth.SomethingStore = (*Store)(nil)
+//
+// directly above the first method of the group, in the file that implements it,
+// with the paragraph that says what breaks if the signature drifts. Nothing
+// collects them; `go build` does.
+//
+// # Interfaces deliberately NOT implemented
+//
+// Listed so their absence reads as a decision rather than an omission.
+//
+//   - auth.APIKeyAuditStore — the reference's optional `logUsage?`. Nothing in
+//     the core calls it: the caller is the API key strategy's audit hook, which
+//     arrives with the admin API-key surface in M8 (v0.10.0). Implementing it
+//     would mean choosing a partition key, a retention and a write amplification
+//     for a table whose only consumer does not exist yet, and the wrong choice
+//     would be a schema to migrate rather than a method to add. The item shape
+//     is sketched in data-model.md §1.5; the store lands with its reader.
+//
+// Everything else the core declares is now implemented here. The five that this
+// list used to name — UserMetadataStore, RolesPermissionsStore, TenantStore,
+// APIKeyStore, TelemetryStore — landed in D6 together with the three v0.8.0
+// admin listers (AdminUserStore, SessionLister, RoleLister), the four narrow
+// API-key companions, and the three webhook stores.
+//
+// The rule they were listed under still stands and is why this register is kept
+// rather than deleted: a stub returning "not implemented" would be worse than an
+// absent method, because the core's type assertion would then succeed and
+// Service would advertise a feature that fails on the wire, where an absent
+// method makes it answer ErrFeatureNotSupported and the route turn that into the
+// reference's own 501.
