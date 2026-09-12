@@ -23,6 +23,8 @@ func sampleUser(tenantID string) auth.User {
 		FirstName:           "Ada",
 		LastName:            "Lovelace",
 		Role:                "admin",
+		IsAdmin:             true,
+		LoginProvider:       "google",
 		IsEmailVerified:     true,
 		Require2FA:          true,
 		IsTOTPEnabled:       true,
@@ -67,10 +69,14 @@ func TestUserRoundTrip(t *testing.T) {
 		byID.PhoneNumber != want.PhoneNumber || byID.FirstName != want.FirstName ||
 		byID.LastName != want.LastName || byID.Role != want.Role ||
 		byID.TOTPSecret != want.TOTPSecret || byID.PendingEmail != want.PendingEmail ||
-		byID.ResetTokenHash != want.ResetTokenHash {
+		byID.ResetTokenHash != want.ResetTokenHash || byID.LoginProvider != want.LoginProvider {
 		t.Fatalf("string fields lost: got %+v want %+v", byID, want)
 	}
-	if !byID.IsEmailVerified || !byID.Require2FA || !byID.IsTOTPEnabled {
+	// IsAdmin is in this list for a reason the others are not: it is the whole of
+	// the admin router's 'is-admin-flag' access policy, so losing it is not a
+	// cosmetic round-trip gap but a deployment in which nobody can administer
+	// anything.
+	if !byID.IsEmailVerified || !byID.Require2FA || !byID.IsTOTPEnabled || !byID.IsAdmin {
 		t.Fatalf("bool fields lost: %+v", byID)
 	}
 	if !byID.CreatedAt.Equal(want.CreatedAt) {

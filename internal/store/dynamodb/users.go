@@ -25,6 +25,21 @@ const (
 	attrLastName      = "lastName"
 	attrRole          = "role"
 	attrEmailVerified = "isEmailVerified"
+
+	// attrIsAdmin is auth.User.IsAdmin (models.go, new in core v0.8.0): the
+	// stored flag the admin router's 'is-admin-flag' access policy reads as
+	// `granted = user.isAdmin === true`. It is a persisted column with no
+	// derivation behind it — the core's field doc is explicit that role-shaped
+	// admin-ness belongs in RBAC and a custom predicate instead — so a store that
+	// does not round-trip it is a store where nobody can ever be an
+	// administrator, whatever the record says.
+	attrIsAdmin = "isAdmin"
+
+	// attrLoginProvider is auth.User.LoginProvider: the provider that created
+	// the account, empty for a password registration. Dropping it made every
+	// OAuth-provisioned user report loginProvider "local" on /me and on every
+	// token, because the core reads an empty field as LoginProviderLocal.
+	attrLoginProvider = "loginProvider"
 	attrRequire2FA    = "require2FA"
 	attrTOTPEnabled   = "isTotpEnabled"
 	attrTOTPSecret    = "totpSecret"
@@ -146,6 +161,8 @@ func profileItem(u auth.User) item {
 		s(attrFirstName, u.FirstName).
 		s(attrLastName, u.LastName).
 		s(attrRole, u.Role).
+		b(attrIsAdmin, u.IsAdmin).
+		s(attrLoginProvider, u.LoginProvider).
 		b(attrEmailVerified, u.IsEmailVerified).
 		b(attrRequire2FA, u.Require2FA).
 		b(attrTOTPEnabled, u.IsTOTPEnabled).
@@ -247,6 +264,8 @@ func userFromItem(m map[string]types.AttributeValue) (auth.User, error) {
 		FirstName:       getS(m, attrFirstName),
 		LastName:        getS(m, attrLastName),
 		Role:            getS(m, attrRole),
+		IsAdmin:         getBool(m, attrIsAdmin),
+		LoginProvider:   getS(m, attrLoginProvider),
 		IsEmailVerified: getBool(m, attrEmailVerified),
 		Require2FA:      getBool(m, attrRequire2FA),
 		IsTOTPEnabled:   getBool(m, attrTOTPEnabled),
