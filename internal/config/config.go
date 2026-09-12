@@ -347,8 +347,24 @@ type OAuthProvider struct {
 
 // OAuthProvisioning covers oauth.provisioning.*.
 type OAuthProvisioning struct {
-	AutoCreate           bool              `json:"autoCreate"`
-	AllowedEmailDomains  []string          `json:"allowedEmailDomains"`
+	AutoCreate          bool     `json:"autoCreate"`
+	AllowedEmailDomains []string `json:"allowedEmailDomains"`
+
+	// OnEmailMatch decides what the callback does when the provider account is
+	// unknown but some account already holds the address it asserts: link the
+	// two (the default), raise the reference's OAUTH_ACCOUNT_CONFLICT so the
+	// link is made only after an emailed token proves the address, or refuse.
+	//
+	// It has no counterpart in the schema extract because the reference has no
+	// provisioning at all — the integrator writes findOrCreateUser and decides
+	// this in code (spec §3.3). The imported core does have the knob, and its
+	// default is "link", which is the account-takeover shape the reference's own
+	// store interface warns about: two providers can assert one address without
+	// representing one person. A policy that consequential must be visible in
+	// the document rather than hardcoded here, which is why it is a knob and not
+	// a constant (docs/spec/decisions.md D-20).
+	OnEmailMatch string `json:"onEmailMatch"`
+
 	FieldMap             map[string]string `json:"fieldMap"`
 	RequireVerifiedEmail bool              `json:"requireVerifiedEmail"`
 }
@@ -699,6 +715,20 @@ func Defaults() *Config {
 			DeliveryWebhook: Webhook{TimeoutMs: 5000},
 		},
 		SMS: SMS{CodeTTLMinutes: 10},
+		// The provisioning policy defaults to what the imported core does with
+		// no policy at all (auth.DefaultOAuthProvisioning): create an account
+		// for an identity nothing knows yet, and link an address a provider
+		// asserts to the account that already holds it. Spelling it out here
+		// rather than leaving the zero value is what keeps "configure a
+		// provider and nothing else" working: an explicit policy is taken at
+		// its word by the core, and a zero AutoCreate would turn every first
+		// login into 403 OAUTH_USER_NOT_PROVISIONED.
+		OAuth: OAuth{
+			Provisioning: OAuthProvisioning{
+				AutoCreate:   true,
+				OnEmailMatch: OAuthEmailMatchLink,
+			},
+		},
 		TwoFactor: TwoFactor{
 			AppName: "awesome-node-auth",
 		},
@@ -785,6 +815,12 @@ const (
 	EmailVerificationLazy   = "lazy"
 	EmailVerificationStrict = "strict"
 
+	// The oauth.provisioning.onEmailMatch modes, spelled as the imported core
+	// spells them (auth.OAuthEmailMatchLink and friends).
+	OAuthEmailMatchLink     = "link"
+	OAuthEmailMatchConflict = "conflict"
+	OAuthEmailMatchReject   = "reject"
+
 	AdminAccessPolicyFirstUser  = "first-user"
 	AdminAccessPolicyIsAdmin    = "is-admin-flag"
 	AdminAccessPolicyOpen       = "open"
@@ -816,6 +852,39 @@ const (
 // is what the "in production" qualifier of RS-4 and RS-12 keys off.
 func (c *Config) IsProduction() bool {
 	return c.Deployment.Environment == EnvironmentProduction
+}
+
+// RedirectOrigins is the deployment's redirect allowlist: every email.siteUrls
+// entry followed by every http.cors.origins entry, deduplicated with the first
+// occurrence's position kept — the reference's
+// [...new Set([...siteUrls, ...corsOrigins])] (buildAllowedOrigins,
+// src/router/auth.router.ts:213-219).
+//
+// One list, two consumers, which is why it lives here rather than in whichever
+// of them needed it first: it is the allowlist an emailed link's per-request
+// origin is matched against, and the allowlist an OAuth callback's state origin
+// has to be in to be redirected to. RS-11 refuses a configured OAuth provider
+// when it is empty, and cmd/auth hands the same list to the core, so an emailed
+// link and an OAuth redirect cannot disagree about a request's origin.
+//
+// Entries are returned exactly as written: the core matches a request's Origin
+// against them with an exact comparison, as the reference's includes does.
+func (c *Config) RedirectOrigins() []string {
+	var out []string
+	seen := make(map[string]struct{}, len(c.Email.SiteURLs)+len(c.HTTP.CORS.Origins))
+	for _, list := range [][]string{c.Email.SiteURLs, c.HTTP.CORS.Origins} {
+		for _, origin := range list {
+			if origin == "" {
+				continue
+			}
+			if _, dup := seen[origin]; dup {
+				continue
+			}
+			seen[origin] = struct{}{}
+			out = append(out, origin)
+		}
+	}
+	return out
 }
 
 // CookieDeliveryActive reports whether the stack issues auth cookies at all.

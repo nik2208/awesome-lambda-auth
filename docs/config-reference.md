@@ -1,7 +1,7 @@
 # Configuration reference
 
 What the deployed binary reads, in the order it reads it, and what every knob of
-the `email` domain does once it is read.
+the `email` and `oauth` domains does once it is read.
 
 This page is operator-facing. The schema's provenance — every default traced to
 the line of `awesome-node-auth` that sets it, and the refuse-to-start rules —
@@ -72,10 +72,12 @@ Three kinds of line, all JSON, all on the deployment's log group:
 - `configured knob is not wired to the auth core` — a knob inside a wired domain
   that the imported core cannot honour, reported with its path and a remedy
   (`unwiredKnobs`, `cmd/auth/app.go`). It is never silently ignored.
-- `credential delivery wired` and `email flows wired` — one line each an
-  operator can read the whole delivery and email posture off: which transport
-  each seam uses, the canonical site URL, how many origins are allowlisted, and
-  what the templates directory seeded.
+- `credential delivery wired`, `email flows wired` and `oauth wiring` — one line
+  each an operator can read the whole delivery, email and federated-login
+  posture off: which transport each seam uses, the canonical site URL, how many
+  origins are allowlisted, what the templates directory seeded, and which
+  providers, provisioning policy and linking stores the OAuth block came up
+  with.
 
 ## 3. Secrets
 
@@ -116,9 +118,12 @@ A domain the schema accepts but the binary does not wire is **refused at start**
 otherwise describe behaviour the deployment does not have. The live list is
 `unwiredDomains()` in `internal/config/phases.go`.
 
-The whole `email` domain now loads. `email.siteUrls`, `email.templatesDir` and
-`email.deliveryWebhook` were the last three to leave that list; nothing under
-`email.` is refused by the phase gate any more.
+The whole `email` domain now loads, and so does the whole `oauth` domain.
+`email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the last
+three of the former to leave that list; `oauth.providers` and
+`oauth.provisioning` (§8) are the latest to go, secret prefix included — a
+provider's `clientSecret` supplied through its documented environment variable
+no longer trips the gate, because it is read.
 
 So do `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook`
 (§6, §7). Nothing under `security.` is refused any more either.
@@ -455,7 +460,195 @@ applies and a deployment that configures nothing gets the reference's own
 default. The `iss` claim is a different thing and is not this knob: it is not
 configurable in this build, and it becomes one with the identity-provider block.
 
-## 8. Two worked postures
+## 8. `oauth.*`, knob by knob
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `oauth.providers.<name>.clientId` | string | none; **required** per provider | `AWESOME_AUTH_OAUTH_<NAME>_CLIENT_ID` (google, github) |
+| `oauth.providers.<name>.clientSecret` | secret | none; **required** per provider | `AWESOME_AUTH_OAUTH_<NAME>_CLIENT_SECRET` |
+| `oauth.providers.<name>.callbackUrl` | string (absolute URL) | none; **required** per provider | `AWESOME_AUTH_OAUTH_<NAME>_CALLBACK_URL` (google, github) |
+| `oauth.providers.<name>.authorizationUrl` | string (https, or http on loopback) | none; required for a generic provider, refused on a built-in one | — (file-only) |
+| `oauth.providers.<name>.tokenUrl` | string (https, or http on loopback) | as above | — (file-only) |
+| `oauth.providers.<name>.userInfoUrl` | string (https, or http on loopback) | as above | — (file-only) |
+| `oauth.providers.<name>.scope` | string (space-separated) | the preset's, for a built-in provider | — (file-only) |
+| `oauth.providers.<name>.additionalAuthParams` | map | none; layered over the preset's | — (file-only) |
+| `oauth.providers.<name>.profileMap` | map | none; the default mapping | — (file-only) |
+| `oauth.providers.<name>.projectId` | string | none | `AWESOME_AUTH_OAUTH_<NAME>_PROJECT_ID` (google, github) |
+| `oauth.provisioning.autoCreate` | boolean | `true` | `AWESOME_AUTH_OAUTH_PROVISIONING_AUTO_CREATE` |
+| `oauth.provisioning.onEmailMatch` | `link`\|`conflict`\|`reject` | `link` | `AWESOME_AUTH_OAUTH_PROVISIONING_ON_EMAIL_MATCH` |
+| `oauth.provisioning.requireVerifiedEmail` | boolean | `false` | `AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL` |
+| `oauth.provisioning.allowedEmailDomains` | string[] | none — every domain | `AWESOME_AUTH_OAUTH_PROVISIONING_ALLOWED_EMAIL_DOMAINS` |
+| `oauth.provisioning.fieldMap` | map | none | — (file-only) |
+
+### 8.1 Providers
+
+A provider entry under its own name is the whole switch: configure one and
+`GET <apiPrefix>/oauth/<name>` starts a flow, configure none and every provider
+answers the reference's `404 {"error":"<Provider> OAuth not configured"}`.
+
+**`google` and `github` are the reference's two hard-coded strategies** and
+arrive as presets: the endpoints, the scopes and Google's `access_type=offline`
+come from the imported core, and a document that tries to point either of them
+at another authorization server is refused by name. Three fields are still
+yours, because none of them is an endpoint: `scope` (a deployment that needs one
+more consent scope should not have to fork a provider), `additionalAuthParams`
+(layered over the preset, so an entry replaces the preset's key of the same
+name) and `profileMap`.
+
+**Any other name is a generic OIDC/OAuth2 provider** and must bring
+`authorizationUrl`, `tokenUrl` and `userInfoUrl`. They must be `https`, with one
+carve-out: **outside production**, a loopback host (`127.0.0.1`, `::1`,
+`localhost`) may use plain `http`, because such a request never leaves the
+machine and an identity provider running beside the process has no name to hold
+a certificate for. That is the carve-out RFC 8252 §8.3 makes for the same
+reason. It stops at `deployment.environment: production`, where the premise
+fails: nothing can run beside a Lambda, and `127.0.0.1` there is the runtime
+API — so a production document pointing `tokenUrl` at loopback would POST the
+client secret to the execution environment's own control plane, and is refused.
+
+`clientSecret` is a secret-tagged knob like the signing secrets: a
+`{"secretsManager": …}` / `{"ssmParameter": …}` reference in the document, or
+`AWESOME_AUTH_OAUTH_<NAME>_CLIENT_SECRET` (development) — never a value in the
+document.
+
+`callbackUrl` is what the provider redirects back to, and it must be the URL you
+registered with that provider. The SAM template derives it —
+`<PublicUrl><ApiPrefix>/oauth/<provider>/callback` — and refuses a provider with
+no `PublicUrl` to derive it from.
+
+**A provider needs `stores.enable.linkedAccounts`, and it is not on by default.**
+The linked-accounts store is where a provider identity is bound to an account,
+and the core's callback refuses before it does anything without it: the
+authorization redirect still goes out, the person still consents, and the
+callback answers `501 {"error":"Feature not supported by the configured stores",
+"code":"NOT_IMPLEMENTED"}`. A half-wired login nobody is told about is exactly
+what `RS-11` exists to prevent, so **a configured provider with the store off
+refuses to start**, naming `stores.enable.linkedAccounts`. The SAM template sets
+`AWESOME_AUTH_STORES_ENABLE_LINKED_ACCOUNTS=true` whenever a provider parameter
+is set, so a stack deployed from it never meets this; a document-configured
+deployment has to say so itself:
+
+```json
+{"stores": {"enable": {"linkedAccounts": true, "pendingLinks": true}}}
+```
+
+`pendingLinks` in that snippet is the second store and a separate decision:
+§8.2 covers what `onEmailMatch: conflict` needs it for, and §8.3 what the state
+nonce uses it for.
+
+`projectId` is accepted because the reference carries it and nothing reads it;
+it is reported at cold start as a knob this build cannot honour, the same way
+the mailer's endpoint is.
+
+**`profileMap`** replaces the reference's `mapProfile` function with
+expressions, and is what makes a provider whose userinfo document is not
+OIDC-shaped configurable rather than code. The keys are `id` (required),
+`email`, `emailVerified`, `name` and `picture`; a value is a `??` chain of
+`$.path` segments with an optional quoted literal last, evaluated like
+JavaScript's `??` — the first alternative that resolves to something other than
+missing or null wins:
+
+```json
+{"oauth": {"providers": {"contoso": {
+  "clientId": "…",
+  "clientSecret": {"secretsManager": "awesome-auth/prod/contoso"},
+  "callbackUrl": "https://auth.example.com/auth/oauth/contoso/callback",
+  "authorizationUrl": "https://login.contoso.example/oauth2/v2.0/authorize",
+  "tokenUrl": "https://login.contoso.example/oauth2/v2.0/token",
+  "userInfoUrl": "https://graph.contoso.example/v1.0/me",
+  "scope": "openid email profile",
+  "profileMap": {
+    "id": "$.id",
+    "email": "$.mail ?? $.userPrincipalName",
+    "name": "$.displayName"
+  }}}}}
+```
+
+An expression that does not compile **refuses the cold start**, naming the
+provider and the field, rather than producing a provider that 500s on its first
+callback.
+
+### 8.2 The provisioning policy
+
+The reference has no policy: `findOrCreateUser` is abstract and every integrator
+writes the function (`generic-oauth.strategy.ts:169-172`). A deployable product
+cannot ask for a function, so the policy is declared. The defaults reproduce
+what a permissive `findOrCreateUser` does — create missing accounts, link a
+matching address — so a deployment that configures only a provider behaves the
+way the family's demos do.
+
+| Knob | What it decides |
+|---|---|
+| `autoCreate` | May the callback create an account for a provider identity nothing here knows yet? With `false`, the answer is `403 OAUTH_USER_NOT_PROVISIONED` and accounts come from `/register`, an invitation or an admin. |
+| `onEmailMatch` | The provider account is unknown, but some account already holds the address it asserts. `link` signs that account in and records the binding; `conflict` raises the reference's `OAUTH_ACCOUNT_CONFLICT` — a 302 to `/account-conflict` where the front end drives `/link-request` and `/link-verify`, so the link is made only after an emailed token proves the address; `reject` refuses outright. **`conflict` needs `stores.enable.pendingLinks`** — see below. |
+| `requireVerifiedEmail` | Refuse a profile whose `emailVerified` is not positively true (`403 OAUTH_EMAIL_NOT_VERIFIED`). Most providers send no claim at all, so turning this on for one of them refuses every login through it. |
+| `allowedEmailDomains` | Bare domains, matched case-insensitively on the part after the last `@`, with no subdomain matching. Empty admits every address; non-empty refuses a profile with no address at all. |
+| `fieldMap` | Fills `firstName`, `lastName`, `phoneNumber` and `role` on an account the callback **creates**, with `profileMap` expressions over the same userinfo document. A key outside that list, or a value that does not compile, refuses the cold start. |
+
+**`onEmailMatch` is a knob rather than a constant on purpose.** Linking by
+address is the account-takeover shape the reference's own store interface warns
+about — two providers can assert one address without representing one person —
+and the imported core's default is to link. Hardcoding either answer would put a
+security posture in a binary where no operator can see it;
+[`docs/spec/decisions.md`](spec/decisions.md) D-20 argues the default.
+
+**`conflict` is the one mode with a store dependency.** Its entire answer to a
+conflict is to *stash* it — address, provider, provider account id — so that the
+`/link-request` the front end makes next can resolve who is being linked to
+what. That stash lives in `stores.enable.pendingLinks`, which is off by default
+(only `users`, `sessions` and `tokens` are on). With the store off the core
+skips the stash silently: the browser is still sent to
+`/account-conflict?provider=…&code=OAUTH_ACCOUNT_CONFLICT&email=…`, and
+`/link-request` then has nothing to identify. So **`onEmailMatch: conflict` with
+`stores.enable.pendingLinks` off refuses to start** (`RS-11`), naming the mode
+and pointing at the store. `link` and `reject` have no such dependency — but see
+§8.3 for the other thing that store buys.
+
+### 8.3 Redirects, and the one rule that refuses to start
+
+Where the callback sends the browser is decided by the same two values every
+emailed link is built from (§5.1): the canonical site, and the allowlist
+`email.siteUrls` ∪ `http.cors.origins`. The flow carries the origin it started
+from inside a signed `state`, and the callback honours it only if it is still
+allowlisted; anything else falls back to the canonical site.
+
+**A configured provider with an empty allowlist refuses to start** (rule
+`RS-11`). The callback answers with a fresh session in a `Set-Cookie`, so where
+it sends the browser is a credential-bearing redirect, and with nothing
+allowlisted the reference honours whatever origin the state names
+(`docs/spec/reference-issues.md` N1). The core signs its states, which is why it
+can reproduce that behaviour safely for an embedder; a deployment also has to
+survive the day the signing secret is what went wrong, and an allowlist is the
+defence that does not depend on the signature holding.
+
+**The state's other defence is a store key.** `stores.enable.pendingLinks` is
+also where the flow records the state's nonce on the way out and consumes it on
+the way back, which is what makes a state single-use rather than replayable for
+the whole of its TTL. With the key off — the default — the core skips both
+halves and falls back to the reference's behaviour: signed and time-bounded,
+replayable in between. That is not refused, because it is not a broken
+deployment; it is reported at every cold start on the `configured knob is not
+wired to the auth core` line (§2), with the path and the remedy. Turn it on and
+the nonce becomes single-use.
+
+### 8.4 What the callback does not do yet
+
+The reference's callback is 2FA-aware: an account with a second factor is
+redirected to `${redirectTo}/auth/2fa?tempToken=…&methods=…` instead of being
+handed a session (`auth.router.ts:1298-1313`). The imported core has no such
+branch — it issues a session for every account it resolves — and this product
+does not fork the core, so **a federated login skips the second factor a
+password login demands**. A deployment that requires 2FA and also configures an
+OAuth provider should know that before it turns one on.
+
+It is not silent. It is registered as the product deviation
+`oauth-callback-skips-the-second-factor`, so every cold start announces it
+([`docs/deviations.md`](deviations.md)), and `cmd/auth/oauth_test.go` pins both
+halves — that `POST /login` on such an account does answer the challenge, and
+that the callback does not — so the test fails the day upstream grows the
+branch, which is the signal to delete this paragraph and the register entry.
+
+## 9. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that

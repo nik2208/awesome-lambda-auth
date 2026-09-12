@@ -116,12 +116,14 @@ Built-in providers (endpoints/scopes hardcoded per provider in the reference; ct
 | `oauth.providers.google.projectId` | string | optional | — | `AWESOME_AUTH_OAUTH_GOOGLE_PROJECT_ID` |
 | `oauth.providers.github.clientId` / `.clientSecret` / `.callbackUrl` | strings | none | as Google (secret marked) (RS-11) | `AWESOME_AUTH_OAUTH_GITHUB_CLIENT_ID` etc. |
 
+A built-in provider takes its endpoints and its default scopes from the port's preset and may not override the three endpoint knobs (refused by name). The three fields that are not an endpoint — `scope`, `additionalAuthParams` (layered over the preset, an entry replacing the preset's key of the same name) and `profileMap` — are accepted on a built-in name too: a deployment that needs one more consent scope must not have to fork a provider for it. `projectId` is accepted and read by nothing, here and in the reference; the product reports it at cold start as an unhonoured knob rather than dropping it silently.
+
 Generic providers — `GenericOAuthProviderConfig` is already ~90% declarative in the reference (`src/strategies/oauth/generic-oauth.strategy.ts:39-78`); each entry under `oauth.providers.<name>`:
 
 | Path (per provider) | Type | Default (code) | Validation |
 |---|---|---|---|
 | `clientId`, `clientSecret`, `callbackUrl` | strings | none | required; `clientSecret` `[secret]` |
-| `authorizationUrl`, `tokenUrl`, `userInfoUrl` | strings | none | https URLs |
+| `authorizationUrl`, `tokenUrl`, `userInfoUrl` | strings | none | https URLs, **except on a loopback host outside production** (`127.0.0.0/8`, `::1`, `localhost`), where plain http is accepted: the request never leaves the machine, and a provider running beside the process has no name to hold a certificate for — the carve-out RFC 8252 §8.3 makes for the same reason. The carve-out stops at `deployment.environment: production`, where its premise does not hold: nothing runs beside a Lambda, and loopback there is the runtime API |
 | `scope` | string | none | — |
 | `additionalAuthParams` | map | none | string values |
 | `profileMap` | map | `[new]` — replaces the `mapProfile` fn, whose default is `id: raw.id ?? raw.sub`, `email: raw.email` (`src/strategies/oauth/generic-oauth.strategy.ts:155-156`) | JSONPath / fallback-chain expressions, e.g. `email: "$.mail ?? $.userPrincipalName"` (§3.3) |
@@ -130,10 +132,11 @@ Provisioning policy — replaces the abstract `findOrCreateUser(profile, state)`
 
 | Path | Type | Default | Validation | Env var |
 |---|---|---|---|---|
-| `oauth.provisioning.autoCreate` | boolean | `[new]` | — | `AWESOME_AUTH_OAUTH_PROVISIONING_AUTO_CREATE` |
+| `oauth.provisioning.autoCreate` | boolean | `[new]` — product default `true`, which is what a permissive `findOrCreateUser` does | — | `AWESOME_AUTH_OAUTH_PROVISIONING_AUTO_CREATE` |
 | `oauth.provisioning.allowedEmailDomains` | string[] | `[new]` — empty = all | valid domains | `AWESOME_AUTH_OAUTH_PROVISIONING_ALLOWED_EMAIL_DOMAINS` |
-| `oauth.provisioning.fieldMap` | map | `[new]` | as `profileMap` | — (file-only) |
-| `oauth.provisioning.requireVerifiedEmail` | boolean | `[new]` | — | `AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL` |
+| `oauth.provisioning.onEmailMatch` | `link`\|`conflict`\|`reject` | `[new]` — product knob, default `link`; the reference decides this in the integrator's `findOrCreateUser` and has no knob ([decisions.md](decisions.md) D-20) | enum | `AWESOME_AUTH_OAUTH_PROVISIONING_ON_EMAIL_MATCH` |
+| `oauth.provisioning.fieldMap` | map | `[new]` | as `profileMap`; keys `firstName`, `lastName`, `phoneNumber`, `role` | — (file-only) |
+| `oauth.provisioning.requireVerifiedEmail` | boolean | `[new]` — default `false` | — | `AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL` |
 
 ### 1.8 Two-factor (`twoFactor.*`)
 
@@ -321,7 +324,7 @@ Deployment (stack create/update) and cold start MUST abort with a loud, named er
 | RS-8 | `resourceServer.enabled: true` without a well-formed https `jwksUrl` | **silent** — validated only at first request | `src/services/jwks.service.ts:111` (deploy-time reachability probe: warn-only, endpoints may come up later) |
 | RS-9 | Any TTL knob (`security.jwt.*Ttl`, `idProvider.*Ttl`, `admin.sessionTtl`) fails ms-syntax parsing | **silent** — refresh TTL falls back to 7 d for session expiry while `jwt.sign` may reject the same string | `src/router/auth.router.ts:357-360` |
 | RS-10 | `admin.accessPolicy: first-user` with a store driver lacking `listUsers` | 500 at request time `{error:'accessPolicy: first-user requires IUserStore.listUsers to be implemented'}` | `src/router/admin.router.ts:372-379` |
-| RS-11 | Any `oauth.providers.<name>` block present but missing `clientId`, `clientSecret`, or `callbackUrl` | constructor throw `AuthError('… OAuth not configured', 'OAUTH_NOT_CONFIGURED', 500)` — the one case the reference already fails fast | `src/strategies/oauth/google.strategy.ts:15-17`, `src/strategies/oauth/github.strategy.ts:16` |
+| RS-11 | Any `oauth.providers.<name>` block present but missing `clientId`, `clientSecret`, or `callbackUrl`; **or** any provider configured while the redirect allowlist (`email.siteUrls` ∪ `http.cors.origins`) is empty; **or** any provider configured while `stores.enable.linkedAccounts` is off; **or** `oauth.provisioning.onEmailMatch: conflict` with a provider configured while `stores.enable.pendingLinks` is off | completeness: constructor throw `AuthError('… OAuth not configured', 'OAUTH_NOT_CONFIGURED', 500)` — the one case the reference already fails fast. Allowlist: **silent** — with nothing allowlisted the callback honours whatever origin the signed `state` names, and that callback answers with a session in a `Set-Cookie`, so the open redirect carries the flow's own credential ([reference-issues.md](reference-issues.md) N1). Stores: **n/a** — product rule. Both stores default to off (§1.16), and the reference has neither switch: the port's callback returns `NOT_IMPLEMENTED` (501) without `linkedAccounts`, *after* the browser has been redirected and the person has consented, and drops the conflict stash silently without `pendingLinks`, leaving the `/account-conflict` redirect with nothing for `/link-request` to resolve | `src/strategies/oauth/google.strategy.ts:15-17`, `src/strategies/oauth/github.strategy.ts:16`; allowlist `src/router/auth.router.ts:213-219`, `:325-351`; stash `src/router/auth.router.ts:1349-1351` |
 | RS-12 | `stores.driver: memory` in a production deployment | n/a — product rule (multi-instance Lambda makes in-memory stores incoherent) | — |
 
 Related but not startup rules: **(a)** cookie Max-Age desync (extract seed 11) is eliminated structurally — Max-Age is derived from the TTL knobs (§1.2), so there is nothing to check; **(b)** `PUT /admin/api/settings` persisting arbitrary unvalidated keys (`src/router/admin.router.ts:961-971`, extract seed 14) becomes a **runtime** validation: mutations are validated against the §1.19 schema and unknown keys rejected with 400.

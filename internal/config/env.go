@@ -202,6 +202,7 @@ func envBindings() []envBinding {
 		envBool("AWESOME_AUTH_OAUTH_PROVISIONING_AUTO_CREATE", "oauth.provisioning.autoCreate", func(c *Config, v bool) { c.OAuth.Provisioning.AutoCreate = v }),
 		envList("AWESOME_AUTH_OAUTH_PROVISIONING_ALLOWED_EMAIL_DOMAINS", "oauth.provisioning.allowedEmailDomains", func(c *Config, v []string) { c.OAuth.Provisioning.AllowedEmailDomains = v }),
 		envBool("AWESOME_AUTH_OAUTH_PROVISIONING_REQUIRE_VERIFIED_EMAIL", "oauth.provisioning.requireVerifiedEmail", func(c *Config, v bool) { c.OAuth.Provisioning.RequireVerifiedEmail = v }),
+		envString("AWESOME_AUTH_OAUTH_PROVISIONING_ON_EMAIL_MATCH", "oauth.provisioning.onEmailMatch", func(c *Config, v string) { c.OAuth.Provisioning.OnEmailMatch = v }),
 
 		// §1.8 two-factor
 		envString("AWESOME_AUTH_2FA_APP_NAME", "twoFactor.appName", func(c *Config, v string) { c.TwoFactor.AppName = v }),

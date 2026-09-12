@@ -63,20 +63,24 @@ type domain struct {
 // ClaimsWebhook (cmd/auth claims.go). The claims webhook gained a required
 // signing secret with the wiring, for the reason the Webhook type gives.
 //
+// OAuth (P4) closed the `oauth` block, secret prefix included: every entry of
+// `oauth.providers` becomes a provider in the core's registry — the two built-in
+// names over the core's presets, any other name over the endpoints the document
+// supplies — and `oauth.provisioning` becomes the policy the callback resolves
+// an identity under (cmd/auth oauth.go). A clientSecret supplied through its
+// documented environment variable therefore no longer needs a secretPrefix to
+// be noticed: it is read, and RS-11 refuses the provider that has none.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
-// key end up, since SES is reached by API and not by URL.
+// key end up, since SES is reached by API and not by URL, and where
+// `oauth.providers.<name>.projectId` ends up, since the core's provider has no
+// field for it.
 //
 // Everything below is defined, validated and refused.
 func unwiredDomains() []domain {
 	return []domain{
-		{
-			path:         "oauth",
-			phase:        "P4 (OAuth and account linking)",
-			get:          func(c *Config) any { return c.OAuth },
-			secretPrefix: "oauth.",
-		},
 		{
 			path:         "idProvider",
 			phase:        "P5 (identity provider and JWKS)",

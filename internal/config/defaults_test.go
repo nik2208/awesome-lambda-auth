@@ -55,6 +55,14 @@ func TestDefaultsMatchSpec(t *testing.T) {
 		// §1.6 SMS
 		{"sms.codeTtlMinutes", c.SMS.CodeTTLMinutes, 10},
 
+		// §1.7 OAuth provisioning — the policy the imported core applies with no
+		// policy at all (auth.DefaultOAuthProvisioning), spelled out because an
+		// explicit policy is taken at its word and a zero AutoCreate would
+		// refuse every first login through a provider.
+		{"oauth.provisioning.autoCreate", c.OAuth.Provisioning.AutoCreate, true},
+		{"oauth.provisioning.onEmailMatch", c.OAuth.Provisioning.OnEmailMatch, OAuthEmailMatchLink},
+		{"oauth.provisioning.requireVerifiedEmail", c.OAuth.Provisioning.RequireVerifiedEmail, false},
+
 		// §1.8 two-factor
 		{"twoFactor.appName", c.TwoFactor.AppName, "awesome-node-auth"},
 

@@ -205,7 +205,15 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 	coreOpts = append(coreOpts, claimsOpts...)
-	coreOpts = append(coreOpts, oauthOptions(cfg, users, deliver, log)...)
+	// OAuth: the provider registry and the provisioning policy. It refuses for
+	// a profileMap or a fieldMap that does not compile, so a mapping expression
+	// is a failed deployment rather than a provider that 500s on its first
+	// callback.
+	oauthOpts, err := oauthOptions(cfg, users, deliver, log)
+	if err != nil {
+		return nil, err
+	}
+	coreOpts = append(coreOpts, oauthOpts...)
 
 	core, err := auth.New(coreOpts...)
 	if err != nil {
@@ -339,85 +347,6 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 			log.Warn("auth core", slog.String("message", fmt.Sprintf(format, args...)))
 		}),
 	}
-}
-
-// oauthStoreProvider is what this binary needs from a store to back the
-// account-linking routes.
-//
-// It is a structural assertion on the user store rather than a wider
-// StoreFactory signature, because these two are the only optional stores the auth
-// core does *not* discover by type assertion: LinkedAccountStore and
-// PendingLinkStore both declare Save and Delete, so no single type can implement
-// both, and the core takes them as explicit members of auth.OAuthWiring
-// (awesome-go-auth oauth_wire.go:170-179). Something has to hand them over, and
-// the composition root is the only place that knows which driver is in play.
-type oauthStoreProvider interface {
-	LinkedAccounts() auth.LinkedAccountStore
-	PendingLinks() auth.PendingLinkStore
-}
-
-// oauthOptions wires the OAuth side of the core: the site URL and origin
-// allowlist its redirects resolve against, and the two account-linking stores
-// when the driver has them and the operator asked for them.
-//
-// The wiring is always present, because two of its fields are not about OAuth
-// at all. OAuthWiring.SiteURL is the core's override for the default site URL
-// and OAuthWiring.AllowedOrigins joins Config.SiteURLs in its origin allowlist
-// (Auth.ResolveSiteURL, wire.go) — the same two values every emailed link is
-// built from. Both come from siteURLs in email.go, so an emailed link and an
-// OAuth redirect cannot resolve a request's origin differently, which is how
-// the reference arranges it too (one allowedOrigins, one getDefaultSiteUrl).
-// Setting SiteURL here is also what makes the canonical fallback
-// deployment.publicUrl when email.siteUrls is empty: the core's own default is
-// the first allowlisted entry, and the auth service's origin is not one.
-//
-// The stores are each gated on their own stores.enable key, which is the
-// mechanism the schema already defines for exactly this: "a disabled store
-// makes its feature routes and admin tabs absent, exactly as an absent injected
-// store does in the reference" (config.StoreEnable). With a key off, or with a
-// driver that has no view for it, the store is nil and its routes answer
-// NOT_IMPLEMENTED, which is the truth rather than a silent 500.
-//
-// OAuthWiring.Service stays nil on purpose. The provider registry comes from the
-// oauth.* configuration block, which internal/config/phases.go still refuses as a
-// P4 domain, so GET /oauth/{provider} keeps answering the reference's
-// "<Provider> OAuth not configured" stub — a configuration gap, not a store one.
-// The four account-linking routes need no provider registry and work as soon as
-// the stores are here.
-func oauthOptions(cfg *config.Config, users auth.UserStore, deliver *delivery, log *slog.Logger) []auth.Option {
-	canonical, allowlist := siteURLs(cfg)
-	wiring := auth.OAuthWiring{
-		AllowedOrigins: allowlist,
-		SiteURL:        canonical,
-	}
-	if provider, ok := users.(oauthStoreProvider); ok {
-		if cfg.Stores.Enable.LinkedAccounts {
-			wiring.LinkedAccounts = provider.LinkedAccounts()
-		}
-		if cfg.Stores.Enable.PendingLinks {
-			wiring.PendingLinks = provider.PendingLinks()
-		}
-	}
-	// DeliverLinkToken is wired whenever a mail transport exists, so POST
-	// /link-request sends the verification mail instead of storing a token
-	// nobody receives. With no mailer it is nil, and the route still answers
-	// success without sending anything — which is what the reference does with
-	// no transport configured, so the fallback is not a degradation but the
-	// unconfigured behaviour. The delivery webhook has no seam for this mail
-	// (auth.DeliveryWebhook posts the five credential kinds and nothing else),
-	// so a webhook-only deployment is in the "none" branch here.
-	delivery := "none — POST /link-request stores the token and answers success without sending mail"
-	if deliver != nil && deliver.mail != nil {
-		wiring.DeliverLinkToken = deliver.deliverLinkToken
-		delivery = "ses"
-	}
-	log.Info("oauth wiring",
-		slog.String("siteUrl", canonical),
-		slog.Int("allowedOrigins", len(allowlist)),
-		slog.Bool("linkedAccounts", wiring.LinkedAccounts != nil),
-		slog.Bool("pendingLinks", wiring.PendingLinks != nil),
-		slog.String("linkTokenDelivery", delivery))
-	return []auth.Option{auth.WithOAuth(wiring)}
 }
 
 // httpConfig maps the cookie, CSRF and prefix knobs onto the shared wire layer.
@@ -705,6 +634,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	}
 
 	gaps = append(gaps, deliveryKnobGaps(cfg)...)
+	gaps = append(gaps, oauthKnobGaps(cfg)...)
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

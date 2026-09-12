@@ -17,12 +17,13 @@ The stack deploys and the two official clients, unmodified, register, log in, re
 | Email flows (`cmd/auth/email.go`) | `email.siteUrls` resolves every emailed link per request against the allowlist it forms with `http.cors.origins`; `email.templatesDir` seeds the template store from the artifact without ever overwriting a runtime edit |
 | Token claims (`cmd/auth/claims.go`) | `security.jwt.extraClaims` maps user fields and constants into every minted token; `security.jwt.claimsWebhook` asks a signed https receiver for the rest and fails the mint closed when it cannot answer |
 | Second factor (`cmd/auth/twofactor.go`) | `twoFactor.appName` is the issuer an authenticator app labels a TOTP enrolment with |
+| OAuth (`cmd/auth/oauth.go`) | `oauth.providers` builds the registry — Google and GitHub over the core's presets, any other name as a generic provider with its own endpoints and a declarative `profileMap` — with signed state, PKCE S256 and a redirect allowlist RS-11 refuses to start without; `oauth.provisioning` decides create, link, conflict or refuse |
 | Auth surface | every route `awesome-go-auth` mounts: register, login, refresh, logout, me (now carrying `loginProvider`), sessions, password and email flows, magic link, SMS OTP, TOTP, account linking |
 | Infrastructure (`infra/sam`) | HTTP API + Lambda (`provided.al2023`, arm64) + DynamoDB + Secrets Manager, deployed with the plain AWS CLI |
 | Contract suite (`test/contract`) | black-box, parametrised on a base URL, runs against this stack or the reference Express app |
 | Examples | `examples/angular-client` (ng-awesome-node-auth from npm) and `examples/flutter-client` (awesome_node_auth_flutter from pub.dev), unmodified |
 
-Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `oauth`, `idProvider`, `resourceServer`, `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it. The whole `email` domain now loads — `email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the last three to leave that list — and so does the whole `security` domain, `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook` having left it with the token-claims block.
+Configuration domains the schema accepts but the binary does not act on yet are **refused at start** (rule `PHASE`), never silently ignored. The list is `unwiredDomains()` in [internal/config/phases.go](internal/config/phases.go); at the time of writing: `idProvider`, `resourceServer`, `ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. Each lands with the phase that wires it. Four entries left it in this round: `twoFactor`, `security.jwt.extraClaims` and `security.jwt.claimsWebhook` with the token-claims block, and the whole `oauth` domain — `oauth.providers` and `oauth.provisioning`, secret prefix included — with the OAuth block. The whole `email` and `security` domains now load too; `email.siteUrls`, `email.templatesDir` and `email.deliveryWebhook` were the three before them.
 
 ## Configuration
 
@@ -33,7 +34,7 @@ Two sources, layered:
 
 Secrets are never values in the document. A secret-tagged knob is a reference (`{"secretsManager": "<arn>#<jsonKey>"}`, `{"ssmParameter": "<name>"}`, or its environment variable), resolved at cold start in that order; the template passes them as `AWESOME_AUTH_JWT_ACCESS_SECRET_SECRETSMANAGER` and friends. A plaintext secret in the document refuses to start.
 
-What the binary reads, in the order it reads it, plus the `email` domain knob by knob, is in [docs/config-reference.md](docs/config-reference.md). The schema behind it — every default with its reference citation, and the refuse-to-start rules — is in [docs/spec/config-schema.md](docs/spec/config-schema.md).
+What the binary reads, in the order it reads it, plus the `email` and `oauth` domains knob by knob, is in [docs/config-reference.md](docs/config-reference.md). The schema behind it — every default with its reference citation, and the refuse-to-start rules — is in [docs/spec/config-schema.md](docs/spec/config-schema.md).
 
 ## Toolchain
 

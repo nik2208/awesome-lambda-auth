@@ -14,9 +14,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		domain string
 		mutate func(Document)
 	}{
-		{"oauth", func(doc Document) {
-			set(doc, "oauth.provisioning.autoCreate", true)
-		}},
 		{"idProvider", func(doc Document) {
 			set(doc, "idProvider.issuer", "https://auth.example.com")
 		}},
@@ -588,6 +585,95 @@ func TestTemplatesDirRequiresTheTemplateStore(t *testing.T) {
 	d := requireRule(t, err, RuleStoreRequired, "stores.enable.templates")
 	if !strings.Contains(d.Problem, "email.templatesDir") {
 		t.Errorf("the diagnostic does not name the knob that needs the store:\n%s", d.Problem)
+	}
+}
+
+// TestOAuthDomainIsWired is the P4 counterpart of TestEmailFlowDomainsAreWired:
+// the whole oauth block loads now — the two built-in providers, a generic one,
+// and the provisioning policy — instead of tripping the phase gap.
+//
+// Each case is written the way the schema requires it, so the test also pins
+// that un-gating relaxed nothing: every provider needs its three required
+// values (RS-11), and the deployment needs a redirect allowlist.
+func TestOAuthDomainIsWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+		env    func(map[string]string)
+	}{
+		{"a built-in provider", func(doc Document) {
+			set(doc, "oauth.providers.google.clientId", "123.apps.googleusercontent.com")
+			set(doc, "oauth.providers.google.callbackUrl", "https://auth.example.com/auth/oauth/google/callback")
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET"] = "google-client-secret"
+		}},
+		{"a generic provider", func(doc Document) {
+			set(doc, "oauth.providers.acme.clientId", "acme-client")
+			set(doc, "oauth.providers.acme.callbackUrl", "https://auth.example.com/auth/oauth/acme/callback")
+			set(doc, "oauth.providers.acme.authorizationUrl", "https://idp.example.com/authorize")
+			set(doc, "oauth.providers.acme.tokenUrl", "https://idp.example.com/token")
+			set(doc, "oauth.providers.acme.userInfoUrl", "https://idp.example.com/userinfo")
+			set(doc, "oauth.providers.acme.scope", "openid email")
+			set(doc, "oauth.providers.acme.profileMap", map[string]any{"id": "$.sub", "email": "$.mail ?? $.userPrincipalName"})
+		}, func(env map[string]string) {
+			env["AWESOME_AUTH_OAUTH_ACME_CLIENT_SECRET"] = "acme-client-secret"
+		}},
+		{"the provisioning policy", func(doc Document) {
+			set(doc, "oauth.provisioning.autoCreate", false)
+			set(doc, "oauth.provisioning.onEmailMatch", "conflict")
+			set(doc, "oauth.provisioning.requireVerifiedEmail", true)
+			set(doc, "oauth.provisioning.allowedEmailDomains", []any{"example.com"})
+			set(doc, "oauth.provisioning.fieldMap", map[string]any{"firstName": "$.given_name"})
+		}, nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			// Every OAuth deployment needs both of these (RS-11) — a redirect
+			// allowlist, and the store the callback binds a provider identity
+			// in — so they belong in the baseline of each case rather than in
+			// the three mutators.
+			set(doc, "email.siteUrls", []any{"https://app.example.com"})
+			set(doc, "stores.enable.linkedAccounts", true)
+			tc.mutate(doc)
+			env := baseEnv()
+			if tc.env != nil {
+				tc.env(env)
+			}
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if err != nil {
+				t.Fatalf("the oauth domain is wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if w.Path == "oauth" && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("oauth is still reported as an unwired domain: %s", w.Problem)
+				}
+			}
+			if _, gated := UnwiredDomains()["oauth"]; gated {
+				t.Error("oauth is still listed by UnwiredDomains")
+			}
+		})
+	}
+}
+
+// TestOAuthClientSecretNoLongerTripsThePhaseGap: the oauth domain carried a
+// secretPrefix, and removing the domain has to remove that half too — otherwise
+// an operator who puts a provider's client secret in Secrets Manager gets a
+// refusal for a block that works.
+func TestOAuthClientSecretNoLongerTripsThePhaseGap(t *testing.T) {
+	env := baseEnv()
+	env["AWESOME_AUTH_OAUTH_GITHUB_CLIENT_ID"] = "Iv1.0123456789abcdef"
+	env["AWESOME_AUTH_OAUTH_GITHUB_CLIENT_SECRET"] = "github-client-secret"
+	env["AWESOME_AUTH_OAUTH_GITHUB_CALLBACK_URL"] = "https://auth.example.com/auth/oauth/github/callback"
+
+	doc := baseDoc()
+	set(doc, "email.siteUrls", []any{"https://app.example.com"})
+	set(doc, "stores.enable.linkedAccounts", true)
+
+	if _, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)}); err != nil {
+		t.Fatalf("an OAuth client secret must not reopen the phase gap:\n%v", err)
 	}
 }
 

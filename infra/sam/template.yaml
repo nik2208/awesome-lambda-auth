@@ -60,6 +60,8 @@ Metadata:
         Parameters: [EmailSiteUrls, EmailDeliveryWebhookUrl, EmailDeliveryWebhookSecretArn]
       - Label: {default: Second factor and token claims}
         Parameters: [TotpIssuer, ClaimsWebhookUrl, ClaimsWebhookTimeoutMs, ClaimsWebhookSecretArn]
+      - Label: {default: OAuth providers}
+        Parameters: [OAuthGoogleClientId, OAuthGoogleClientSecretArn, OAuthGithubClientId, OAuthGithubClientSecretArn]
       - Label: {default: Configuration document}
         Parameters: [ConfigFile]
       - Label: {default: Storage}
@@ -90,6 +92,15 @@ Parameters:
   PublicUrl:
     Type: String
     Default: ''
+    # An origin and nothing else: no path, no trailing slash. The OAuth callback
+    # variables below are !Sub '${PublicUrl}${ApiPrefix}/oauth/<name>/callback',
+    # and that value has to byte-match the URL registered with the provider —
+    # "https://auth.example.com/" would produce a second slash and a redirect_uri
+    # the provider rejects. Empty stays allowed; it is the default.
+    AllowedPattern: '^$|^https?://[^/]+$'
+    ConstraintDescription: >-
+      PublicUrl must be a bare origin such as https://auth.example.com — scheme
+      and host only, with no path and no trailing slash — or empty.
     Description: >-
       AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL — the origin clients actually reach,
       e.g. https://auth.example.com. Empty leaves the variable unset, which is
@@ -104,7 +115,15 @@ Parameters:
   ApiPrefix:
     Type: String
     Default: /auth
-    AllowedPattern: '^/[A-Za-z0-9._~/-]*$'
+    # One or more non-empty segments, each beginning with a slash. The old
+    # pattern admitted a bare "/" and a trailing slash, both of which put a
+    # second slash into the derived OAuth callback URL — see PublicUrl.
+    AllowedPattern: '^/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*$'
+    ConstraintDescription: >-
+      ApiPrefix must be one or more path segments, each introduced by a slash and
+      none of them empty — e.g. /auth or /api/auth. A bare "/" and a trailing
+      slash are both refused: they would double the slash in the derived OAuth
+      callback URL.
     Description: AWESOME_AUTH_HTTP_API_PREFIX. Path the auth routes mount under.
 
   AllowedOrigins:
@@ -368,6 +387,69 @@ Parameters:
       The function reads it at cold start; the value never enters the template.
 
   # -----------------------------------------------------------------------
+  # OAuth providers (config-schema.md §1.7). The two built-in names only: their
+  # endpoints and scopes are fixed, so a client id and a client secret are the
+  # whole configuration, and the callback URL is DERIVED rather than asked for
+  # (PublicUrl + ApiPrefix + /oauth/<provider>/callback) — a URL the operator
+  # typed and a URL the function serves that disagree is a flow that dead-ends
+  # at the provider's redirect_uri check, so there is nothing to be gained by
+  # letting them differ. Register that same URL with the provider.
+  #
+  # A generic provider needs three endpoints, a scope and usually a profile map,
+  # which is more structure than a flat parameter list can carry: configure it
+  # in the JSON document (ConfigFile) instead, where every knob of §1.7 is
+  # available and its client secret is a {"secretsManager": …} reference.
+  #
+  # Empty client id = provider off. Setting one also switches
+  # AWESOME_AUTH_STORES_ENABLE_LINKED_ACCOUNTS on, because that store is where
+  # the callback binds a provider identity to an account and RS-11 refuses a
+  # provider without it.
+  #
+  # The Rules section below refuses the parameter combinations that would deploy
+  # a stack whose cold start then fails: a provider without PublicUrl (always,
+  # since the callback URL is derived here), and — only when no ConfigFile is
+  # supplied, because a document can answer both — a provider without a redirect
+  # allowlist or without its client secret.
+  # -----------------------------------------------------------------------
+
+  OAuthGoogleClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_ID — the OAuth client id from the Google
+      Cloud console, e.g. 123456789-abc.apps.googleusercontent.com. Empty
+      switches Google sign-in off, and GET <ApiPrefix>/oauth/google then answers
+      the reference's 404 stub. A client id is not a secret; the client SECRET
+      is, and it goes in OAuthGoogleClientSecretArn.
+
+  OAuthGoogleClientSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    Description: >-
+      ARN of an existing Secrets Manager secret holding the Google OAuth client
+      secret. REQUIRED whenever OAuthGoogleClientId is set. Nothing is generated
+      for you: the value comes from the provider's console, and only you can put
+      it there. Append #<jsonKey> to select one key of a JSON secret document.
+      The function reads it at cold start; the value never enters the template.
+
+  OAuthGithubClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_OAUTH_GITHUB_CLIENT_ID — the client id of the GitHub OAuth
+      app, e.g. Iv1.0123456789abcdef. Empty switches GitHub sign-in off.
+
+  OAuthGithubClientSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$'
+    Description: >-
+      ARN of an existing Secrets Manager secret holding the GitHub OAuth client
+      secret. REQUIRED whenever OAuthGithubClientId is set. As above: supplied,
+      never generated, and read by the function at cold start.
+
+  # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
   # OAuth profile maps, rate-limit scopes) have no environment variable by
   # design; they arrive as a JSON document baked into the artifact by
@@ -467,11 +549,131 @@ Conditions:
   HasClaimsWebhook: !Not [!Equals [!Ref ClaimsWebhookUrl, '']]
   HasClaimsWebhookSecret: !Not [!Equals [!Ref ClaimsWebhookSecretArn, '']]
   HasConfigFile: !Not [!Equals [!Ref ConfigFile, '']]
+  HasOAuthGoogle: !Not [!Equals [!Ref OAuthGoogleClientId, '']]
+  HasOAuthGithub: !Not [!Equals [!Ref OAuthGithubClientId, '']]
+  HasAnyOAuthProvider: !Or [!Condition HasOAuthGoogle, !Condition HasOAuthGithub]
   # A named stage on the raw execute-api URL puts /<stage> in front of every
   # path the browser sees, so the Path-scoped refresh cookie has to match.
   NeedsStagePrefixedCookiePath: !And
     - !Not [!Condition IsDefaultStage]
     - !Not [!Condition HasPublicUrl]
+
+# ---------------------------------------------------------------------------
+# Rules are evaluated before a changeset is created, which is the only place a
+# parameter combination can be refused with the stack still running — it turns
+# an init failure and a rollback into a message before anything is touched.
+#
+# What a Rule can see is the limit of what it may assert. Rules resolve against
+# parameters and nothing else: not Conditions, not Resources, and — the one that
+# matters here — not the contents of ConfigFile, which is a full JSON
+# configuration document and a first-class source for every knob of
+# config-schema.md §1. email.siteUrls, http.cors.origins and a provider's
+# clientSecret as a {"secretsManager": …} reference are all legitimately
+# supplied there, so a rule that asserts the corresponding *parameter* is
+# non-empty would refuse a stack the function would start happily.
+#
+# So each rule below falls into one of two shapes:
+#
+#   * parameter-only — the value has no document equivalent because this
+#     template is what consumes it. OAuthCallbacksNeedAPublicUrl is the only
+#     one: the callback env var is derived here, by !Sub, from PublicUrl.
+#   * document-aware — the knob can come from either source, so the rule also
+#     asserts ConfigFile is empty and steps aside when a document is supplied.
+#     The cold-start rules then do the checking, and they see both sources
+#     (config-schema.md §2, RS-11).
+# ---------------------------------------------------------------------------
+Rules:
+
+  # The callback URL registered with the provider is PublicUrl + ApiPrefix +
+  # /oauth/<provider>/callback. It cannot be derived from this stack's own
+  # execute-api URL: referencing HttpApi from the function's environment is a
+  # circular dependency (see the note on AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL), and
+  # a raw execute-api URL is the wrong thing to register with a provider anyway.
+  OAuthCallbacksNeedAPublicUrl:
+    RuleCondition: !Or
+      - !Not [!Equals [!Ref OAuthGoogleClientId, '']]
+      - !Not [!Equals [!Ref OAuthGithubClientId, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref PublicUrl, '']]
+        AssertDescription: >-
+          An OAuth provider needs PublicUrl. The callback URL this stack serves is
+          <PublicUrl><ApiPrefix>/oauth/<provider>/callback, and it is the URL you
+          register with Google or GitHub; with PublicUrl empty there is no origin
+          to build it from. Set PublicUrl to the custom domain clients reach.
+
+  # RS-11's second half: the callback answers with a fresh session in a
+  # Set-Cookie and decides where to send the browser from the origin inside the
+  # state. With nothing allowlisted, any origin the state names is honoured
+  # (reference-issues N1), so the function refuses to start.
+  #
+  # Document-aware: email.siteUrls and http.cors.origins are both knobs a
+  # ConfigFile can carry, and a Rule cannot read one. With a document supplied
+  # this steps aside and RS-11 does the checking at cold start, where both
+  # sources are visible.
+  OAuthNeedsARedirectAllowlist:
+    RuleCondition: !And
+      - !Or
+        - !Not [!Equals [!Ref OAuthGoogleClientId, '']]
+        - !Not [!Equals [!Ref OAuthGithubClientId, '']]
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref EmailSiteUrls, '']]
+          - !Not [!Equals [!Ref AllowedOrigins, '']]
+        AssertDescription: >-
+          An OAuth provider needs a redirect allowlist (refuse-to-start rule RS-11).
+          Set EmailSiteUrls to the front-end origins the callback may send a browser
+          back to — they are also the base of every emailed link — or AllowedOrigins
+          if this deployment only ever redirects to its CORS origins.
+
+  # A client id with no secret is a provider that fails RS-11 at cold start; a
+  # secret ARN with no client id is a Secrets Manager entry nothing reads and a
+  # sign-in button nobody gets.
+  #
+  # The first of each pair is document-aware: clientSecret is a secret-tagged
+  # knob, so a document may reference it as {"secretsManager": …} without this
+  # parameter. The second is parameter-only and stays unconditional — the secret
+  # env var below is emitted only when the *parameter* client id is set, so an
+  # ARN parameter with an empty client id parameter really is read by nothing,
+  # whatever the document says.
+  GoogleOAuthNeedsItsClientSecret:
+    RuleCondition: !And
+      - !Not [!Equals [!Ref OAuthGoogleClientId, '']]
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OAuthGoogleClientSecretArn, '']]
+        AssertDescription: >-
+          OAuthGoogleClientId is set, so OAuthGoogleClientSecretArn must name the
+          Secrets Manager secret holding the client secret. The token exchange
+          presents it; without one the provider block is incomplete (RS-11).
+
+  GoogleOAuthSecretNeedsItsClientId:
+    RuleCondition: !Not [!Equals [!Ref OAuthGoogleClientSecretArn, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OAuthGoogleClientId, '']]
+        AssertDescription: >-
+          OAuthGoogleClientSecretArn is set but OAuthGoogleClientId is empty, so no
+          Google provider is configured and the secret would be read by nothing.
+          Set the client id, or clear the ARN.
+
+  GithubOAuthNeedsItsClientSecret:
+    RuleCondition: !And
+      - !Not [!Equals [!Ref OAuthGithubClientId, '']]
+      - !Equals [!Ref ConfigFile, '']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OAuthGithubClientSecretArn, '']]
+        AssertDescription: >-
+          OAuthGithubClientId is set, so OAuthGithubClientSecretArn must name the
+          Secrets Manager secret holding the client secret (RS-11).
+
+  GithubOAuthSecretNeedsItsClientId:
+    RuleCondition: !Not [!Equals [!Ref OAuthGithubClientSecretArn, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OAuthGithubClientId, '']]
+        AssertDescription: >-
+          OAuthGithubClientSecretArn is set but OAuthGithubClientId is empty, so no
+          GitHub provider is configured and the secret would be read by nothing.
+          Set the client id, or clear the ARN.
 
 Resources:
 
@@ -797,6 +999,50 @@ Resources:
             - !Ref ClaimsWebhookSecretArn
             - !Ref 'AWS::NoValue'
 
+          # --- OAuth providers -------------------------------------------
+          # Three variables per provider, set as a group or not at all: the
+          # client id, the callback URL derived from the origin this deployment
+          # is reached at, and a REFERENCE to the client secret (never the
+          # secret). The Rules section refuses a client id without PublicUrl, so
+          # the !Sub below always has an origin to build on.
+          #
+          # The callback URL must be byte-identical to the one registered with
+          # the provider, which is why it is derived here and not typed: the
+          # provider checks redirect_uri against its own registration, and the
+          # function sends the value of this variable. PublicUrl and ApiPrefix
+          # both carry AllowedPatterns that forbid a trailing slash, so the two
+          # !Subs below can only ever produce one slash before "oauth".
+          #
+          # The linked-accounts store is switched on with them, and it is not
+          # optional: it is where the callback binds a provider identity to an
+          # account, and with it off the core answers the callback 501 after the
+          # person has already consented. RS-11 refuses that combination at cold
+          # start, so this line is what keeps a provider-configured stack
+          # startable — it is set here rather than left to the operator because
+          # the store is a consequence of configuring a provider, not a separate
+          # decision. stores.enable.pendingLinks is a separate decision and stays
+          # document-only: it buys the single-use state nonce, and RS-11 requires
+          # it only for oauth.provisioning.onEmailMatch: conflict.
+          AWESOME_AUTH_STORES_ENABLE_LINKED_ACCOUNTS: !If [HasAnyOAuthProvider, 'true', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_ID: !If [HasOAuthGoogle, !Ref OAuthGoogleClientId, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_OAUTH_GOOGLE_CALLBACK_URL: !If
+            - HasOAuthGoogle
+            - !Sub '${PublicUrl}${ApiPrefix}/oauth/google/callback'
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET_SECRETSMANAGER: !If
+            - HasOAuthGoogle
+            - !Ref OAuthGoogleClientSecretArn
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_OAUTH_GITHUB_CLIENT_ID: !If [HasOAuthGithub, !Ref OAuthGithubClientId, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_OAUTH_GITHUB_CALLBACK_URL: !If
+            - HasOAuthGithub
+            - !Sub '${PublicUrl}${ApiPrefix}/oauth/github/callback'
+            - !Ref 'AWS::NoValue'
+          AWESOME_AUTH_OAUTH_GITHUB_CLIENT_SECRET_SECRETSMANAGER: !If
+            - HasOAuthGithub
+            - !Ref OAuthGithubClientSecretArn
+            - !Ref 'AWS::NoValue'
+
           # --- configuration document ------------------------------------
           # A path inside the artifact, never a value: the document is part of
           # the reproducible zip, so what the function reads is what was built.
@@ -964,6 +1210,27 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Select [0, !Split ['#', !Ref ClaimsWebhookSecretArn]]
+          - !Ref 'AWS::NoValue'
+
+        # -----------------------------------------------------------------
+        # The OAuth client secrets, one ARN per configured provider and nothing
+        # else — the '#<jsonKey>' selector stripped, because the selector is the
+        # function's and the resource is the secret. A stack with one provider
+        # grants one read; a stack with none grants nothing at all, which is why
+        # this is a separate statement rather than two more entries on the
+        # signing-secret one.
+        # -----------------------------------------------------------------
+        - !If
+          - HasAnyOAuthProvider
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOAuthClientSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !If [HasOAuthGoogle, !Select [0, !Split ['#', !Ref OAuthGoogleClientSecretArn]], !Ref 'AWS::NoValue']
+                  - !If [HasOAuthGithub, !Select [0, !Split ['#', !Ref OAuthGithubClientSecretArn]], !Ref 'AWS::NoValue']
           - !Ref 'AWS::NoValue'
 
         # -----------------------------------------------------------------

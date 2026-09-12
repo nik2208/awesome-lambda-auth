@@ -47,7 +47,7 @@ import (
 // stores.enable.templates hands the core a TemplateStore, which its ready-made
 // mailers consult before the built-in templates (MailTemplater.RenderMail). The
 // store is a view on the user store, obtained by structural assertion exactly as
-// the two OAuth stores are (oauthStoreProvider in app.go): the composition root
+// the two OAuth stores are (oauthStoreProvider in oauth.go): the composition root
 // is the only place that knows which driver is in play, and a driver that lacks
 // the view refuses to start rather than advertising a store its routes cannot
 // reach.
@@ -71,19 +71,11 @@ import (
 // written, because the core matches a request's Origin against them with an
 // exact comparison, as the reference's includes does.
 func siteURLs(cfg *config.Config) (canonical string, allowlist []string) {
-	seen := make(map[string]struct{}, len(cfg.Email.SiteURLs)+len(cfg.HTTP.CORS.Origins))
-	for _, list := range [][]string{cfg.Email.SiteURLs, cfg.HTTP.CORS.Origins} {
-		for _, origin := range list {
-			if origin == "" {
-				continue
-			}
-			if _, dup := seen[origin]; dup {
-				continue
-			}
-			seen[origin] = struct{}{}
-			allowlist = append(allowlist, origin)
-		}
-	}
+	// The merge itself lives in internal/config, because RS-11 has to ask the
+	// same question at validation time: a configured OAuth provider with an
+	// empty allowlist is refused, and it would be refused against a different
+	// list if this file kept its own copy of the rule.
+	allowlist = cfg.RedirectOrigins()
 	for _, u := range cfg.Email.SiteURLs {
 		if u != "" {
 			canonical = u

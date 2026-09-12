@@ -405,6 +405,7 @@ func derive(cfg *Config) {
 	cfg.Email.Verification.Mode = normalizeEnum(cfg.Email.Verification.Mode)
 	cfg.Email.Mailer.DefaultLang = normalizeEnum(cfg.Email.Mailer.DefaultLang)
 	cfg.Stores.Driver = normalizeEnum(cfg.Stores.Driver)
+	cfg.OAuth.Provisioning.OnEmailMatch = normalizeEnum(cfg.OAuth.Provisioning.OnEmailMatch)
 	cfg.Tools.Auth = strings.TrimSpace(cfg.Tools.Auth)
 	cfg.Tools.SSE.Distributor.Type = normalizeEnum(cfg.Tools.SSE.Distributor.Type)
 	cfg.RateLimit.KeyBy = normalizeEnum(cfg.RateLimit.KeyBy)
@@ -417,6 +418,15 @@ func derive(cfg *Config) {
 	// leaving an empty string for every downstream comparison to re-derive.
 	if cfg.Sessions.CheckOn == "" {
 		cfg.Sessions.CheckOn = SessionCheckOnRefresh
+	}
+
+	// A document that writes oauth.provisioning.onEmailMatch: "" is asking for
+	// the default rather than for an empty mode, exactly as an absent key is —
+	// the core normalises the same way (OAuthProvisioning.normalized). Doing it
+	// here means the enum check below never has to special-case the empty
+	// string, and every consumer reads a real mode.
+	if cfg.OAuth.Provisioning.OnEmailMatch == "" {
+		cfg.OAuth.Provisioning.OnEmailMatch = OAuthEmailMatchLink
 	}
 }
 

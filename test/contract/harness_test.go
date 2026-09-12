@@ -15,6 +15,7 @@ package contract
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -63,6 +64,7 @@ const (
 	CapTOTP           Capability = "totp"
 	CapLinkedAccounts Capability = "linked-accounts"
 	CapCookieSecure   Capability = "secure-cookies"
+	CapOAuthGoogle    Capability = "oauth-google"
 )
 
 // capState is the three-way answer a probe can get, and the distinction the
@@ -114,6 +116,36 @@ func classify(r *Resp) capability {
 		}
 	}
 	return capability{state: capBroken, why: fmt.Sprintf("%s answered %d %s, which is neither the feature nor a declared absence", r.Target, r.Status, r.snippet())}
+}
+
+// classifyOAuth reads the probe answer for GET <prefix>/oauth/google, whose two
+// documented shapes are not the two classify knows about.
+//
+// "On" is a 302 to the provider carrying a state — the route answers a redirect,
+// never a 200 — and the documented absence is the reference's own stub for a
+// strategy the host app never passed: 404 {"error":"Google OAuth not
+// configured"} (auth.router.ts:1361), which is a JSON body rather than an
+// unmounted route's fall-through. Anything else is a fault: a 500 from a
+// half-wired provider must not read as "nobody configured Google".
+func classifyOAuth(r *Resp) capability {
+	switch r.Status {
+	case 302:
+		loc := r.Header.Get("Location")
+		if loc == "" {
+			return capability{state: capBroken, why: fmt.Sprintf("%s answered 302 with no Location", r.Target)}
+		}
+		u, err := url.Parse(loc)
+		if err != nil || u.Query().Get("state") == "" {
+			return capability{state: capBroken, why: fmt.Sprintf("%s answered 302 to %q, which carries no state parameter", r.Target, loc)}
+		}
+		return capability{state: capOn, why: fmt.Sprintf("%s answered 302 to %s with a state", r.Target, u.Host)}
+	case 404:
+		var m map[string]any
+		if json.Unmarshal(r.Body, &m) == nil && m["error"] == "Google OAuth not configured" {
+			return capability{state: capAbsent, why: fmt.Sprintf("%s answered the reference's 404 stub — no Google provider is configured", r.Target)}
+		}
+	}
+	return capability{state: capBroken, why: fmt.Sprintf("%s answered %d %s, which is neither a provider redirect nor the documented 404 stub", r.Target, r.Status, r.snippet())}
 }
 
 // Case is one assertion about the wire. Adding a route to the covered surface is
@@ -175,6 +207,7 @@ func readRequired(t *testing.T) required {
 	known := map[Capability]bool{
 		CapRegister: true, CapCSRF: true, CapSessions: true,
 		CapTOTP: true, CapLinkedAccounts: true, CapCookieSecure: true,
+		CapOAuthGoogle: true,
 	}
 	for _, f := range strings.Split(raw, ",") {
 		f = strings.TrimSpace(f)
@@ -186,7 +219,7 @@ func readRequired(t *testing.T) required {
 			continue
 		}
 		if !known[Capability(f)] {
-			t.Fatalf("%s names an unknown capability %q; known: register, csrf, sessions, totp, linked-accounts, secure-cookies, all",
+			t.Fatalf("%s names an unknown capability %q; known: register, csrf, sessions, totp, linked-accounts, secure-cookies, oauth-google, all",
 				RequireEnv, f)
 		}
 		req.set[Capability(f)] = true
@@ -368,6 +401,9 @@ a stack answering 500 to every route exited 0.`, e.Prefix, reg.Status, reg.snipp
 	e.Caps[CapSessions] = classify(cli.GET(t, "/sessions"))
 	e.Caps[CapLinkedAccounts] = classify(cli.GET(t, "/linked-accounts"))
 	e.Caps[CapTOTP] = classify(cli.POST(t, "/2fa/setup", nil, CSRF()))
+	// The OAuth entry point reads no credential (§4: "Auth gate: none"), so the
+	// anonymous client is the honest probe for it.
+	e.Caps[CapOAuthGoogle] = classifyOAuth(anon.GET(t, "/oauth/google"))
 
 	names := make([]string, 0, len(e.Caps))
 	for k := range e.Caps {

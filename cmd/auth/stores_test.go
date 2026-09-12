@@ -77,12 +77,14 @@ func mountedRoutes() []mountedRoute {
 		{method: http.MethodPost, path: "/auth/add-phone", bearer: true, body: `{"phoneNumber":"+390123456789"}`},
 
 		// OAuth. Both of these answer the reference's per-provider "not
-		// configured" stub, because the provider registry comes from the oauth.*
-		// configuration block and internal/config/phases.go still refuses it as a
-		// P4 domain. That is a configuration gap and not a store gap, which is
-		// exactly why the status is pinned here instead of merely being "not 501".
+		// configured" stub, because the sweep's environment configures no
+		// oauth.providers entry: the registry is empty, so the route answers the
+		// stub exactly as the reference does with no strategy passed. That is a
+		// configuration gap and not a store gap, which is exactly why the status
+		// is pinned here instead of merely being "not 501" — a provider-backed
+		// deployment is driven end to end in oauth_test.go instead.
 		{method: http.MethodGet, path: "/auth/oauth/google", wantStatus: http.StatusNotFound,
-			why: "no provider registry: oauth.* is a P4 configuration domain, so the route answers the reference's 404 stub"},
+			why: "no oauth.providers entry is configured, so the registry is empty and the route answers the reference's 404 stub"},
 		{method: http.MethodGet, path: "/auth/oauth/google/callback", wantStatus: http.StatusNotFound,
 			why: "same 404 stub; OAuthComplete is never reached, so its LinkedAccounts check cannot 501"},
 

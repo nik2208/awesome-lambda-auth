@@ -15,6 +15,15 @@ import (
 // (*Store).CompatibilityNotes() — and docs/deviations.md indexes all three.
 // deviations_test.go fails when an entry of any register is missing from that
 // index, so a deviation cannot quietly stop being documented.
+//
+// One kind of entry sits outside that division and is here because nowhere else
+// can carry it: a divergence that belongs to a core route, that this product
+// cannot fix without forking the core, and that a deployment only becomes able
+// to reach because this product wired the block it lives in. The rule that a
+// deviation has to be announced at cold start does not stop applying because
+// the code that causes it is imported, and the core's own register is not ours
+// to write. Such an entry says so in Why, and names the test that will fail the
+// day upstream closes it.
 type WireDeviation struct {
 	// ID is the stable handle. It never changes once published.
 	ID string
@@ -83,6 +92,25 @@ func WireDeviations() []WireDeviation {
 				"the only moment it can be read; and a runtime edit must survive the next " +
 				"redeploy, or the admin API would be undone by every cold start.",
 			Spec: "docs/spec/config-schema.md §1.5, §3.8 and §3.10; docs/spec/decisions.md D-17",
+		},
+		{
+			ID:      "oauth-callback-skips-the-second-factor",
+			Surface: "GET <prefix>/oauth/{provider}/callback, for an account with a second factor enabled",
+			Behaviour: "The callback issues a session and redirects, for every account it resolves. " +
+				"An account whose POST /login answers the second-factor challenge is signed in " +
+				"through a provider without presenting one.",
+			Reference: "The callback is 2FA-aware: such an account is redirected to " +
+				"${redirectTo}/auth/2fa?tempToken=<jwt>&methods=<list> with no session issued " +
+				"(src/router/auth.router.ts:1298-1313).",
+			Why: "Not a decision this product made: the imported core's OAuthComplete has no " +
+				"second-factor branch, and the rule against forking the core stands. It is " +
+				"registered rather than left in a comment because wiring oauth.providers is what " +
+				"makes it reachable at all -- before P4 the route answered the not-configured stub -- " +
+				"and an operator who requires 2FA has to learn this from the cold-start log rather " +
+				"than from an incident. cmd/auth/oauth_test.go " +
+				"TestOAuthCallbackIssuesASessionEvenForATwoFactorAccount fails the day upstream " +
+				"grows the branch, which is when this entry is retired.",
+			Spec: "docs/spec/wire-contract.md §3 (the tempToken) and §4; docs/config-reference.md §6.4",
 		},
 	}
 }

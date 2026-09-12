@@ -205,12 +205,15 @@ where they do not:
 Both statements are absent from the role entirely unless their half is
 configured — `MailerFromAddress` for mail, `EnableSmsDelivery` for SMS.
 
-There are two more `secretsmanager:GetSecretValue` statements, and each follows
-the signing-secret one exactly: present only when `EmailDeliveryWebhookSecretArn`
-or `ClaimsWebhookSecretArn` is set, scoped to that one ARN with any `#<jsonKey>`
-selector stripped, because the selector is the function's and the resource is
-the secret. Two statements rather than one with two resources, so that a stack
-with one webhook grants nothing for the other.
+There are three more `secretsmanager:GetSecretValue` statements, and each
+follows the signing-secret one exactly: one present only when
+`EmailDeliveryWebhookSecretArn` is set, one only when `ClaimsWebhookSecretArn`
+is set, and one only when an OAuth provider is configured, each scoped to the
+ARNs actually named with any `#<jsonKey>` selector stripped, because the
+selector is the function's and the resource is the secret. Three statements
+rather than one with every ARN on it, so that a stack with one webhook grants
+nothing for the other; and a stack with one provider grants one read, while a
+stack with none grants nothing for OAuth at all.
 
 ## Credential delivery
 
@@ -340,6 +343,79 @@ requests** and one `GET /me` is one. Every other authenticated route is zero.
 `email.templatesDir` has none: it is a mapping table, which an environment
 variable cannot carry. It arrives in the configuration document (`ConfigFile`);
 see [`docs/config-reference.md`](../../docs/config-reference.md) §6.
+
+## OAuth providers
+
+Four parameters, two providers, and one thing you do **not** supply.
+
+| Parameter | Effect |
+|---|---|
+| `OAuthGoogleClientId` | The client id from the Google Cloud console. Empty switches Google sign-in off and `GET <ApiPrefix>/oauth/google` answers the reference's `404 {"error":"Google OAuth not configured"}`. |
+| `OAuthGoogleClientSecretArn` | Secrets Manager ARN of the client secret. **Required with the client id**, supplied rather than generated — the value comes from the provider's console. `#<jsonKey>` selects one key of a JSON secret. |
+| `OAuthGithubClientId` / `OAuthGithubClientSecretArn` | The same pair for GitHub. |
+
+The thing you do not supply is the **callback URL**. It is derived —
+`<PublicUrl><ApiPrefix>/oauth/<provider>/callback` — and that is the URL to
+register with the provider. A URL the operator typed and a URL the function
+serves that disagree is a flow that dead-ends at the provider's `redirect_uri`
+check, so there is nothing to be gained by letting them differ. Because the
+derived value has to byte-match the registration, `PublicUrl` is constrained to
+a bare origin (`https://auth.example.com`, no path, no trailing slash) and
+`ApiPrefix` to non-empty segments — otherwise
+`https://auth.example.com/` + `/auth` would produce a double slash and every
+callback would be rejected by the provider.
+
+The other thing you do not supply is the **linked-accounts store**. Setting a
+client id also sets `AWESOME_AUTH_STORES_ENABLE_LINKED_ACCOUNTS=true`, because
+that store is where the callback binds a provider identity to an account: with
+it off the authorization redirect is still sent and the person still consents,
+and then the callback answers `501 {"error":"Feature not supported by the
+configured stores"}`. Refuse-to-start rule RS-11 refuses that combination, so
+without this line a provider-configured stack would not start at all. It costs
+nothing at rest — the rows live in the one table this stack already creates.
+
+Its sibling, `stores.enable.pendingLinks`, is **not** set for you, because it is
+a decision rather than a consequence. It buys two things: the single-use state
+nonce (without it a captured `state` stays replayable for the whole of its TTL,
+which is the reference's own behaviour, and the cold-start log says so), and the
+`onEmailMatch: conflict` flow, whose stash lives there — RS-11 refuses that mode
+without the store. Both are document-level knobs, so turn it on in `ConfigFile`:
+`{"stores": {"enable": {"pendingLinks": true}}}`.
+
+`Rules` refuse, at changeset time, the parameter combinations whose cold start
+would then fail. One is unconditional, because the value has no document
+equivalent — this template is what consumes it:
+
+* a provider without `PublicUrl` — there is no origin to derive the callback
+  from, and it cannot be defaulted to this stack's own execute-api URL (that is
+  the circular dependency in the troubleshooting section below).
+
+The rest also require `ConfigFile` to be empty, because a `Rule` can read
+parameters and nothing else — it cannot see inside the configuration document,
+where each of these knobs is equally at home. With a document supplied they step
+aside and the cold-start rules do the checking, which is the only place both
+sources are visible:
+
+* a provider without a redirect allowlist — `EmailSiteUrls` or `AllowedOrigins`
+  must name at least one origin, because the callback answers with a session in
+  a `Set-Cookie` and decides where to send the browser from the origin inside
+  the signed state; with nothing allowlisted, any origin that state names would
+  be honoured (RS-11, `docs/spec/reference-issues.md` N1). A document may supply
+  the same list under `email.siteUrls` or `http.cors.origins`;
+* a client id with no secret ARN — an incomplete provider, unless the document
+  references the secret itself as `{"secretsManager": …}`.
+
+One more is unconditional in the other direction: a secret ARN with no client id
+**parameter** is a secret nothing reads, whatever the document says, because the
+`_SECRETSMANAGER` variable that would consume it is emitted only when the
+parameter client id is set.
+
+**A generic (non-Google, non-GitHub) provider has no parameters here.** It needs
+three endpoints, a scope and usually a profile map, which is more structure than
+a flat parameter list carries: configure it in the JSON configuration document
+(`ConfigFile`), where every knob of `config-schema.md` §1.7 is available and its
+client secret is a `{"secretsManager": …}` reference resolved the same way.
+`docs/config-reference.md` §8 has the worked example.
 
 ## Cost at rest
 

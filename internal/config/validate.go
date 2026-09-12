@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -277,9 +278,26 @@ func validateOAuth(c *Config, d *diagnostics) {
 					"supply authorizationUrl, tokenUrl and userInfoUrl, or use a built-in provider name")
 				continue
 			}
-			absoluteURL(d, base+field, value, true)
+			// https, except on a loopback host outside production. The token
+			// endpoint is posted the client secret and the userinfo endpoint is
+			// sent the access token, so plaintext to anywhere reachable is a
+			// credential on the wire — but a request to 127.0.0.1 never leaves
+			// the host, and an identity provider running beside the process (a
+			// dev Keycloak or Dex) has no certificate to present. That is the
+			// carve-out RFC 8252 §8.3 makes for the same reason.
+			//
+			// It is gated on the environment because the premise fails in a
+			// production deployment of this product: under Lambda no identity
+			// provider can live beside the function, and 127.0.0.1 there is
+			// where the runtime API listens — so a production document pointing
+			// tokenUrl at loopback is not a dev convenience, it is a client
+			// secret POSTed to the execution environment's own control plane.
+			requireHTTPS := !(isLoopbackURL(value) && !c.IsProduction())
+			absoluteURL(d, base+field, value, requireHTTPS)
 		}
 	}
+	enum(d, "oauth.provisioning.onEmailMatch", c.OAuth.Provisioning.OnEmailMatch,
+		OAuthEmailMatchLink, OAuthEmailMatchConflict, OAuthEmailMatchReject)
 	for i, dom := range c.OAuth.Provisioning.AllowedEmailDomains {
 		if strings.ContainsAny(dom, "@/: ") || !strings.Contains(dom, ".") {
 			d.errf("", fmt.Sprintf("oauth.provisioning.allowedEmailDomains[%d]", i),
@@ -558,6 +576,36 @@ func absoluteURL(d *diagnostics, path, got string, requireHTTPS bool) {
 			fmt.Sprintf("%q does not use https", got),
 			"use an https URL; this value carries credentials or token material")
 	}
+}
+
+// isLoopbackURL reports whether a URL names a host on this machine: the two
+// loopback literals, the literal "localhost", and anything in 127.0.0.0/8.
+//
+// It is what lets an OAuth provider endpoint be plain http outside production
+// (validateOAuth): a request to a loopback address never reaches a network, so
+// there is nothing for TLS to protect, and a provider that runs beside the
+// process has no name to get a certificate for. Neither half of that is true of
+// a production deployment of this product, which is why validateOAuth gates the
+// carve-out on the environment rather than on this predicate alone. Nothing
+// outside that carve-out uses it — a mail gateway, an SMS gateway or a webhook
+// receiver on loopback would be a deployment that cannot work under Lambda
+// anyway.
+//
+// A value that does not parse is not loopback, so the https requirement stays
+// on and absoluteURL reports the malformed URL rather than waving it through.
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || host == "::1" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // absoluteURLOrigin is absoluteURL for a knob whose value must not be echoed

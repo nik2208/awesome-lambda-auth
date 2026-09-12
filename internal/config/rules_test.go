@@ -168,12 +168,88 @@ func TestRefuseToStartRules(t *testing.T) {
 		{
 			name: "RS-11 incomplete oauth provider block",
 			mutate: func(doc Document) {
+				set(doc, "email.siteUrls", []any{"https://app.example.com"})
+				set(doc, "stores.enable.linkedAccounts", true)
 				set(doc, "oauth.providers.google.clientId", "123.apps.googleusercontent.com")
 			},
-			allowUnimplemented: true,
-			wantRule:           RuleOAuthIncomplete,
-			wantPath:           "oauth.providers.google",
-			wantMessage:        "clientSecret, callbackUrl",
+			wantRule:    RuleOAuthIncomplete,
+			wantPath:    "oauth.providers.google",
+			wantMessage: "clientSecret, callbackUrl",
+		},
+		{
+			// reference-issues N1: with nothing to allowlist, the callback
+			// honours whatever origin the state names — and the callback is the
+			// route that answers with a fresh session in a Set-Cookie.
+			//
+			// Reported under the provider, because that is the block the
+			// operator was writing when they triggered it; email.siteUrls and
+			// http.cors.origins are named in the remedy, where they are the
+			// answer rather than a place to go looking.
+			name: "RS-11 a configured provider with an empty redirect allowlist",
+			mutate: func(doc Document) {
+				set(doc, "stores.enable.linkedAccounts", true)
+				set(doc, "oauth.providers.google.clientId", "123.apps.googleusercontent.com")
+				set(doc, "oauth.providers.google.callbackUrl", "https://auth.example.com/auth/oauth/google/callback")
+			},
+			env: map[string]string{
+				"AWESOME_AUTH_JWT_ACCESS_SECRET":          strings.Repeat("a", 40),
+				"AWESOME_AUTH_JWT_REFRESH_SECRET":         strings.Repeat("b", 40),
+				"AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET": "google-client-secret",
+			},
+			wantRule:    RuleOAuthIncomplete,
+			wantPath:    "oauth.providers.google",
+			wantMessage: "redirect allowlist is empty",
+		},
+		{
+			// The store defaults to off, and without it the core's callback
+			// answers 501 NOT_IMPLEMENTED — after the browser has been sent to
+			// the provider and the person has consented. A login nobody can
+			// complete is a refusal, not a runtime surprise.
+			name: "RS-11 a configured provider with the linked-accounts store disabled",
+			mutate: func(doc Document) {
+				set(doc, "email.siteUrls", []any{"https://app.example.com"})
+				set(doc, "oauth.providers.google.clientId", "123.apps.googleusercontent.com")
+				set(doc, "oauth.providers.google.callbackUrl", "https://auth.example.com/auth/oauth/google/callback")
+			},
+			env: map[string]string{
+				"AWESOME_AUTH_JWT_ACCESS_SECRET":          strings.Repeat("a", 40),
+				"AWESOME_AUTH_JWT_REFRESH_SECRET":         strings.Repeat("b", 40),
+				"AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET": "google-client-secret",
+			},
+			wantRule:    RuleOAuthIncomplete,
+			wantPath:    "stores.enable.linkedAccounts",
+			wantMessage: "501",
+		},
+		{
+			// onEmailMatch: conflict stashes the conflict for /link-request to
+			// pick up, and the stash lives in the pending-links store. Without
+			// it the 302 to /account-conflict still goes out and resolves
+			// nothing.
+			name: "RS-11 onEmailMatch conflict with the pending-links store disabled",
+			mutate: func(doc Document) {
+				set(doc, "email.siteUrls", []any{"https://app.example.com"})
+				set(doc, "stores.enable.linkedAccounts", true)
+				set(doc, "oauth.provisioning.onEmailMatch", "conflict")
+				set(doc, "oauth.providers.google.clientId", "123.apps.googleusercontent.com")
+				set(doc, "oauth.providers.google.callbackUrl", "https://auth.example.com/auth/oauth/google/callback")
+			},
+			env: map[string]string{
+				"AWESOME_AUTH_JWT_ACCESS_SECRET":          strings.Repeat("a", 40),
+				"AWESOME_AUTH_JWT_REFRESH_SECRET":         strings.Repeat("b", 40),
+				"AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET": "google-client-secret",
+			},
+			wantRule:    RuleOAuthIncomplete,
+			wantPath:    "oauth.provisioning.onEmailMatch",
+			wantMessage: "stores.enable.pendingLinks",
+		},
+		{
+			name: "an unknown oauth provisioning email-match mode",
+			mutate: func(doc Document) {
+				set(doc, "oauth.provisioning.onEmailMatch", "merge")
+			},
+			wantRule:    "",
+			wantPath:    "oauth.provisioning.onEmailMatch",
+			wantMessage: "not a valid value",
 		},
 		{
 			name: "RS-12 memory store in production",
@@ -452,6 +528,107 @@ func TestRS2SeesThroughHostSpellings(t *testing.T) {
 
 // TestAllRulesAreReportedTogether: an operator fixing a broken deployment gets the
 // whole list, not one problem per deploy cycle.
+// TestOAuthRedirectAllowlistAcceptsEitherSource: RS-11 asks for an allowlist,
+// not for one particular knob. The reference builds it from both
+// (buildAllowedOrigins, auth.router.ts:213-219), so a deployment that lists its
+// front-end origins under http.cors.origins has already answered the question.
+func TestOAuthRedirectAllowlistAcceptsEitherSource(t *testing.T) {
+	env := baseEnv()
+	env["AWESOME_AUTH_OAUTH_GOOGLE_CLIENT_SECRET"] = "google-client-secret"
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(Document)
+	}{
+		{"email.siteUrls", func(doc Document) {
+			set(doc, "email.siteUrls", []any{"https://app.example.com"})
+		}},
+		{"http.cors.origins", func(doc Document) {
+			set(doc, "http.cors.origins", []any{"https://app.example.com"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			set(doc, "stores.enable.linkedAccounts", true)
+			set(doc, "oauth.providers.google.clientId", "123.apps.googleusercontent.com")
+			set(doc, "oauth.providers.google.callbackUrl", "https://auth.example.com/auth/oauth/google/callback")
+			tc.mutate(doc)
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+			if err != nil {
+				t.Fatalf("%s supplies the redirect allowlist, so this must load:\n%v", tc.name, err)
+			}
+			if got := cfg.RedirectOrigins(); len(got) != 1 || got[0] != "https://app.example.com" {
+				t.Errorf("RedirectOrigins() = %v, want the one configured origin", got)
+			}
+		})
+	}
+}
+
+// TestGenericProviderEndpointsAllowLoopbackOverHTTP: the https requirement
+// protects a client secret in flight, and a request to a loopback address is
+// never in flight. A dev identity provider beside the process has no
+// certificate to present, and refusing it would make the only local OAuth
+// deployment impossible — while plain http to anywhere else stays refused.
+//
+// The carve-out is scoped to a non-production deployment, which is the only
+// place its premise holds. Under Lambda nothing runs beside the function and
+// loopback is where the runtime API listens, so a production document pointing
+// tokenUrl at 127.0.0.1 is a client secret POSTed to the execution
+// environment's own control plane — the last subtest pins that it is refused.
+func TestGenericProviderEndpointsAllowLoopbackOverHTTP(t *testing.T) {
+	env := baseEnv()
+	env["AWESOME_AUTH_OAUTH_ACME_CLIENT_SECRET"] = "acme-client-secret"
+
+	provider := func(doc Document, endpointBase string) {
+		set(doc, "email.siteUrls", []any{"https://app.example.com"})
+		set(doc, "stores.enable.linkedAccounts", true)
+		set(doc, "oauth.providers.acme.clientId", "acme-client")
+		set(doc, "oauth.providers.acme.callbackUrl", "https://auth.example.com/auth/oauth/acme/callback")
+		set(doc, "oauth.providers.acme.authorizationUrl", endpointBase+"/authorize")
+		set(doc, "oauth.providers.acme.tokenUrl", endpointBase+"/token")
+		set(doc, "oauth.providers.acme.userInfoUrl", endpointBase+"/userinfo")
+	}
+
+	for _, base := range []string{"http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"} {
+		t.Run(base, func(t *testing.T) {
+			doc := baseDoc()
+			// deployment.environment defaults to production, and the carve-out
+			// does not apply there: a local identity provider is a development
+			// arrangement, so the document says so.
+			set(doc, "deployment.environment", "development")
+			provider(doc, base)
+			if _, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)}); err != nil {
+				t.Fatalf("a loopback provider endpoint must load outside production:\n%v", err)
+			}
+		})
+	}
+
+	t.Run("http elsewhere is still refused", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "deployment.environment", "development")
+		provider(doc, "http://idp.example.com")
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		d := requireRule(t, err, "", "oauth.providers.acme.tokenUrl")
+		if !strings.Contains(d.Problem, "https") {
+			t.Errorf("the diagnostic does not say what is wrong with the scheme:\n%s", d.Problem)
+		}
+	})
+
+	t.Run("loopback in production is refused", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "deployment.environment", "production")
+		provider(doc, "http://127.0.0.1:8080")
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(env)})
+		d := requireRule(t, err, "", "oauth.providers.acme.tokenUrl")
+		if !strings.Contains(d.Problem, "https") {
+			t.Errorf("the diagnostic does not say what is wrong with the scheme:\n%s", d.Problem)
+		}
+	})
+}
+
 func TestAllRulesAreReportedTogether(t *testing.T) {
 	doc := baseDoc()
 	set(doc, "security.csrf.enabled", false)

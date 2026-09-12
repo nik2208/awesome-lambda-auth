@@ -32,7 +32,7 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 
 All three are passed through `scripts/toolchain.sh` into the container.
 
@@ -49,7 +49,9 @@ AWESOME_AUTH_CONTRACT_REQUIRE=register,csrf,secure-cookies,sessions,totp \
   ./scripts/toolchain.sh go test ./test/contract/... -v
 ```
 
-(`linked-accounts` is left out because it really is switched off there.)
+(`linked-accounts` and `oauth-google` are left out because they really are
+switched off there: the stores are off and no `oauth.providers.google` block is
+configured.)
 
 `…_REQUIRE` doubles as the guard on the suite's own plumbing: setting it while
 `…_BASE_URL` is empty is a **failure**, because a caller who named the
@@ -101,6 +103,7 @@ deployment under test: https://… (router mounted at /auth)
   AWESOME_AUTH_CONTRACT_REQUIRE=register,csrf,secure-cookies,sessions,totp
   csrf             on      auto-init cookie "__Host-csrf-token" observed
   linked-accounts  absent  …/auth/linked-accounts answered 501 NOT_IMPLEMENTED — the store is switched off
+  oauth-google     absent  …/auth/oauth/google answered the reference's 404 stub — no Google provider is configured
   register         on      POST /auth/register answered 201
   secure-cookies   on      csrf cookie Secure=true
   sessions         on      …/auth/sessions answered 200
@@ -115,6 +118,13 @@ without that code) is `BROKEN`, and a broken capability **fails** the cases that
 need it instead of skipping them, and fails the probe besides. A fault must
 never be able to switch a case off; that is how a contract suite goes green
 against a broken deployment.
+
+`oauth-google` is probed by its own classifier, because its two documented
+answers are neither of the two above: `GET <prefix>/oauth/google` is `on` when
+it answers a 302 to the provider carrying a `state`, and `absent` only on the
+reference's own per-provider stub, `404 {"error":"Google OAuth not
+configured"}`. A 500 from a half-wired provider is `BROKEN`, not "nobody
+configured Google".
 
 The same rule guards the suite's own footing: `POST /register` answering
 anything but 2xx or 404 aborts the run. It used to skip, which meant a stack
@@ -234,13 +244,17 @@ attributes, CSRF double-submit, unwrapped `/me` (with `loginProvider`),
 empty-body refresh, the `{sessions:[…]}` and `{linkedAccounts:[…]}` wrappers,
 `SESSION_REVOKED`, the TOTP round trip end to end, the step-up token's limits
 and the shape of the access token itself, the documented error shapes
-including the paths that carry no `code`, and the mailbox-free half of the email
-flows: the auth and CSRF gates on `/change-email/request` and
+including the paths that carry no `code`, the mailbox-free half of the email
+flows (the auth and CSRF gates on `/change-email/request` and
 `/send-verification-email`, `GET /verify-email` answering JSON and never
-redirecting, `/forgot-password` accepting `emailLang`.
+redirecting, `/forgot-password` accepting `emailLang`), and the browser-visible
+half of OAuth: the authorization redirect and its query, the unknown-provider
+404, and the callback's JSON-not-a-redirect failure shape.
 
-Not covered: OAuth provider flows (they need a provider), the admin router, the
-tools/SSE router, and the email/SMS token round trips — a token minted by one
-route and spent by another — because the suite has no mailbox to read it from.
-Nothing stops a case being added for them the day the deployment has what they
-need.
+Not covered: the OAuth round trip itself — the suite cannot consent at a real
+provider — so the exchange, the provisioning policy and the account-conflict
+redirect are pinned against an httptest provider in `cmd/auth/oauth_test.go`
+instead. Also not covered: the admin router, the tools/SSE router, and the
+email/SMS token round trips — a token minted by one route and spent by another —
+because the suite has no mailbox to read it from. Nothing stops a case being
+added for them the day the deployment has what they need.

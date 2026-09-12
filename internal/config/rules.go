@@ -234,15 +234,85 @@ func checkRS10FirstUser(c *Config, capabilities func(string) StoreCapabilities, 
 		"use is-admin-flag or rbac:<role>, or select a driver that supports listing users")
 }
 
-// checkRS11OAuthProviders: a provider block must be complete.
+// checkRS11OAuthProviders: a provider block must be complete, the deployment
+// that configures one must have somewhere to send the browser back to, and it
+// must have the stores the flow it just switched on writes to.
 //
-// This is the one misconfiguration the reference already fails fast on, throwing
-// OAUTH_NOT_CONFIGURED from the strategy constructor
+// The completeness half is the one misconfiguration the reference already fails
+// fast on, throwing OAUTH_NOT_CONFIGURED from the strategy constructor
 // (src/strategies/oauth/google.strategy.ts:15-17).
+//
+// The store half is this product's, and it exists because the two stores the
+// OAuth callback needs are off by default (Defaults enables users, sessions and
+// tokens, and nothing else). With stores.enable.linkedAccounts off the core's
+// OAuthComplete returns errStoreNotConfigured before it does anything at all
+// (oauth_wire.go), which the wire layer answers as 501 NOT_IMPLEMENTED — so the
+// authorize route still 302s the browser to Google, the person consents, and the
+// callback tells them the feature is not supported. Half a flow that nothing
+// refuses is exactly the silent misconfiguration this table exists to eliminate,
+// so a provider without its store is a refusal rather than a 501 discovered by
+// the first person who tries to sign in.
+//
+// stores.enable.pendingLinks is demanded only by onEmailMatch: conflict, which
+// is the mode whose whole answer to a conflict is "stash it and let
+// /link-request resolve it later". Without the store the core's
+// stashAccountConflict returns immediately, the 302 to /account-conflict is
+// still sent, and the front end lands on a page whose follow-up call can never
+// identify anybody. For the other two modes the store is optional — it also
+// carries the single-use-nonce replay defence, which is reported as an unwired
+// knob at cold start rather than refused, because a replayable-inside-its-TTL
+// signed state is the reference's own behaviour and not a broken deployment.
+//
+// The allowlist half is this product's, and it closes the second half of
+// reference-issues N1. The callback decides where to send the browser by
+// reading the origin out of the `state` it is handed and checking it against
+// the redirect allowlist — email.siteUrls merged with http.cors.origins
+// (buildAllowedOrigins, auth.router.ts:213-219). An *empty* allowlist accepts
+// any origin the state carries (originAllowed, :327 and the core's transcription
+// of it), which is an open redirect: the OAuth callback is precisely the route
+// that carries a fresh session in a Set-Cookie, so a state pointing at an
+// attacker's origin turns a successful login into a redirect the victim's
+// browser follows with the flow's own credentials already in the jar.
+//
+// The core signs its states, which is why it can reproduce the reference's
+// empty-allowlist behaviour safely for an embedder. A deployment is a different
+// thing: it also has to survive the day the signing secret is the thing that
+// went wrong, and an allowlist is the defence that does not depend on the
+// signature holding. So a configured provider with nothing to allowlist is
+// refused here rather than left to be discovered from a phishing report.
 func checkRS11OAuthProviders(c *Config, d *diagnostics) {
-	for _, name := range sortedKeys(c.OAuth.Providers) {
+	names := sortedKeys(c.OAuth.Providers)
+	if len(names) == 0 {
+		return
+	}
+
+	if !c.Stores.Enable.LinkedAccounts {
+		d.errf(RuleOAuthIncomplete, "stores.enable.linkedAccounts",
+			fmt.Sprintf("the OAuth provider(s) %s are configured and the linked-accounts store is disabled, so the authorization redirect would be sent, the person would consent, and the callback would answer 501 NOT_IMPLEMENTED -- the store is where a provider identity is bound to an account, and the callback refuses before it does anything without it",
+				strings.Join(names, ", ")),
+			"switch the linked-accounts store on (AWESOME_AUTH_STORES_ENABLE_LINKED_ACCOUNTS=true) or remove the oauth.providers block")
+	}
+
+	if c.OAuth.Provisioning.OnEmailMatch == OAuthEmailMatchConflict && !c.Stores.Enable.PendingLinks {
+		d.errf(RuleOAuthIncomplete, "oauth.provisioning.onEmailMatch",
+			"onEmailMatch is \"conflict\", whose whole answer to a conflict is to stash it for the link flow, and the pending-links store is disabled -- the browser would still be redirected to /account-conflict, but nothing would be stashed and POST /link-request could never resolve the identity",
+			"enable stores.enable.pendingLinks (AWESOME_AUTH_STORES_ENABLE_PENDING_LINKS=true), or choose oauth.provisioning.onEmailMatch: link or reject")
+	}
+
+	allowlistEmpty := len(c.RedirectOrigins()) == 0
+	for _, name := range names {
 		p := c.OAuth.Providers[name]
 		base := "oauth.providers." + name
+
+		if allowlistEmpty {
+			// Reported under the provider that triggers it: the operator was
+			// working in oauth.providers.<name>, and the allowlist knobs belong
+			// in the remedy, where they say what to do rather than where to look.
+			d.errf(RuleOAuthIncomplete, base,
+				fmt.Sprintf("the %q provider is configured and the redirect allowlist is empty, so the callback would honour whatever origin the state it is handed names, unverified", name),
+				"list the front-end origins the callback may send a browser back to in email.siteUrls (they are also the base of every emailed link), or in http.cors.origins")
+		}
+
 		secretPath := base + ".clientSecret"
 		missing := make([]string, 0, 3)
 		if p.ClientID == "" {
