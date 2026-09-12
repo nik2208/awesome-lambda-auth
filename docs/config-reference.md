@@ -886,7 +886,123 @@ settings store — a second place for the same non-effect to be discovered from 
 worse than none. The branding keys under `ui.*` belong to the settings store too
 and arrive with the hosted UI.
 
-## 12. Two worked postures
+## 12. `docs.*`, knob by knob
+
+The two documentation routes: `GET <prefix>/openapi.json`, the generated OpenAPI
+document, and `GET <prefix>/docs`, the Swagger UI page that reads it. Both come
+from the imported adapter — nothing in this binary mounts a route under the api
+prefix — and both are unguarded, exactly as the reference registers them
+(`src/router/auth.router.ts:1651-1677`).
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `docs.swagger` | `true` \| `false` \| `auto` | `auto` | `AWESOME_AUTH_DOCS_SWAGGER` |
+| `docs.basePath` | absolute path | `http.apiPrefix` (so `/auth` unless you moved it) | `AWESOME_AUTH_DOCS_BASE_PATH` |
+
+### 12.1 What `auto` resolves to
+
+`auto` is **on outside production and off in it**, resolved against
+`deployment.environment`:
+
+| `docs.swagger` | `deployment.environment` | Both routes |
+|---|---|---|
+| `true` | anything | mounted |
+| `false` | anything | 404 |
+| `auto` | `development` | mounted |
+| `auto` | `production` | 404 |
+
+That reproduces the reference's `swagger === true || (swagger !== false &&
+NODE_ENV !== 'production')` (`src/router/auth.router.ts:1652-1654`) with one
+substitution: a configuration knob in place of a process variable. The
+substitution is not this product's idea — the imported core takes a plain
+boolean and says why, that a library whose routes appear and disappear with a
+variable it never sees configured is one nobody can reason about from its own
+configuration — so resolving `auto` is the host's job, and `cmd/auth/docs.go` is
+where it happens.
+
+**The consequence is that a deployment which says nothing gets neither route.**
+`auto` is the default here and `production` is the default environment, so
+silence is 404 on both; the reference reads an unset `NODE_ENV` as "not
+production" and serves both. That is the `production-by-default` deviation
+([deviations.md](deviations.md)), whose text names swagger as one of the three
+things the default tightens. Say `deployment.environment: development` and the
+routes appear.
+
+The cold-start log says which way it went, on every start: `documentation routes
+mounted` with both paths, or `documentation routes not mounted` with the knob and
+the environment that decided it.
+
+### 12.2 `docs.basePath` moves the description, never the mount
+
+It is the reference's `swaggerBasePath` (`src/router/auth.router.ts:133-139`,
+read at `:1657`) and the core's `DocsOptions.BasePath`, and all three mean one
+thing: the base the served document writes its path items under, and the base of
+the spec URL the Swagger page fetches. **The two routes are always served under
+`http.apiPrefix`.** The reference's own doc comment — "Base path where the auth
+router is mounted" — is the misleading one; nothing mounts anything from this
+value, there or here.
+
+Unset, it is the resolved `http.apiPrefix`, so the document describes the paths
+this deployment actually answers and no one has to think about it. Set it only
+when a reverse proxy makes this stack reachable from outside under some other
+path, so that a reader who fetches what the document names gets a real response.
+Set it to anything else and the deployment publishes a document describing paths
+it does not serve — which is why a base path that differs from the mount is
+called out by name in the cold-start log rather than quietly honoured.
+
+### 12.3 The page puts a third-party script on the auth origin
+
+The Swagger page is the reference's, reproduced byte for byte by the core, and
+it loads `swagger-ui-dist@5` from the **unpkg CDN with no subresource
+integrity** (`src/router/openapi.ts:1646-1669`). Whatever unpkg serves then
+executes same-origin with this deployment's cookies — the CSRF cookie included,
+which is readable from JavaScript by design, because the double-submit pattern
+requires the client to read it. A bad day at that CDN is a credential-reading
+script on your auth origin.
+
+**This is not a refuse-to-start rule, and that is a decision.** The core's
+`DocsOptions.Enabled` is one switch for the page *and* for the machine-readable
+document; every adapter mounts both under it; this binary may add no route under
+the api prefix and does not fork the core. So a refusal aimed at the page would
+take the document with it and refuse a production deployment for wanting the one
+artefact in the pair that carries no script at all — leaving one move, turning
+both off, which is the state the operator was trying to leave. The house rule
+that "forgetting to name the environment should tighten, not loosen" is already
+satisfied by §12.1: reaching this takes two deliberate statements,
+`docs.swagger: "true"` and `deployment.environment: "production"`, in one
+document. The fix that would let the product be stricter is upstream's — a
+spec-only mode, or a page served from assets the library vendors — and it is
+recorded as an upstream ask rather than worked around here.
+
+**What the deployment does instead**, in three parts:
+
+- **It warns at deploy time.** `docs.swagger: true` in production raises a
+  configuration warning naming the CDN and the cookie it can read. It is a
+  warning and not a log line so that the deployment tooling, which reads
+  `Config.Warnings()` before an upload, shows it before the stack has it.
+- **It sends a `Content-Security-Policy`** on both documentation responses,
+  together with `X-Content-Type-Options: nosniff` and `Referrer-Policy:
+  no-referrer`. The page's policy allows the one CDN origin its own HTML names
+  and denies everything else: no `fetch` or XHR off this origin, no image
+  beacon, no form action, no nested frame, no rewritten `<base>`, and no framing
+  of the page itself. The document's is `default-src 'none'` with the same two
+  denials. Registered as the deviation
+  `docs-page-carries-a-content-security-policy` ([deviations.md](deviations.md)),
+  since the reference sends no header of the kind.
+- **It keeps the two routes together.** The served document describes both paths,
+  so a deployment answering one and 404ing the other would publish a document
+  that lies about its own surface.
+
+**Be clear about what the policy buys.** It narrows the hazard; it does not
+close it. A compromised bundle still executes same-origin, can still read
+`document.cookie`, and can still put what it read into a top-level navigation,
+which no CSP directive in any shipping browser prevents. What goes are the quiet
+channels. If that is not good enough for your deployment — and on anything
+facing the internet it should not be — the answer is `docs.swagger: false`, or
+`auto` with `deployment.environment: production`, and reading the document from
+a checkout instead.
+
+## 13. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that
