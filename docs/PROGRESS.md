@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Upstream: `v0.8.0` tagliato — tre PR di seam di store, nessuna rotta (#72 WebhookStore, #73 admin/session/role lister piu `User.IsAdmin`, #74 APIKeyStore completo). In corso: U17 (vocabolario `identity.*` e contesto di richiesta, testa del percorso critico M9) e U10 (i 14 asset UI vendorizzati con il controllo di drift, M7). Prodotto: pinnato a `v0.7.0`, sei domini ancora gated; in corso D3 (runtime settings piu i due refactor abilitanti) e X1 (migrazione Cognito, che il seam `WithPasswordVerifier` di v0.7.0 ha sbloccato). Il pin a `v0.8.0` aspetta D3, e apre D6.
+Upstream: `v0.8.0` tagliato; dopo il tag sono atterrate anche U10 (i 14 asset UI vendorizzati, con gli stessi object name git della reference) e U17 (vocabolario `identity.*`, contesto di richiesta, seam `HTTPConfig.ClientIP`). In corso U11 (serving della UI, chiude M7) e U18 (le 19 pubblicazioni raggiungibili delle 26, chiude il buco per cui `EventBus.Publish` non aveva un solo chiamante). Prodotto: D3 mergiato e pin a `v0.8.0` fatto; quattro domini ancora gated (`ui`, `admin`, `tools`, `rateLimit`). In corso D6 (store admin su DynamoDB, senza rotte), D4 (superficie docs) e X1 (migrazione Cognito). Prossimo: D5 rate limiting.
 
 ## Blocks
 
@@ -79,3 +79,14 @@ Upstream dance: `v0.8.0` = M6 completo
 Stack: nessuna modifica. $0/mese.
 Notes: una rottura deliberata, e solo di interfaccia: `APIKeyStore` ora richiede `FindByID`, che la reference dichiara obbligatorio. Nessun implementatore esiste fuori dai test. Segnalato e **non** corretto: la reference paga sempre il costo bcrypt confrontando con un hash fittizio quando il prefisso non risolve, per non lasciare un oracolo temporale su "questo prefisso esiste" (`api-key.strategy.ts:36-42`); il port va in corto circuito e l'oracolo c'è. È preesistente, chiuderlo cambia il percorso di verifica, e vive ora come attività a sé.
 Next: pin del prodotto a `v0.8.0` insieme a D3, poi D6
+
+### B4 — D3 runtime settings, e i due refactor che aprono la strada (product · main · 2026-09-12)
+Status: green
+Landed: `337df5f` (PR #2, sei commit), pin `1442ee9`
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ — in locale prima e dopo il rebase, e su CI GitHub. build ✓ (zip entro budget) deploy – contract – (nessuna capability nuova: l'admin è ciò che espone i settings, quindi i casi di contratto sono di D8)
+Deviations: `runtime-settings-seed-only-fills-absent-keys` nel registro di prodotto e nell'indice
+Decisions: il seed non sovrascrive mai, **per chiave e solo per le chiavi dichiarate**. Per chiave perché i settings sono un unico item e congelare l'intero documento al primo cold start fisserebbe chiavi per cui nessun blocco ha ancora knob. Solo-dichiarate perché un bool o un int con un default di schema risulterebbe altrimenti sempre "presente": seminare `require2fa:false` renderebbe inerte un `require2fa:true` aggiunto al documento mesi dopo. "Dichiarato" è lo stesso predicato che usano già `domainConfigured` e `checkStoreRequirements`.
+Upstream dance: core pinnato a `v0.8.0` (nessuna rotta nuova, quindi `mountedRoutes()` non cresce — che è la risposta giusta del tripwire per un tag che non allarga la superficie)
+Stack: nessuna risorsa nuova, nessun parametro nuovo. $0/mese. **Non ancora deployato**: il deploy è in attesa di approvazione.
+Notes: due refactor abilitanti, che vanno fatti una volta sola. (1) Le capability della contract suite si auto-registrano: una regione contigua per capability in `test/contract/capabilities_test.go`, e ordine di probe, insieme accettato da `AWESOME_AUTH_CONTRACT_REQUIRE`, blocco di report e loop dei fault derivano tutti dal registro. Sotto c'era un bordo tagliente trovato e chiuso: `capOn` è `iota`, quindi lo zero di `capState` è "acceso" e una capability mai registrata avrebbe spento nessun caso — `assertSettled` lo impedisce. (2) `coreOptionSets` pre-riserva gli slot `settings, docs, ui, admin, tools` in ordine fisso, con builder e non slice già costruite, così un set che fa I/O non viene pagato prima del rifiuto di un set precedente. Una regola preesistente era troppo stretta e l'ho allargata: `rules.go` chiedeva lo store dei settings solo per `require2FA` o una allowlist non vuota, mancando un grace period non di default e una allowlist esplicitamente vuota — entrambe sarebbero partite con lo store spento e sarebbero state seminate nel nulla.
+Next: D4 docs, D5 rate limiting, D6 store admin
