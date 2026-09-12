@@ -122,6 +122,32 @@ type domain struct {
 // operator who set a budget, watched nothing be limited, and had no way to tell
 // from outside.
 //
+// The hosted UI (P6's fourth block) closed `ui`, and it is the first domain to
+// leave this list that adds a *surface* rather than changing one. With
+// `ui.enabled` set, the imported adapter mounts the whole of the reference's ui
+// router at <prefix>/ui — the config document, the server-rendered pages with
+// their injected branding and configuration, and the reference's own fourteen
+// browser assets, which awesome-go-auth vendors byte for byte and compiles in
+// (cmd/auth ui.go, which builds HTTPConfig.UI). The same flag re-points every
+// emailed link at a hosted page rather than at the API route itself
+// (HTTPConfig.UILink), which is why httpConfig has followed `ui.enabled` since
+// P2 even while this gate made it unreachable: the link shape and the UI switch
+// could not be allowed to drift apart on the day the UI landed.
+//
+// Two knobs of the block behave differently from the rest and neither is a
+// phase gap. `ui.assetsDir` is honoured and *refuses* the cold start when it
+// names a directory that cannot render a page, because the core never falls
+// back to the vendored assets for a host that supplied its own — so the
+// alternative to refusing is a stack that 404s every page while every health
+// check passes. `ui.uploadDir` is accepted and honoured by nothing: the writer
+// is an admin route no build mounts yet, a Lambda has no directory that
+// survives a request, and an fs.FS over S3 is a GetObject on the path every
+// page requests. That one is a registered deviation
+// (ui-uploaded-assets-are-not-served) and is reported by logUISurface, which is
+// the distinction this gate exists to preserve — a domain is refused while it
+// does nothing at all, and a knob inside a wired domain is reported while
+// nothing can act on it.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
@@ -134,11 +160,6 @@ type domain struct {
 // Everything below is defined, validated and refused.
 func unwiredDomains() []domain {
 	return []domain{
-		{
-			path:  "ui",
-			phase: "P6 (hosted UI)",
-			get:   func(c *Config) any { return c.UI },
-		},
 		{
 			path:         "admin",
 			phase:        "P6 (admin surface)",

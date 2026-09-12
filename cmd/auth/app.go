@@ -221,6 +221,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err := checkResourceServerSupport(cfg); err != nil {
 		return nil, err
 	}
+	// Before the stores are opened, because this one needs none of them: it
+	// reads the deployment artifact, and a `ui.assetsDir` that is not there is a
+	// UI that 404s every page on a stack every health check calls healthy. See
+	// checkUIAssets.
+	if err := checkUISupport(cfg); err != nil {
+		return nil, err
+	}
 
 	users, sessions, err := newStores(ctx, cfg, log)
 	if err != nil {
@@ -297,6 +304,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 	logDocsSurface(cfg, log)
+	logUISurface(cfg, log)
 
 	var handler http.Handler = mux
 	// The documentation responses carry a Content-Security-Policy. It is a
@@ -593,7 +601,17 @@ func coreOptionSets(
 		// The slot itself stays, because it is the landing site the roadmap
 		// promised and moving it would move every later block's.
 		{name: "docs"},
-		// ui.* — the hosted UI and its config route.
+		// ui.* — the hosted UI, its config document and its assets. Wired, and
+		// deliberately empty for exactly the reason `docs` is: the whole block
+		// reaches the core through HTTPConfig.UI, which the adapter reads at
+		// mount time to register one handler for the entire <prefix>/ui subtree
+		// (ui.go, httpConfig). There is no auth.Option for a branding colour, a
+		// headless flag or an asset filesystem, and the two stores the config
+		// document is actually built from — settings and templates — were handed
+		// to the core by the `settings` slot and by emailOptions long before
+		// this block existed, so the UI reads them without asking for anything
+		// of its own. The slot stays, recording that it was filled with nothing
+		// on purpose.
 		{name: "ui"},
 		// admin.* — the admin router and its access policy.
 		{name: "admin"},
@@ -610,13 +628,24 @@ func coreOptionSets(
 // *name* prefix is likewise derived by the core (CookieOptions.CookieName) and
 // is not a knob in either layer.
 //
-// UIEnabled is the one field that reaches an emailed link: with it set, the
-// core's UILink points a link at <site><prefix>/ui/<path> — the hosted UI's
-// page for it — instead of at the bare API route (buildUiLink,
-// auth.router.ts:261-271). It follows ui.enabled, which phases.go still refuses
-// as a P6 domain, so today it is always false and every link points at the API
-// route; wiring it now means the link shape and the UI switch cannot drift
-// apart when the UI lands.
+// UI is the whole `ui` block, and it is the one field here that changes two
+// surfaces at once. UIOptions.Enabled makes the adapter register a handler for
+// the entire <prefix>/ui subtree — the config document, the SSR pages, the
+// assets — and it is also what points every emailed link at
+// <site><prefix>/ui/<path>, the hosted UI's page for it, instead of at the bare
+// API route (UILink, buildUiLink, auth.router.ts:261-271). The two have followed
+// one another since P2 precisely so they could not drift apart on the day the UI
+// landed, which is this one. ui.go builds the value.
+//
+// **The deprecated alias is deliberately not set.** HTTPConfig.UIEnabled is the
+// older spelling of UI.Enabled, from when the flag decided nothing but the shape
+// of a link, and the core treats the two as one switch: resolve() sets both from
+// either, uiEnabled() reads both, and an adapter mounts on UI.Enabled. This
+// function used to set the alias and now sets the field it was renamed to, which
+// is the one arrangement in which the two cannot be assigned from different
+// expressions and come to disagree. A caller holding an *unresolved* config —
+// delivery.go, which asks it for UILink — is unaffected, because UILink is one
+// of the callers that reads both.
 //
 // Docs is where the whole documentation surface lives: the two routes the
 // adapter mounts under it are the entirety of what the `docs` block does, which
@@ -644,8 +673,8 @@ func httpConfig(cfg *config.Config) auth.HTTPConfig {
 			Domain:           cfg.Cookies.Domain,
 			RefreshTokenPath: cfg.Cookies.RefreshTokenPath,
 		},
-		CSRF:      auth.CSRFConfig{Enabled: cfg.Security.CSRF.Enabled},
-		UIEnabled: cfg.UI.Enabled,
+		CSRF: auth.CSRFConfig{Enabled: cfg.Security.CSRF.Enabled},
+		UI:   uiOptions(cfg),
 		// Resource-server mode: the adapter registers none of the nineteen
 		// routes that create, prove, deliver or change a credential, so each of
 		// them answers 404 rather than reaching a handler with no issuer behind

@@ -33,6 +33,14 @@ Transform: AWS::Serverless-2016-10-31
 #      double-submit no longer rest on a host you control. "$default" does not
 #      fix this and nothing except a custom domain will.
 #
+# CloudFront changes the first half and not the second. Set EnableCloudFront
+# to "true" and the stage segment moves onto the origin (AuthDistribution's
+# OriginPath), so the browser sees paths rooted at "/" whatever StageName says —
+# problem 1 is gone even on a named stage. Problem 2 is not: *.cloudfront.net is
+# a shared registrable domain in exactly the way execute-api.amazonaws.com is.
+# Only CloudFrontAliases plus CloudFrontCertificateArn — a domain you control —
+# closes it, and that is the same conclusion as the paragraph below reaches.
+#
 # The governing knob is `cookies.allowInsecureCookieMode`
 # (AWESOME_AUTH_COOKIES_ALLOW_INSECURE_COOKIE_MODE), spec config-schema.md
 # §1.2, enforced by refuse-to-start rule RS-2 (§2, internal/config/rules.go
@@ -74,6 +82,8 @@ Metadata:
         Parameters: [TableNamePrefix, MaxReadRequestUnits, MaxWriteRequestUnits, EnableDeletionProtection]
       - Label: {default: Function}
         Parameters: [MemorySize, Timeout, LogRetentionDays, SessionCheckOn]
+      - Label: {default: Content delivery (CloudFront)}
+        Parameters: [EnableCloudFront, CloudFrontAliases, CloudFrontCertificateArn, CloudFrontPriceClass]
 
 Parameters:
 
@@ -742,6 +752,74 @@ Parameters:
       AWESOME_AUTH_SESSIONS_CHECK_ON. "allcalls" costs one strongly-consistent
       GetItem on every authenticated request and buys immediate revocation.
 
+  # -----------------------------------------------------------------------
+  # Content delivery. The hosted UI is served by the function, from assets
+  # embedded in the binary, at <ApiPrefix>/ui — so the pages and the API they
+  # post to are the same origin by construction and there is no second bucket,
+  # no second deployment and no CORS between them. What CloudFront adds is the
+  # *front door*: one hostname in front of that origin, at which a custom domain
+  # can be attached.
+  #
+  # THIS IS NOT A CACHE, AND THE RESOURCES BELOW SAY SO IN AS MANY WORDS. See
+  # AuthCachePolicy for why nothing this origin serves is shared-cacheable.
+  #
+  # Off by default, and off means no resource and no bill: with
+  # EnableCloudFront "false" the distribution, the cache policy and the origin
+  # request policy are all conditioned away and the stack is byte for byte the
+  # stack it was before this block existed.
+  # -----------------------------------------------------------------------
+
+  EnableCloudFront:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Put a CloudFront distribution in front of the HTTP API, so the hosted UI
+      and the auth routes share one hostname that a custom domain can be
+      attached to. "false" — the default — creates nothing. CloudFront has no
+      fixed monthly charge and its perpetual free tier covers 10,000,000 HTTPS
+      requests and 1 TB out per month; data transfer from API Gateway to
+      CloudFront is not billed.
+
+  CloudFrontAliases:
+    Type: String
+    Default: ''
+    Description: >-
+      Comma-separated custom domains to serve the distribution at, e.g.
+      auth.example.com. Requires CloudFrontCertificateArn. Empty — the default —
+      leaves the distribution on its own *.cloudfront.net name, which is a
+      SHARED registrable domain exactly as execute-api.amazonaws.com is: it does
+      not satisfy RS-2 and does not let you run cookie mode with
+      AllowInsecureCookieMode "false". An alias does. Placeholder is empty on
+      purpose; never commit a real domain.
+
+  CloudFrontCertificateArn:
+    Type: String
+    Default: ''
+    # us-east-1 is not a preference. CloudFront reads viewer certificates from
+    # ACM in us-east-1 only, whatever region the rest of this stack is in.
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:acm:us-east-1:\d{12}:certificate/.+$'
+    ConstraintDescription: >-
+      CloudFrontCertificateArn must be an ACM certificate ARN in us-east-1 —
+      CloudFront reads viewer certificates from that region only — or empty.
+    Description: >-
+      ACM certificate covering CloudFrontAliases, in us-east-1. This template
+      does not create it: a DNS-validated certificate needs a validation record
+      in a zone CloudFormation cannot assume it controls, and a stack that hung
+      on validation would be worse than one that asks for an ARN. Public ACM
+      certificates are free.
+
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: >-
+      Which edge locations serve the distribution. PriceClass_100 (North America
+      and Europe) is the cheapest per GB and per request and is the default
+      because nothing here is cached — a distant edge buys a shorter TLS
+      handshake and nothing else, so paying for one is paying for latency
+      smoothing, not for hit rate.
+
 Conditions:
   IsDefaultStage: !Equals [!Ref StageName, '$default']
   GenerateJwtAccessSecret: !Equals [!Ref JwtAccessSecretArn, '']
@@ -793,9 +871,20 @@ Conditions:
   HasResourceServerIssuer: !Not [!Equals [!Ref ResourceServerIssuer, '']]
   # A named stage on the raw execute-api URL puts /<stage> in front of every
   # path the browser sees, so the Path-scoped refresh cookie has to match.
+  #
+  # Behind the distribution it does not: the origin carries the stage in its
+  # OriginPath, so the browser sees paths with no stage segment in them. That is
+  # why the distribution is a reason to set PublicUrl — which is what turns this
+  # condition off — and why the parameter description says so rather than this
+  # condition growing a third term. A stack can legitimately be reachable both
+  # ways at once, and only the operator knows which URL their clients use.
   NeedsStagePrefixedCookiePath: !And
     - !Not [!Condition IsDefaultStage]
     - !Not [!Condition HasPublicUrl]
+
+  CloudFrontEnabled: !Equals [!Ref EnableCloudFront, 'true']
+  HasCloudFrontAliases: !Not [!Equals [!Ref CloudFrontAliases, '']]
+  HasCloudFrontCertificate: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
 
 # ---------------------------------------------------------------------------
 # Rules are evaluated before a changeset is created, which is the only place a
@@ -939,6 +1028,32 @@ Rules:
           OAuthGithubClientSecretArn is set but OAuthGithubClientId is empty, so no
           GitHub provider is configured and the secret would be read by nothing.
           Set the client id, or clear the ARN.
+
+  # Both parameter-only, in the shape the header describes: neither value has a
+  # ConfigFile equivalent, because this template is what consumes them. They are
+  # a pair — CloudFront refuses a distribution carrying an alias with no viewer
+  # certificate — and refusing here turns a failed changeset into a message
+  # before anything is touched.
+  CloudFrontAliasesNeedACertificate:
+    RuleCondition: !Not [!Equals [!Ref CloudFrontAliases, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
+        AssertDescription: >-
+          CloudFrontAliases needs CloudFrontCertificateArn. A distribution serving
+          a custom domain has to present a certificate for it, and CloudFront reads
+          viewer certificates from ACM in us-east-1 only — whatever region the rest
+          of this stack is in. Request or import the certificate there and pass its
+          ARN.
+
+  CloudFrontCertificateNeedsAnAlias:
+    RuleCondition: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CloudFrontAliases, '']]
+        AssertDescription: >-
+          CloudFrontCertificateArn is set but CloudFrontAliases is empty, so the
+          distribution would keep its *.cloudfront.net name and present the default
+          certificate — the one you supplied would be attached to nothing. Set the
+          domains, or clear the ARN.
 
 Resources:
 
@@ -1813,6 +1928,200 @@ Resources:
             Method: ANY
             PayloadFormatVersion: '2.0'
 
+  # ---------------------------------------------------------------------
+  # Content delivery
+  #
+  # One distribution, one origin — this stack's own HTTP API — and no caching
+  # at all. Created only when EnableCloudFront is "true"; with it "false" every
+  # resource in this region is conditioned away and the stack costs what it
+  # cost before.
+  #
+  # ---- what it is for, since it is not for caching -------------------------
+  #
+  # The hosted UI is served by the function, from assets compiled into the
+  # binary, at <ApiPrefix>/ui. So the login page and the routes it posts to are
+  # already the same origin, and "UI embedded same-origin" needs no distribution
+  # to be true. What a distribution adds is a hostname in front of that origin
+  # that is not execute-api.amazonaws.com — and that is the whole of the
+  # KNOWN LIMITATION at the top of this file. Attach an alias and a certificate
+  # and the deployment gets:
+  #
+  #   * a registrable domain it controls, so cookie scoping and the CSRF
+  #     double-submit no longer rest on a name shared with every other AWS
+  #     account, and RS-2 can be satisfied with AllowInsecureCookieMode "false";
+  #   * the __Host- prefix and a Path-scoped refresh cookie that work, because
+  #     the stage segment stays on the origin side (see OriginPath below) and
+  #     the browser sees paths rooted at "/";
+  #   * TLS terminated at the edge, closer to the viewer than the region is.
+  #
+  # Without an alias it is the same distribution on a *.cloudfront.net name,
+  # which is a shared registrable domain exactly as execute-api is — so it buys
+  # the edge TLS and nothing about cookies. The parameter descriptions say so;
+  # this template will not pretend a distribution alone fixes RS-2.
+  #
+  # ---- what is deliberately NOT here ---------------------------------------
+  #
+  # No access logging and no WAF association. Both are real money — logging is
+  # an S3 bucket that grows with traffic, and a web ACL is a fixed monthly
+  # charge plus per-request — and neither is needed by anything this block
+  # delivers. A deployment that wants them adds them knowing what they cost.
+  #
+  # No second origin and no S3 bucket. The assets are in the binary; adding a
+  # bucket would split the UI across two origins, two deployments and two
+  # cache-invalidation stories, to serve fourteen files totalling well under a
+  # megabyte that the function already has in memory.
+  # ---------------------------------------------------------------------
+
+  # The cache policy, and the argument for why it caches nothing.
+  #
+  # This origin serves four classes of response and not one of them is
+  # shared-cacheable:
+  #
+  #   1. The SSR pages (<ApiPrefix>/ui, /ui/login, …). Every one embeds a
+  #      per-request config object, and the core sends
+  #      "no-store, no-cache, must-revalidate, max-age=0" on them — which is the
+  #      reference's own header (ui.router.ts:284), not an addition.
+  #   2. GET <ApiPrefix>/ui/config. It carries "no-store" and it is the request
+  #      that distributes a fresh per-client CSRF cookie. A shared cache that
+  #      stored one 200 would hand one visitor's CSRF cookie to the next.
+  #   3. Every auth route. They set session cookies and return per-user bodies.
+  #   4. The static assets. They are sent "public, max-age=0" — express.static's
+  #      maxAge: 0, reproduced (ui.router.ts:330) — so a cache may store them but
+  #      must revalidate every time, and the embedded files carry neither an
+  #      ETag nor a Last-Modified for a revalidation to succeed against. There is
+  #      therefore no hit to be had from them even in principle, only a
+  #      conditional request that always misses.
+  #
+  # Caching class 4 anyway would mean overriding a TTL the origin declared,
+  # which is the edge disagreeing with the server about the server's own policy.
+  # Caching any of 1-3 would be a security bug. So the honest configuration is
+  # the one below: min, max and default TTL all zero, which is byte for byte
+  # what the AWS-managed CachingDisabled policy is. It is declared here rather
+  # than referenced by its managed id so that a reader sees the zeros.
+  #
+  # WARNING, and the reason this comment is long: the cache key below carries
+  # NOTHING that identifies a caller — no cookie, no header, no query string,
+  # only CloudFront's own normalised Accept-Encoding. That is sound solely
+  # because the three TTLs are zero and nothing is ever stored under it. Raising
+  # any of them without also widening the key would serve one signed-in
+  # visitor's response to the next. If a later block wants edge caching, it
+  # belongs on a SEPARATE ordered cache behaviour scoped to paths that carry no
+  # credential, never on this policy.
+  AuthCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: CloudFrontEnabled
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${AWS::StackName}-auth-no-store'
+        Comment: >-
+          Caches nothing: every response from the auth origin either declares
+          no-store or carries a credential.
+        MinTTL: 0
+        MaxTTL: 0
+        DefaultTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          # Paired with Compress on the behaviour below, which is what CloudFront
+          # requires: the flag normalises the viewer's Accept-Encoding, and
+          # compression is the one thing the edge does for these responses. It
+          # adds the only component this cache key has, and since the TTLs are
+          # zero it stores nothing under it either way.
+          EnableAcceptEncodingGzip: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # What reaches the origin, which is a different question from what the cache
+  # key is and is why this is a second policy rather than more of the first.
+  #
+  # Everything the viewer sent, minus Host. All of it is load-bearing: the
+  # Cookie header carries the session, the access token and the CSRF cookie;
+  # Authorization carries a bearer token for clients in bearer mode; Origin and
+  # Referer are what the core matches against the redirect allowlist; the query
+  # string carries ?lang= on the UI routes and the whole OAuth and OIDC callback
+  # vocabulary everywhere else. A forwarding policy that dropped any of them
+  # would break a flow that works without CloudFront, which is the one thing a
+  # front door must not do.
+  #
+  # Host is the exception, and it has to be: API Gateway routes on the Host
+  # header and rejects a request carrying the viewer's. "allExcept [Host]" is
+  # the AWS-managed AllViewerExceptHostHeader policy, spelled out here for the
+  # same reason the cache policy is.
+  AuthOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: CloudFrontEnabled
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${AWS::StackName}-auth-all-viewer-except-host'
+        Comment: >-
+          Forwards every viewer header except Host, plus all cookies and all
+          query strings, to the auth origin.
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allExcept
+          Headers: [Host]
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  AuthDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: CloudFrontEnabled
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'awesome-lambda-auth front door for ${AWS::StackName} — hosted UI and API, same origin, uncached'
+        PriceClass: !Ref CloudFrontPriceClass
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Aliases: !If [HasCloudFrontAliases, !Split [',', !Ref CloudFrontAliases], !Ref 'AWS::NoValue']
+        ViewerCertificate: !If
+          - HasCloudFrontCertificate
+          - AcmCertificateArn: !Ref CloudFrontCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: HttpApiOrigin
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+            # The stage segment lives here and not in the browser's URL. A named
+            # stage serves the API under /<stage>/…; putting that on the origin
+            # means the function sees exactly the path it sees without
+            # CloudFront — which is what AWESOME_AUTH_DEPLOYMENT_STAGE tells
+            # lambdahttp to strip — while the viewer sees paths rooted at "/",
+            # which is what the __Host- cookie prefix and the Path-scoped
+            # refresh cookie require. A $default stage has no segment to move.
+            OriginPath: !If [IsDefaultStage, !Ref 'AWS::NoValue', !Sub '/${StageName}']
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              # Longer than the function can possibly take: API Gateway caps the
+              # integration at 29s and the Timeout parameter is bounded by it,
+              # so the edge never gives up on a request the origin is still
+              # answering and turns a slow login into a 504 nothing logged.
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+        DefaultCacheBehavior:
+          TargetOriginId: HttpApiOrigin
+          # The whole surface is one behaviour on purpose. There is no path
+          # under this origin that may be cached (see AuthCachePolicy), so a
+          # second behaviour could only differ in ways that are wrong.
+          ViewerProtocolPolicy: redirect-to-https
+          # CloudFront accepts exactly three sets here and this is the widest of
+          # them, spelled in its canonical order. It has to be: the auth surface
+          # is POST, PATCH and DELETE as much as it is GET, and a narrower set
+          # answers 403 at the edge for a request the origin would have served.
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          # Compression is the one thing the edge does for these responses that
+          # the origin does not: the function sends no Content-Encoding, and the
+          # HTML pages and the vendored CSS and JS compress well.
+          Compress: true
+          CachePolicyId: !Ref AuthCachePolicy
+          OriginRequestPolicyId: !Ref AuthOriginRequestPolicy
+
 Outputs:
 
   ApiEndpoint:
@@ -1823,6 +2132,28 @@ Outputs:
       - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}'
     Export:
       Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  # The distribution's own hostname, reported rather than wired.
+  #
+  # It cannot be fed back into the function's environment as
+  # AWESOME_AUTH_DEPLOYMENT_PUBLIC_URL, for exactly the reason the raw
+  # execute-api URL cannot: AuthFunction.Environment -> AuthDistribution ->
+  # HttpApi -> AuthFunction is the same circular dependency, one resource
+  # longer. An output is resolved after every resource exists, so this is where
+  # the value can be seen; setting PublicUrl to it (or to an alias) on the next
+  # deployment is a deliberate second step, and it is the step that turns off
+  # the stage-prefixed cookie path and lets RS-2 pass.
+  CloudFrontDomainName:
+    Condition: CloudFrontEnabled
+    Description: >-
+      Distribution hostname. Serves the whole stack — hosted UI under
+      <ApiPrefix>/ui and the auth routes under <ApiPrefix> — with no stage
+      segment in the path and nothing cached. On its own *.cloudfront.net name
+      this is a shared registrable domain and does not satisfy RS-2; set
+      CloudFrontAliases and CloudFrontCertificateArn for one that does.
+    Value: !Sub 'https://${AuthDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomainName'
 
   TableName:
     Description: DynamoDB single table backing every store.

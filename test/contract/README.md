@@ -32,7 +32,7 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,rate-limit`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,ui,rate-limit`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 | `AWESOME_AUTH_CONTRACT_RATE_LIMIT` | Declares this deployment's rate limiter as `<keyBy>:<max>`, e.g. `email:10`. **Opt-in and unset by default**, because a limiter cannot be probed without spending the budget it protects. Only `email:` runs the case; `ip:` is recorded absent, and anything unparseable is a fault. See below. |
 
 All four are passed through `scripts/toolchain.sh` into the container.
@@ -266,6 +266,46 @@ against both — so it is pinned in `cmd/auth/docs_test.go`, where the middlewar
 that sends it lives.
 
 
+**The hosted UI** is the whole of the reference's `ui` router, mounted at
+`<prefix>/ui` (`auth.router.ts:1640`, `src/router/ui.router.ts`): the config
+document, the server-rendered pages, the vendored assets under them. One flag
+mounts all of it — `config.ui.enabled` there, `ui.enabled` here — and it
+defaults to **off**, so an unconfigured stack answers 404 on the whole subtree
+and the three cases skip.
+
+The probe is `GET <prefix>/ui/config`, fetched **anonymously**: it is the first
+request a login page makes, before any session exists, so a probe holding one
+would hide a deployment that had put the UI behind a session. It is the document
+rather than a page for two reasons. Every page path falls through to the SSR
+catch-all, so a deployment serving a stray `index.html` would answer 200 to a
+page probe while being no UI at all; and the document is the only part of the
+surface a **headless** deployment still serves, so probing a page would report a
+legitimate SPA posture as an absent feature. A 200 that is not JSON is recorded
+as a fault rather than as the feature: the config route lives *inside* the UI
+handler, with the catch-all behind it, so a route that stopped answering would
+serve HTML with a perfectly good 200.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `ui/config-document-is-served-anonymously` | `200 application/json` with no credential; `apiPrefix` is the prefix this deployment actually serves; the three branding members that have defaults behind them (`primaryColor`, `secondaryColor`, `siteName`) are never empty; `translations` is an object and never `null`; `lang` is non-empty; `features` carries `register`; and the only cookie the response may set is the CSRF auto-init one | `ui` |
+| `ui/login-page-is-server-rendered` | `200 text/html; charset=utf-8`, `Cache-Control` carrying `no-store` and `max-age=0` because the document embeds a per-request config object, `window.__AUTH_CONFIG__` injected so the page boots without waiting for `/ui/config`, that injected object agreeing with the fetched one, and the readiness splash injected with it | `ui` |
+| `ui/mount-root-and-unknown-pages-render-the-login-page` | `<prefix>/ui`, `<prefix>/ui/` and an extensionless path with no page of its own all answer `200` with a rendered page and **no redirect** — the mount root is one page in Express and was two patterns here, and the catch-all fallback is what makes a client-side route deep-linkable | `ui` |
+
+Two things are deliberately not asserted, for the reason the docs section gives.
+`Cache-Control: no-store` on `/ui/config` is this port's own addition — the
+reference sets no header there, and `adapter/nethttp/ui.go` says so; the SSR
+pages' `no-store` *is* the reference's (`ui.router.ts:284`) and is asserted. And
+the escaping of the injected config object is the upstream deviation
+`ui-ssr-config-json-is-html-escaped`, the one place the port is stricter than
+the reference: the bytes differ, the value `JSON.parse` yields does not, so every
+case parses the object rather than matching it.
+
+Not covered here: the uploaded-asset paths, which answer 404 on this product in
+every configuration — the product deviation `ui-uploaded-assets-are-not-served`
+([deviations.md](../../docs/deviations.md)) — and headless mode, which is a
+deployment posture the suite cannot tell from an absent one without being told.
+
+
 **Rate limiting is the one capability that is declared rather than probed, and
 the one case that is opt-in.** The built-in limiter is net-new to this product —
 `awesome-node-auth` has none, `RouterOptions.rateLimiter` being an empty slot
@@ -388,6 +428,12 @@ two refusals that must not leak a token or a redirect.
 The documentation surface joins it too: the served OpenAPI document, the Swagger
 page and the url it points at, and the fact that neither route asks for a
 credential.
+
+So does the hosted UI, as far as a black-box client can see it: the config
+document the pages boot from, the server-rendered login page with its injected
+configuration and its readiness splash, and the two path shapes that are one
+page in Express and had to be made one page here — the mount root with and
+without its trailing slash, and an extensionless path with no file of its own.
 
 The rate limiter joins it on the operator's say-so only, and only as far as the
 shape of one refusal: that a `429` is the registered body, carries a usable
