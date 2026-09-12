@@ -108,6 +108,20 @@ type domain struct {
 // than a mistake — the Swagger page served in production, which puts an unpinned
 // CDN bundle on the auth origin (collectWarnings, load.go).
 //
+// Rate limiting (P6's third block) closed `rateLimit`, and it is the first
+// domain to leave this list whose defaults are not the reference's, because the
+// reference has none: it ships no limiter at all, `RouterOptions.rateLimiter`
+// being an empty slot that collapses to `rl = []` when nothing fills it
+// (auth.router.ts:46, :468). So the block does not merely reach behaviour now,
+// it reaches behaviour this product invented — `rateLimit.enabled` defaults to
+// true, and a deployment that never mentions the block answers 429 on the five
+// credential flows where the reference answers 200 (cmd/auth ratelimit.go,
+// internal/store/dynamodb rate_limit.go; the deviation is
+// rate-limited-routes-answer-429). That is also why the gate mattered more here
+// than usual: the alternative to refusing a configured-but-inert block was an
+// operator who set a budget, watched nothing be limited, and had no way to tell
+// from outside.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
@@ -136,11 +150,6 @@ func unwiredDomains() []domain {
 			phase:        "P7 (tools, telemetry, SSE, webhooks)",
 			get:          func(c *Config) any { return c.Tools },
 			secretPrefix: "tools.",
-		},
-		{
-			path:  "rateLimit",
-			phase: "P7 (rate limiting)",
-			get:   func(c *Config) any { return c.RateLimit },
 		},
 	}
 }

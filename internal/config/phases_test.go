@@ -23,10 +23,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		{"tools", func(doc Document) {
 			set(doc, "tools.basePath", "/ops")
 		}},
-		{"rateLimit", func(doc Document) {
-			set(doc, "rateLimit.enabled", true)
-			set(doc, "rateLimit.scope", []any{"login"})
-		}},
 	}
 
 	for _, tc := range cases {

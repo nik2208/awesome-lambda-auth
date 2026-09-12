@@ -138,12 +138,18 @@ runtime-mutable layer instead of refusing the deployment, and
 `runtimeSettings.require2fa` reaches a route: `POST <prefix>/2fa/disable` answers
 `403` `2FA_REQUIRED` on it.
 
-`docs` is the latest to go (§12). `docs.swagger` now decides whether the
+`docs` left it in the round before (§12). `docs.swagger` now decides whether the
 imported adapter mounts `GET <prefix>/openapi.json` and `GET <prefix>/docs`, and
 `auto` — the default — is resolved against `deployment.environment`, so an
 unconfigured deployment answers 404 on both. `docs.basePath` reaches the core
-unchanged and moves what the document describes, never where it is served. The
-four left on the list are `ui`, `admin`, `tools` and `rateLimit`.
+unchanged and moves what the document describes, never where it is served.
+
+`rateLimit` is the latest to go (§13), and it is the first domain to leave this
+list whose behaviour has no counterpart upstream at all: the reference ships no
+limiter, so there was nothing to inherit and every default is this product's.
+Configuring the block now changes what a deployment does instead of refusing it —
+and, because `rateLimit.enabled` defaults to `true`, so does configuring nothing.
+**The three left on the list are `ui`, `admin` and `tools`.**
 
 `stores.migration` (§13) never appeared on that list and never will: it is new in
 this release and is wired by the same change that declared it, so there was never
