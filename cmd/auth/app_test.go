@@ -700,7 +700,7 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 
 	// The slots no block has filled yet. Filling one means deleting its name
 	// from here in the same commit.
-	wantEmpty := []string{"settings", "docs", "ui", "admin", "tools"}
+	wantEmpty := []string{"docs", "ui", "admin", "tools"}
 	if strings.Join(empty, ",") != strings.Join(wantEmpty, ",") {
 		t.Errorf("unfilled core option slots are %v, want %v", empty, wantEmpty)
 	}

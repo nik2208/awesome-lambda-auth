@@ -440,7 +440,7 @@ func checkStoreRequirements(c *Config, d *diagnostics) {
 		"inbound webhooks are enabled and their per-provider rows and mapping scripts live in that store",
 		"enable stores.enable.webhooks, or set tools.inboundWebhooks.enabled: false")
 
-	requireStore(c.RuntimeSettings.Require2FA || len(c.RuntimeSettings.EnabledWebhookActions) > 0,
+	requireStore(runtimeSettingsConfigured(c),
 		"stores.enable.settings", c.Stores.Enable.Settings,
 		"runtimeSettings seeds are configured and the runtime-mutable layer has nowhere to live",
 		"enable stores.enable.settings, or remove the runtimeSettings block")
@@ -448,6 +448,31 @@ func checkStoreRequirements(c *Config, d *diagnostics) {
 	requireStore(c.Tools.Enabled && c.Tools.Telemetry.Enabled, "stores.enable.telemetry", c.Stores.Enable.Telemetry,
 		"the telemetry query endpoint is enabled and has no store to query",
 		"enable stores.enable.telemetry, or set tools.telemetry.enabled: false")
+}
+
+// runtimeSettingsConfigured reports whether the operator declared any
+// runtimeSettings seed, which is the condition under which stores.enable.settings
+// stops being optional.
+//
+// It is "the block differs from its defaults", the same test domainConfigured
+// applies to an unwired domain and the same one cmd/auth applies key by key when
+// it decides what to seed. The three agreeing is what makes the guarantee usable:
+// a declared seed always has a store to go into, so the composition root never
+// has to decide what to do with one that does not.
+//
+// It used to be `Require2FA || len(EnabledWebhookActions) > 0`, which was
+// narrower than the block in two ways that both ended in silence once the domain
+// was wired. A lazyEmailVerificationGracePeriodDays moved off its default would
+// not have required the store, so the seed would have had nowhere to go and
+// nothing would have said so; and an explicitly empty enabledWebhookActions —
+// the administrator switching every inbound-webhook action off, which the core
+// keeps distinct from "unset" all the way to the stored document — has length
+// zero and would have counted as unconfigured.
+func runtimeSettingsConfigured(c *Config) bool {
+	defaults := Defaults().RuntimeSettings
+	return c.RuntimeSettings.Require2FA != defaults.Require2FA ||
+		c.RuntimeSettings.EnabledWebhookActions != nil ||
+		c.RuntimeSettings.LazyEmailVerificationGracePeriodDays != defaults.LazyEmailVerificationGracePeriodDays
 }
 
 // sharedAWSHostSuffixes are the AWS-owned domains where several accounts' APIs

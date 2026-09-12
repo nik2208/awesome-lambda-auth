@@ -491,8 +491,15 @@ func coreOptionSets(
 		//
 		// Filling one is replacing that entry's nil build with a builder, and
 		// nothing else. Leaving one empty costs nothing at runtime.
-		// runtimeSettings.* — the store the admin surface mutates at run time.
-		{name: "settings"},
+		{
+			// Runtime settings: the store the admin surface mutates at run time,
+			// seeded from runtimeSettings. The third set that can do I/O at cold
+			// start — and only when the document declares a seed, since with
+			// nothing declared there is nothing to compare against — and the
+			// third that refuses for a driver that lacks the store.
+			name:  "settings",
+			build: func() ([]auth.Option, error) { return settingsOptions(ctx, cfg, users, log) },
+		},
 		// docs.* — the OpenAPI document and the docs route.
 		{name: "docs"},
 		// ui.* — the hosted UI and its config route.
@@ -604,6 +611,7 @@ type memoryStoreBundle struct {
 	links     auth.LinkedAccountStore
 	pending   auth.PendingLinkStore
 	templates auth.TemplateStore
+	settings  auth.SettingsStore
 	codes     auth.AuthCodeStore
 }
 
@@ -616,6 +624,13 @@ func newMemoryStoreBundle() memoryStoreBundle {
 		links:           auth.NewMemoryLinkedAccounts(),
 		pending:         auth.NewMemoryPendingLinks(),
 		templates:       auth.NewMemoryTemplateStore(),
+		// Per execution environment, with the consequence that a runtime settings
+		// edit made through one is invisible to the next and is lost on its next
+		// cold start — where it would also be re-seeded from the document, since
+		// an empty store holds none of the declared keys. RS-12 already refuses
+		// this driver in production; internal/store/dynamodb/settings.go is what
+		// makes an administrator's toggle outlive the execution environment.
+		settings: auth.NewMemorySettingsStore(),
 		// Per execution environment, like everything else on this driver, and
 		// with a consequence worth knowing on Lambda even in development: an
 		// authorization code minted by one environment is unknown to the next,
@@ -630,6 +645,7 @@ func newMemoryStoreBundle() memoryStoreBundle {
 func (m memoryStoreBundle) LinkedAccounts() auth.LinkedAccountStore { return m.links }
 func (m memoryStoreBundle) PendingLinks() auth.PendingLinkStore     { return m.pending }
 func (m memoryStoreBundle) Templates() auth.TemplateStore           { return m.templates }
+func (m memoryStoreBundle) Settings() auth.SettingsStore            { return m.settings }
 func (m memoryStoreBundle) AuthCodes() auth.AuthCodeStore           { return m.codes }
 
 // driverStores lists the stores.enable.<store> keys each driver can actually
@@ -648,20 +664,26 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// "templates" joined the set when the store gained its TEMPLATES
 		// partition: mail templates and UI translations are readable and
 		// patchable on this driver, so email.templatesDir seeds a store that
-		// outlives the execution environment.
+		// outlives the execution environment. "settings" joined it the same way,
+		// with the SETTINGS singleton (data-model.md §1.8): a require2FA an
+		// administrator switches on is seen by every execution environment and
+		// survives a redeploy.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
+			"settings": true,
 		}, true
 	case config.StoreDriverMemory:
-		// awesome-go-auth ships MemoryLinkedAccounts, MemoryPendingLinks and
-		// MemoryTemplateStore, and newMemoryStoreBundle hangs all three off the
-		// user store, so the development driver backs the same set as the
-		// production one. A driver that backs fewer is still refused by name in
-		// emailOptions, which is why that refusal exists.
+		// awesome-go-auth ships MemoryLinkedAccounts, MemoryPendingLinks,
+		// MemoryTemplateStore and MemorySettingsStore, and newMemoryStoreBundle
+		// hangs all four off the user store, so the development driver backs the
+		// same set as the production one. A driver that backs fewer is still
+		// refused by name in emailOptions and settingsOptions, which is why those
+		// refusals exist.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
+			"settings": true,
 		}, true
 	default:
 		return nil, false
@@ -807,6 +829,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, deliveryKnobGaps(cfg)...)
 	gaps = append(gaps, oauthKnobGaps(cfg)...)
 	gaps = append(gaps, idpKnobGaps(cfg)...)
+	gaps = append(gaps, runtimeSettingsKnobGaps(cfg)...)
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

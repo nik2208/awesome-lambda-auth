@@ -300,6 +300,32 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantPath:           "stores.enable.rbac",
 		},
 		{
+			// The rule used to read `require2FA || len(enabledWebhookActions) > 0`,
+			// which called this document unconfigured: the seed would have had
+			// nowhere to go and nothing would have said so.
+			name: "a runtime settings seed with the settings store disabled",
+			mutate: func(doc Document) {
+				set(doc, "runtimeSettings.lazyEmailVerificationGracePeriodDays", 30)
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleStoreRequired,
+			wantPath:           "stores.enable.settings",
+			wantMessage:        "runtime-mutable layer has nowhere to live",
+		},
+		{
+			// The other half the old rule missed: an explicitly empty list is the
+			// administrator switching every inbound-webhook action off, which the
+			// core keeps distinct from "unset" all the way to the stored
+			// document, and its length is zero.
+			name: "an explicitly cleared webhook allowlist with the settings store disabled",
+			mutate: func(doc Document) {
+				set(doc, "runtimeSettings.enabledWebhookActions", []any{})
+			},
+			allowUnimplemented: true,
+			wantRule:           RuleStoreRequired,
+			wantPath:           "stores.enable.settings",
+		},
+		{
 			name: "a plaintext secret in the document",
 			mutate: func(doc Document) {
 				set(doc, "security.jwt.accessTokenSecret", strings.Repeat("a", 40))

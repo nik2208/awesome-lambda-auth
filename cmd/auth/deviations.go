@@ -110,6 +110,28 @@ func WireDeviations() []WireDeviation {
 			Spec: "docs/spec/config-schema.md §1.5, §3.8 and §3.10; docs/spec/decisions.md D-17",
 		},
 		{
+			ID:      "runtime-settings-seed-only-fills-absent-keys",
+			Surface: "runtimeSettings.*, and every route that reads the settings store — today POST <prefix>/2fa/disable",
+			Behaviour: "The runtimeSettings block is a cold-start seed, applied key by key and only to the keys the " +
+				"settings store does not already hold; a key an administrator has set at run time wins over the " +
+				"document, on every cold start, for good. A key the document leaves at its schema default is not " +
+				"seeded at all.",
+			Reference: "There is no seed. routerOptions.settingsStore is whatever the host app passes and its " +
+				"contents come from whoever writes to it (src/interfaces/settings-store.interface.ts:28-40); the " +
+				"reference ships no implementation of the interface and no configuration path into one.",
+			Why: "A Lambda has no deploy step that runs code, so cold start is the only moment a declared seed can be " +
+				"applied — the same position email.templatesDir is in, and templates-dir-only-seeds-absent-ids is the " +
+				"same decision. Two things make it sharper here. Cold start recurs: a Lambda cold-starts on every " +
+				"scale-out and after every idle period, so a seed that overwrote would revert an administrator's " +
+				"toggle not at the next deployment but at an unpredictable moment in between. And the unit is a key " +
+				"rather than an item: the settings are one document, so seeding it whole on the first cold start " +
+				"would freeze every key at once, including the ones no block has a knob for yet — AuthSettings' " +
+				"nil-means-absent gives the right granularity for free. Seeding only declared keys follows from the " +
+				"same argument: writing a schema default into a runtime-mutable store is not starting from a declared " +
+				"state but inventing one, and it would make a seed added to the document later inert on arrival.",
+			Spec: "docs/spec/config-schema.md §1.19; docs/config-reference.md §12; docs/spec/decisions.md D-17 (the templates sibling)",
+		},
+		{
 			ID:      "oauth-callback-skips-the-second-factor",
 			Surface: "GET <prefix>/oauth/{provider}/callback, for an account with a second factor enabled",
 			Behaviour: "The callback issues a session and redirects, for every account it resolves. " +
