@@ -22,8 +22,8 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 - [x] P3 2FA issuer and claims — U: v0.5.0 · D: wired
 - [x] P4 OAuth — U: v0.6.0 · D: wired
 - [x] P5 IdP, JWKS, KMS, resource server — U: v0.6.0 · D: wired, con firma KMS e store dei codici OIDC
-- [ ] P6 settings, UI, docs, admin — U: v0.8.0, v0.9.0 · D: `ui`, `admin`, `docs`, `runtimeSettings`
-- [ ] P7 tools, event plane, SSE, rate limiting — U: v0.10.0 · D: `tools`, `rateLimit`
+- [ ] P6 settings, UI, docs, admin — U: v0.7.0 (docs, ui/config), v0.8.0 (store seams), v0.9.0 (vendored UI), v0.10.0 (admin router) · D: `runtimeSettings` (D3), `docs` (D4), `ui` (D7), `admin` (D8)
+- [ ] P7 tools, event plane, SSE, rate limiting — U: v0.7.0 (rate-limiter slot), v0.11.0 (event plane, webhooks, SSE, tools) · D: `rateLimit` (D5), `tools` (D9a-d)
 
 ### Product items
 - [ ] X1 Cognito migration
