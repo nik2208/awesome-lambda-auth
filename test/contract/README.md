@@ -32,9 +32,10 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs,rate-limit`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_RATE_LIMIT` | Declares this deployment's rate limiter as `<keyBy>:<max>`, e.g. `email:10`. **Opt-in and unset by default**, because a limiter cannot be probed without spending the budget it protects. Only `email:` runs the case; `ip:` is recorded absent, and anything unparseable is a fault. See below. |
 
-All three are passed through `scripts/toolchain.sh` into the container.
+All four are passed through `scripts/toolchain.sh` into the container.
 
 **Set `AWESOME_AUTH_CONTRACT_REQUIRE` for anything that is supposed to be
 complete.** Absence is unfalsifiable from outside: a session store the operator
@@ -264,6 +265,43 @@ the reference sets no such header, and the identical assertions have to run
 against both — so it is pinned in `cmd/auth/docs_test.go`, where the middleware
 that sends it lives.
 
+
+**Rate limiting is the one capability that is declared rather than probed, and
+the one case that is opt-in.** The built-in limiter is net-new to this product —
+`awesome-node-auth` has none, `RouterOptions.rateLimiter` being an empty slot
+(`auth.router.ts:46`) that collapses to `rl = []` absent (`:468`) — so there is
+no reference behaviour to compare against, and, unlike every other capability
+here, it cannot be observed by a harmless request. A limiter answers nothing
+until it refuses, and making it refuse means spending the budget it exists to
+protect: a probe that did that would flake, because the budget may already be
+part-spent by real traffic or a parallel run, and it would leave the deployment
+throttled for whoever called next.
+
+So the operator declares it, with `AWESOME_AUTH_CONTRACT_RATE_LIMIT=email:10`,
+and the case runs only then. Only `email:` is honoured. Under an account-keyed
+limiter the case spends the budget of one random never-registered address under
+`@contract.invalid` and leaves the stack exactly as it found it; under an
+address-keyed one the budget it would spend is the suite's own source address,
+shared with everyone behind the same egress, which is the state the case exists
+not to leave behind. An `ip:` declaration is therefore recorded `absent` and the
+case skips, while a declaration nobody can parse is `BROKEN` and fails — a
+malformed declaration is a fault, not a deployment without a limiter.
+
+**The case asserts the shape, not the timing.** It never asserts that the
+refusal arrives on request `max+1`: a fixed window can roll mid-run and hand back
+a fresh budget, and another caller may have spent part of the first one. It
+sends at most `2×max+2` requests, stops at the first `429`, and asserts what that
+response *is*.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `rate-limit/refusal-shape` | the refusal is `429` with the body `{"error":"Too many requests","code":"RATE_LIMITED"}` verbatim, `Content-Type: application/json` and a `Retry-After` that parses as a positive integer; it carries **no `Set-Cookie`**, not even the CSRF auto-init one, because the limiter sits ahead of the middleware that distributes it and a refused request cost nothing downstream; and **no `RateLimit-*` header** on it or on the last allowed response, since `RateLimit-Remaining` under an account-keyed counter is an oracle about somebody else's traffic | `rate-limit` |
+
+This case fails against the reference by design, in the sense that it can never
+run there: the reference has no limiter to declare. It pins the product
+deviation `rate-limited-routes-answer-429`
+([deviations.md](../../docs/deviations.md)) rather than a clause of the wire
+contract, which is why its `Doc` cites the register.
 ## Adding a case
 
 Adding a route to the covered surface is adding a `Case`, never editing the
@@ -350,6 +388,14 @@ two refusals that must not leak a token or a redirect.
 The documentation surface joins it too: the served OpenAPI document, the Swagger
 page and the url it points at, and the fact that neither route asks for a
 credential.
+
+The rate limiter joins it on the operator's say-so only, and only as far as the
+shape of one refusal: that a `429` is the registered body, carries a usable
+`Retry-After`, sets no cookie and leaks no budget. The timing is deliberately
+not covered — a suite that had to exhaust a live limiter to pass would flake and
+would leave the deployment throttled for the next caller — and neither is the
+counter's atomicity, which is pinned against a real DynamoDB in
+`internal/store/dynamodb/rate_limit_test.go` instead.
 
 Not covered: the OAuth round trip itself — the suite cannot consent at a real
 provider — so the exchange, the provisioning policy and the account-conflict
