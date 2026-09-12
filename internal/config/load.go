@@ -467,6 +467,23 @@ func collectWarnings(cfg *Config) {
 				"move it to Secrets Manager or an SSM SecureString and reference it from the document")
 		}
 	}
+	// The Swagger page served on purpose in production. It is not refused, and
+	// cmd/auth/docs.go argues why at length: the core's DocsOptions.Enabled is
+	// one switch for the page and for the machine-readable document, the product
+	// may not mount either route itself, and a refusal aimed at the page would
+	// take the document with it. What is left is to make sure the operator knows
+	// what they asked for — here rather than only in the cold-start log, because
+	// this is what the deployment tooling reads before an upload.
+	//
+	// Only the explicit "true" warns. "auto" is off in production by definition,
+	// and it is the default, so silence never reaches this.
+	if cfg.IsProduction() && cfg.Docs.Swagger == SwaggerTrue {
+		cfg.warn("docs.swagger",
+			"the Swagger UI page is served in production, and it loads swagger-ui-dist@5 from the unpkg CDN with no subresource integrity, "+
+				"so whatever that CDN serves executes on the auth origin with the cookies -- the CSRF cookie included, which is readable from JavaScript by design",
+			"set docs.swagger: auto to serve both documentation routes outside production and neither in it; "+
+				"keep true only if the third-party script on the auth origin is a risk you are taking deliberately -- the deployment answers both routes behind a Content-Security-Policy that confines it, which narrows the exposure and does not remove it")
+	}
 	if cfg.Cookies.Domain != "" && cfg.Cookies.Secure {
 		cfg.warn("cookies.domain",
 			"setting a cookie domain forfeits the __Host- prefix, so cookies fall back to __Secure-",

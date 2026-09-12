@@ -313,3 +313,79 @@ func TestEnvBindingsCoverEveryStore(t *testing.T) {
 		}
 	}
 }
+
+// TestSwaggerPageInProductionWarns: the one hazard of the docs block that the
+// product neither refuses nor silently accepts.
+//
+// `docs.swagger: true` in production serves the reference's Swagger page, which
+// loads an unpinned third-party bundle onto the auth origin. cmd/auth/docs.go
+// argues why that is a warning and not an RS rule — the core mounts the page
+// and the machine-readable document under one bool, and a refusal aimed at the
+// page would take the document with it — and this is the other half of that
+// decision: the operator hears about it, from Warnings(), which the deployment
+// tooling reads before an upload.
+//
+// The three silent rows matter as much as the loud one. A warning that fired on
+// `auto` would fire on the schema default and therefore on every deployment,
+// which is how a warning stops being read.
+func TestSwaggerPageInProductionWarns(t *testing.T) {
+	cases := []struct {
+		name        string
+		swagger     string
+		environment string
+		want        bool
+	}{
+		{"true in production", SwaggerTrue, EnvironmentProduction, true},
+		{"true outside production", SwaggerTrue, EnvironmentDevelopment, false},
+		{"auto in production", SwaggerAuto, EnvironmentProduction, false},
+		{"false in production", SwaggerFalse, EnvironmentProduction, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			set(doc, "deployment.environment", tc.environment)
+			set(doc, "docs.swagger", tc.swagger)
+
+			// AllowUnimplemented so this test asserts the warning and nothing
+			// else: it is unaffected by whether the docs domain is still behind
+			// its phase gate, and the flag touches no §2 rule and no warning
+			// (see Options.AllowUnimplemented).
+			cfg, err := Load(t.Context(), Options{
+				Document:           doc,
+				Getenv:             getenvFrom(baseEnv()),
+				AllowUnimplemented: true,
+			})
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+
+			var got *Diagnostic
+			for i, w := range cfg.Warnings() {
+				if w.Path == "docs.swagger" {
+					got = &cfg.Warnings()[i]
+				}
+			}
+			if tc.want && got == nil {
+				t.Fatalf("no warning on docs.swagger; got %v", cfg.Warnings())
+			}
+			if !tc.want {
+				if got != nil {
+					t.Fatalf("docs.swagger warned for %q in %q: %s", tc.swagger, tc.environment, got.Error())
+				}
+				return
+			}
+			// The warning has to name the hazard and not merely the knob: an
+			// operator who reads "swagger is on" learns nothing they did not
+			// type themselves.
+			for _, want := range []string{"unpkg", "subresource integrity", "CSRF cookie"} {
+				if !strings.Contains(got.Error(), want) {
+					t.Errorf("the warning does not mention %q:\n%s", want, got.Error())
+				}
+			}
+			if !strings.Contains(got.Remedy, "auto") {
+				t.Errorf("the warning does not offer docs.swagger: auto as the way out:\n%s", got.Remedy)
+			}
+		})
+	}
+}
