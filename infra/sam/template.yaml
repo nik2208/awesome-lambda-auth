@@ -81,9 +81,21 @@ Metadata:
       - Label: {default: Storage}
         Parameters: [TableNamePrefix, MaxReadRequestUnits, MaxWriteRequestUnits, EnableDeletionProtection]
       - Label: {default: Function}
-        Parameters: [MemorySize, Timeout, LogRetentionDays, SessionCheckOn]
+        Parameters: [MemorySize, Timeout, ReservedConcurrentExecutions, SessionCheckOn]
       - Label: {default: Content delivery (CloudFront)}
         Parameters: [EnableCloudFront, CloudFrontAliases, CloudFrontCertificateArn, CloudFrontPriceClass]
+      - Label: {default: Observability and alarms}
+        Parameters:
+          - LogRetentionDays
+          - EnableAlarms
+          - AlarmEmail
+          - AlarmTopicArn
+          - DurationAlarmThresholdMs
+          - ConcurrencyAlarmThreshold
+          - CapacityAlarmUnits
+          - LogIngestionAlarmBytes
+      - Label: {default: Budget}
+        Parameters: [BudgetLimitUsd, BudgetTimeUnit, EnableCostAnomalyDetection]
 
 Parameters:
 
@@ -738,11 +750,41 @@ Parameters:
       Seconds. Not the 15-minute default: nothing in the auth router should
       take longer than an API Gateway integration is willing to wait (29s).
 
-  LogRetentionDays:
-    Type: Number
-    Default: 14
-    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
-    Description: CloudWatch Logs retention. Never-expire is a slow-growing bill.
+  # Concurrency. This is the only HARD stop in the stack, and it is off by
+  # default — see the AlarmEmail note below for why nothing else here is one.
+  #
+  # An alarm tells you a runaway is running. A reservation stops it: the function
+  # cannot exceed this many simultaneous execution environments, and Lambda
+  # answers 429 (TooManyRequestsException) past it, which the Errors and Throttles
+  # alarms then report. That bounds the bill of a recursive invocation, of an SSE
+  # long-poll that never closes, and of a credential-stuffing run, in the only way
+  # a bill can actually be bounded — by refusing work.
+  #
+  # It is empty by default because the refusal is indiscriminate: past the
+  # reservation real logins get the same 429 as the runaway, so a number set too
+  # low is a self-inflicted outage. It also *removes* that concurrency from the
+  # account's unreserved pool, where every other function in the region draws
+  # from, so the number is an account-wide decision and not a stack-local one.
+  #
+  # Pick it from measured duration, not from imagination: at ~300 ms a login
+  # (README "Measured on a real deployment"), one reserved execution environment
+  # sustains a little over three logins a second, so 20 is ~60 logins/s — far
+  # above anything this deployment has seen and far below an account's default
+  # 1 000. Zero is NOT "unset": Lambda reads a reservation of 0 as "throttle
+  # everything", which is why the sentinel is the empty string.
+  ReservedConcurrentExecutions:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[0-9]{1,5}$'
+    ConstraintDescription: >-
+      ReservedConcurrentExecutions must be a whole number of execution
+      environments, or empty for no reservation. Note that 0 is a real value and
+      means "throttle every invocation".
+    Description: >-
+      Cap the function's simultaneous execution environments. Empty — the
+      default — reserves nothing and leaves it drawing on the account pool. This
+      is the only hard spend limit in the stack; everything else here is an
+      alert.
 
   SessionCheckOn:
     Type: String
@@ -820,6 +862,190 @@ Parameters:
       handshake and nothing else, so paying for one is paying for latency
       smoothing, not for hit rate.
 
+  # -----------------------------------------------------------------------
+  # Observability, alarms and budget
+  # =======================================================================
+  #
+  # The whole of this section exists because of one asymmetry: this stack costs
+  # under a dollar a month at rest and there is no ceiling on what it can cost
+  # in an afternoon. Steady-state spend is not the risk — the KMS key at USD
+  # 1.00, the two secrets at USD 0.40 each, CloudFront and DynamoDB at zero when
+  # idle. The risk is an incident that looks healthy: a function that starts
+  # timing out bills its whole timeout on every request, a stream consumer that
+  # re-invokes itself runs until something stops it, a log group with no expiry
+  # grows forever, and a long-lived connection bills GB-seconds for as long as
+  # nobody notices it is still open.
+  #
+  # **NOTHING BELOW IS A SPENDING CAP, AND AWS DOES NOT SELL ONE.** An alarm and
+  # a budget both notify; neither stops a service, and a budget in particular
+  # will not turn anything off when it trips. The only hard stop in this template
+  # is ReservedConcurrentExecutions above, and the only other real ones are the
+  # DynamoDB MaxRead/MaxWriteRequestUnits ceilings. Everything here is how you
+  # find out in ten minutes instead of at the end of the month.
+  #
+  # Costs. Nine standard-resolution alarm metrics, against a CloudWatch
+  # always-free allowance of ten — so in an account with no other alarms this
+  # section is free, and USD 0.90/month in one that has already spent the
+  # allowance. The SNS topic and its subscription cost nothing at rest and are
+  # not created at all unless AlarmEmail is set. The budget is the second budget
+  # in an account that has the AWS-provided zero-spend one, and the first two per
+  # account are free. Cost anomaly detection is free. Prices are at the time of
+  # writing, as everywhere else in this file; check them before budgeting on them.
+  # -----------------------------------------------------------------------
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: >-
+      CloudWatch Logs retention, in days, for EVERY log group this stack owns.
+      Never-expire is a slow-growing bill that nobody ever goes back and fixes:
+      ~0.50 USD per GB ingested is paid once, ~0.03 per GB-month is paid forever.
+      14 days is long enough to debug last week's incident and short enough that
+      the stored volume stops growing.
+
+  EnableAlarms:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create the nine CloudWatch alarms. On by default: they are within the
+      always-free ten alarm metrics, and an unmonitored serverless stack is the
+      failure mode this section exists to prevent. Turn them off only in an
+      account whose free allowance is already spent and where 0.90 USD/month is
+      not worth it — or where the alarms are managed centrally somewhere else.
+
+  # The notification target. Empty is the default and empty means NOTHING is
+  # created — no topic, no subscription, no charge — and the alarms are then
+  # visible in the console with no action attached.
+  #
+  # It is a parameter and not a literal because an address in a template is a
+  # repository-wide leak of somebody's mailbox, and because the address that
+  # should receive a production alarm is never the address of whoever wrote the
+  # stack. The same goes for the ARN below: neither an account id nor an address
+  # is ever committed here.
+  #
+  # Alarms with no action are decoration, so set one of these for anything real.
+  AlarmEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: AlarmEmail must be an email address, or empty.
+    Description: >-
+      Address to notify. Creates an SNS topic and subscribes this address to it;
+      SNS then sends a confirmation mail that MUST be clicked or the subscription
+      stays pending and every alarm publishes into nothing. Mutually exclusive
+      with AlarmTopicArn. Empty — the default — creates no topic and gives the
+      alarms no action.
+
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:sns:[a-z0-9-]+:\d{12}:[A-Za-z0-9_-]+$'
+    ConstraintDescription: AlarmTopicArn must be an SNS topic ARN, or empty.
+    Description: >-
+      Existing SNS topic to notify instead of creating one — the right choice
+      when alerts already go somewhere (a chat bridge, PagerDuty, an account-wide
+      topic). It must live in this stack's region, because a CloudWatch alarm can
+      only publish to a topic in its own region. If BudgetLimitUsd or
+      EnableCostAnomalyDetection is also set, the topic's access policy must let
+      budgets.amazonaws.com and costalerts.amazonaws.com publish to it: this
+      stack can only write that policy for a topic it owns.
+
+  # Thresholds. Each one is a number this template can defend, not a round figure:
+  # see the alarm that consumes it for what incident it is drawn against.
+  DurationAlarmThresholdMs:
+    Type: Number
+    Default: 8000
+    MinValue: 1
+    MaxValue: 29000
+    Description: >-
+      Alarm when the function's slowest invocation in a 5-minute window exceeds
+      this, twice running. The default is 80% of the default Timeout of 10 s: a
+      function that has started timing out bills its entire timeout on every
+      request, so the alarm has to fire BEFORE the timeout rather than on it.
+      **Raise this whenever you raise Timeout** — the two are coupled and
+      CloudFormation cannot do the arithmetic. infra/sam/template_test.go asserts
+      the defaults stay in that relationship.
+
+  ConcurrencyAlarmThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: >-
+      Alarm when this many execution environments run simultaneously for five
+      minutes. At the measured ~300 ms login this is ~165 logins a second
+      sustained; at the measured ~1.1 ms /healthz it is far more. It is a smoke
+      detector for the three incidents that show up here first — a recursive
+      invocation, a long-poll that never closes, a stampede — and not a limit.
+      The limit is ReservedConcurrentExecutions.
+
+  CapacityAlarmUnits:
+    Type: Number
+    Default: 18000
+    MinValue: 1
+    Description: >-
+      Alarm when consumed read or write capacity units total this much in five
+      minutes. 18 000 is 60 units a second, 30% of the MaxRead/MaxWriteRequestUnits
+      ceiling of 200 — early enough to be a warning rather than an autopsy. The
+      write half has a precise meaning here: the rate limiter spends exactly 1 WCU
+      per limited request, allowed or refused (internal/store/dynamodb/rate_limit.go),
+      so 60 WCU/s sustained for five minutes is ~18 000 credential attempts, which
+      is a stuffing run and not a user base.
+
+  LogIngestionAlarmBytes:
+    Type: Number
+    Default: 26214400
+    MinValue: 1
+    Description: >-
+      Alarm when the auth log group ingests this many bytes in an hour. 25 MiB is
+      roughly 65 000 requests an hour at the two lines and few hundred bytes each
+      this binary writes per request — traffic this deployment has never seen. It
+      catches the thing retention cannot: a loop that logs per iteration, which is
+      billed at ~0.50 USD/GB on the way in and is almost always a symptom of the
+      incident rather than the incident.
+
+  # Budget. Read the argument at BudgetResource before setting this; the short
+  # version is that it is deliberately NOT a second zero-spend budget, because
+  # the zero-spend budget an account already has cannot fire while promotional
+  # credit is covering the bill.
+  BudgetLimitUsd:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Create an AWS Budget at this many USD of GROSS consumption — credits and
+      refunds excluded, which is what makes it different from the AWS-provided
+      "My Zero-Spend Budget". 0 — the default — creates no budget at all, because
+      a template deployed by a stranger must not silently add a budget to their
+      account. A budget notifies and NEVER caps: AWS does not stop services when
+      one trips.
+
+  BudgetTimeUnit:
+    Type: String
+    Default: ANNUALLY
+    AllowedValues: [MONTHLY, QUARTERLY, ANNUALLY]
+    Description: >-
+      The period BudgetLimitUsd applies to. ANNUALLY is the default because the
+      question a credit-covered deployment has to answer is cumulative ("how much
+      of the grant is left"), not monthly; a monthly budget resets every month
+      and would never see a slow burn add up. The period begins at the start of
+      the current one, so an annual budget created today runs to the end of this
+      calendar year.
+
+  EnableCostAnomalyDetection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create an AWS Cost Anomaly Detection monitor and subscription. Free, and it
+      is the one thing here that needs no threshold decided in advance: it learns
+      the shape of this account's spend and reports departures from it, which is
+      exactly the "0.75 USD/month became 40" case. Requires AlarmEmail or
+      AlarmTopicArn. Off by default — see the note on the resources for the one
+      caveat, which is that Cost Explorer is a global service and this is the only
+      thing in this template that a regional stack might have to create elsewhere.
+
 Conditions:
   IsDefaultStage: !Equals [!Ref StageName, '$default']
   GenerateJwtAccessSecret: !Equals [!Ref JwtAccessSecretArn, '']
@@ -885,6 +1111,21 @@ Conditions:
   CloudFrontEnabled: !Equals [!Ref EnableCloudFront, 'true']
   HasCloudFrontAliases: !Not [!Equals [!Ref CloudFrontAliases, '']]
   HasCloudFrontCertificate: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
+
+  # Observability. HasAlarmTarget is the one every notifying resource is gated
+  # on: with neither parameter set, no topic is created, no subscription exists,
+  # no address appears anywhere, and the alarms carry no AlarmActions at all.
+  AlarmsEnabled: !Equals [!Ref EnableAlarms, 'true']
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+  HasExternalAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+  CreateAlarmTopic: !And [!Condition HasAlarmEmail, !Not [!Condition HasExternalAlarmTopic]]
+  HasAlarmTarget: !Or [!Condition CreateAlarmTopic, !Condition HasExternalAlarmTopic]
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrentExecutions, '']]
+  BudgetEnabled: !Not [!Equals [!Ref BudgetLimitUsd, '0']]
+  BudgetNotifies: !And [!Condition BudgetEnabled, !Condition HasAlarmTarget]
+  CostAnomalyDetectionEnabled: !And
+    - !Equals [!Ref EnableCostAnomalyDetection, 'true']
+    - !Condition HasAlarmTarget
 
 # ---------------------------------------------------------------------------
 # Rules are evaluated before a changeset is created, which is the only place a
@@ -1054,6 +1295,36 @@ Rules:
           distribution would keep its *.cloudfront.net name and present the default
           certificate — the one you supplied would be attached to nothing. Set the
           domains, or clear the ARN.
+
+  # Both notification parameters name the same thing, and honouring one silently
+  # over the other is how an operator ends up watching a topic nothing publishes
+  # to. Refusing the pair costs one redeploy and removes a whole class of "the
+  # alarm never fired" — which is the only failure mode of an alarm that matters.
+  AlarmEmailAndTopicAreExclusive:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref AlarmEmail, '']
+          - !Equals [!Ref AlarmTopicArn, '']
+        AssertDescription: >-
+          AlarmEmail and AlarmTopicArn both name where alarms go, so set exactly
+          one. To have both, set AlarmTopicArn to your own topic and subscribe the
+          address to it there — a topic you own is the one place a subscription
+          list belongs.
+
+  # A monitor with no subscriber is a monitor that detects anomalies and tells
+  # nobody, and AWS refuses the subscription without one anyway; failing at the
+  # changeset says so in a sentence instead of in a rollback.
+  CostAnomalyDetectionNeedsANotificationTarget:
+    RuleCondition: !Equals [!Ref EnableCostAnomalyDetection, 'true']
+    Assertions:
+      - Assert: !Not
+          - !And
+            - !Equals [!Ref AlarmEmail, '']
+            - !Equals [!Ref AlarmTopicArn, '']
+        AssertDescription: >-
+          EnableCostAnomalyDetection is "true", so set AlarmEmail or AlarmTopicArn.
+          A cost anomaly subscription requires a subscriber, and one that notified
+          nothing would be a detector whose output nobody ever sees.
 
 Resources:
 
@@ -1322,6 +1593,35 @@ Resources:
       # second one.
       FailOnWarnings: true
 
+  # ---------------------------------------------------------------------
+  # THE LOG GROUP CONVENTION — read this before adding a function
+  # ---------------------------------------------------------------------
+  #
+  # **Every function this stack adds gets an explicit log group, named
+  # /aws/lambda/<its FunctionName>, with RetentionInDays: !Ref LogRetentionDays,
+  # and the function DependsOn it.** Three properties, all of them load-bearing:
+  #
+  #   * Explicit, because a log group Lambda creates for itself has NO EXPIRY AT
+  #     ALL. That is not a default this template can change afterwards for a
+  #     group CloudFormation does not own — and it is the one cost mistake in a
+  #     serverless stack that compounds silently, because nothing about a
+  #     never-expiring log group looks wrong until the storage line does.
+  #   * Named exactly /aws/lambda/<FunctionName>, because that is the name Lambda
+  #     itself would use. Get one character wrong and the deployment succeeds:
+  #     CloudFormation creates a log group nothing writes to, Lambda creates the
+  #     real one with no expiry, and the stack looks correct.
+  #   * DependsOn, because it is a race. Without the ordering the function can be
+  #     invoked — and therefore create its own group — before CloudFormation
+  #     creates this one, and the create then fails with "log group already
+  #     exists" or, worse, succeeds against a group whose retention was never set.
+  #
+  # This is a convention and not a mechanism, so it is ENFORCED BY A TEST:
+  # infra/sam/template_test.go reads this file, finds every function in it, and
+  # fails if any one of them lacks a matching log group, a retention that is
+  # !Ref LogRetentionDays, or the DependsOn. A later block that adds the SSE
+  # function, the webhook worker, the script runner or the migrate job gets a red
+  # build rather than a bill nobody reads. That test is the reason this comment
+  # can be a paragraph instead of a checklist somebody has to remember.
   AuthLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -1342,6 +1642,10 @@ Resources:
       Architectures: [arm64]
       MemorySize: !Ref MemorySize
       Timeout: !Ref Timeout
+      # Empty means no reservation, and no reservation is the default. See the
+      # parameter: this is the stack's only hard spend limit, and the reason it
+      # is off is that past it real logins are refused exactly as a runaway is.
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrentExecutions, !Ref 'AWS::NoValue']
       Environment:
         Variables:
           # --- deployment ------------------------------------------------
@@ -2122,6 +2426,570 @@ Resources:
           CachePolicyId: !Ref AuthCachePolicy
           OriginRequestPolicyId: !Ref AuthOriginRequestPolicy
 
+  # =====================================================================
+  # Observability
+  # =====================================================================
+  #
+  # Nine alarms, one optional topic to send them to, one optional budget and one
+  # optional anomaly monitor. Each alarm below states the incident it catches and
+  # why its threshold is that number, because an alarm whose threshold nobody can
+  # justify is an alarm somebody eventually silences.
+  #
+  # None of them has an OKActions, deliberately. "The alarm cleared" is not news
+  # — the console and the alarm history both have it — and doubling the volume of
+  # mail is the reliable way to get alarms filtered into a folder nobody reads.
+  #
+  # All of them treat missing data as not breaching. A stack with no traffic
+  # publishes no Lambda and no DynamoDB metrics at all, and an alarm that went
+  # off because nothing happened would be an alarm turned off within the week.
+
+  # The notification target, created only when AlarmEmail is set.
+  #
+  # NOT ENCRYPTED, and that is a decision rather than an omission: an SNS topic
+  # encrypted with the AWS-managed aws/sns key cannot be published to by
+  # CloudWatch, Budgets or Cost Anomaly Detection, because those services cannot
+  # be granted use of an AWS-managed key. The result is the worst possible
+  # failure — a stack that deploys, a topic that looks right, and alarms that
+  # silently reach nobody. A customer-managed key with a policy for all three
+  # service principals would work and costs USD 1.00/month; what travels through
+  # here is an alarm name and a metric value, so it is not worth the dollar or
+  # the extra failure mode.
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateAlarmTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+      DisplayName: !Sub '${AWS::StackName} alarms'
+      Subscription:
+        # SNS sends a confirmation mail to this address and the subscription
+        # stays *pending* until somebody clicks it. An unconfirmed subscription
+        # is indistinguishable from a working one in the stack's output, so
+        # confirm it and then trip an alarm on purpose once.
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  # A TopicPolicy REPLACES the topic's access policy; it does not add to it. The
+  # first statement is therefore the default policy AWS would have written,
+  # reproduced — without it, deploying this would take the account's own ability
+  # to publish, subscribe or manage the topic away.
+  #
+  # The other three are the service principals that need explicit permission.
+  # CloudWatch would in fact be covered by the default SourceOwner condition;
+  # it is spelled out anyway so that the list of what may publish here is the
+  # list a reader can see. Each is scoped by aws:SourceAccount, which is the
+  # confused-deputy guard: without it the statement authorises *any* account's
+  # budget to publish into this topic.
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateAlarmTopic
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: OwnerFullControl
+            Effect: Allow
+            Principal: {AWS: !Ref 'AWS::AccountId'}
+            Action:
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:AddPermission
+              - sns:RemovePermission
+              - sns:DeleteTopic
+              - sns:Subscribe
+              - sns:ListSubscriptionsByTopic
+              - sns:Publish
+            Resource: !Ref AlarmTopic
+          - Sid: CloudWatchAlarms
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+          - Sid: Budgets
+            Effect: Allow
+            Principal: {Service: budgets.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+          - Sid: CostAnomalyDetection
+            Effect: Allow
+            Principal: {Service: costalerts.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlarmTopic
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+
+  # ── the function ────────────────────────────────────────────────────
+  #
+  # Errors, Throttles, Duration, ConcurrentExecutions. This quartet is the
+  # per-function set, and **a later block that adds a function adds its own four**
+  # — the SSE function above all, which is the one this whole section was
+  # sequenced before. Four alarm metrics per function at USD 0.10 each past the
+  # free ten; a five-function stack is around USD 1.00/month in alarms, which is
+  # the right price for knowing.
+
+  # Invocations that FAILED, which is a different and much narrower thing than
+  # requests that answered 4xx or 5xx: the auth router returns those through the
+  # adapter as successful invocations. A datapoint here means the handler itself
+  # did not answer — a refuse-to-start rule tripping at init (every request 500s
+  # until it is fixed), a panic, an event shape the adapter could not decode.
+  #
+  # The threshold is 1 because the steady-state value is 0. There is no "a few
+  # errors are normal" regime for this metric in this stack, so a percentage
+  # would only delay the message.
+  AuthErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-auth-errors'
+      AlarmDescription: >-
+        The auth function failed an invocation. Not a 4xx or a 5xx the router
+        returned — those are successful invocations — but the handler itself not
+        answering: a refuse-to-start rule, a panic, an undecodable event.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref AuthFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # Invocations Lambda refused. Two causes, and both want knowing about:
+  # ReservedConcurrentExecutions if one is set — the hard cap doing its job, and
+  # therefore real users being refused — or the account's unreserved pool being
+  # exhausted, which is every other function in the region being refused too.
+  #
+  # Threshold 1, for the same reason as Errors: the normal value is zero.
+  AuthThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-auth-throttles'
+      AlarmDescription: >-
+        Lambda refused an invocation of the auth function — the reservation
+        binding, or the account's concurrency pool exhausted. Either way, someone
+        got a 429 they did not deserve.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref AuthFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # Duration approaching the timeout, which is a COST alarm as much as a latency
+  # one: Lambda bills GB-milliseconds, so a function that has started timing out
+  # bills its entire configured timeout on every request instead of the ~1 ms of
+  # a /healthz or the ~300 ms of a login. At the default 10 s that is a thirtyfold
+  # bill increase per request, arriving with no change in traffic.
+  #
+  # Maximum and not Average: one invocation sitting on a dead downstream is
+  # invisible in an average over a busy period, and it is the one that is about to
+  # become all of them. Two consecutive periods, because a single slow request —
+  # a cold start behind a slow Secrets Manager, one retried SES call — is not an
+  # incident, and an alarm that fires on those gets muted.
+  AuthDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-auth-duration'
+      AlarmDescription: >-
+        The auth function's slowest invocation is approaching its timeout, twice
+        running. A function that times out bills its whole timeout on every
+        request; this fires before that, not after.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref AuthFunction}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref DurationAlarmThresholdMs
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # Simultaneous execution environments. This is the alarm for the two incidents
+  # the plan for this stack is actually afraid of, and it catches them HOURS
+  # before any spend signal does — CloudWatch billing metrics update roughly every
+  # six hours and Cost Explorer is a day behind, while this is a minute behind:
+  #
+  #   * an SSE connection (or any long poll) that never closes. Each one holds an
+  #     execution environment for its whole life and bills GB-seconds the entire
+  #     time, while every dashboard shows a healthy function answering quickly.
+  #     Concurrency is the only metric that moves.
+  #   * a recursive invocation. Lambda's own recursion detection covers
+  #     Lambda→SQS/SNS→Lambda loops, not a function that re-enters through HTTP,
+  #     and this stack's next blocks add exactly those transports.
+  #
+  # Sustained for five minutes at one-minute resolution, so a burst of parallel
+  # logins does not page anybody; a spin loop holds the number up and a crowd
+  # does not.
+  AuthConcurrencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-auth-concurrency'
+      AlarmDescription: >-
+        The auth function has held this many simultaneous execution environments
+        for five minutes. The first and fastest signal of a connection that never
+        closes or an invocation that re-enters itself — both of which bill
+        GB-seconds while looking perfectly healthy.
+      Namespace: AWS/Lambda
+      MetricName: ConcurrentExecutions
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref AuthFunction}
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: !Ref ConcurrencyAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # ── the table ───────────────────────────────────────────────────────
+  #
+  # Throttles and consumed capacity, read and write kept apart in both pairs. The
+  # split is not symmetry for its own sake: which side moves is most of the
+  # diagnosis. Writes are registrations, sessions and — above all — the rate
+  # limiter's own counter; reads are logins, session checks and the hosted UI.
+
+  # The write ceiling binding. MaxWriteRequestUnits is 200, so this fires when
+  # the deliberate cap in this template is doing its job and refusing writes: a
+  # credential-stuffing run has become a DynamoDB bill, and the limiter is
+  # failing open because its counter lives in the same table (ratelimit.go).
+  AuthTableWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-table-write-throttles'
+      AlarmDescription: >-
+        DynamoDB refused a write against the auth table — MaxWriteRequestUnits
+        binding. Registrations, session writes and every rate-limiter counter are
+        being dropped, and the limiter fails open when its own counter cannot be
+        written.
+      Namespace: AWS/DynamoDB
+      MetricName: WriteThrottleEvents
+      Dimensions:
+        - {Name: TableName, Value: !Ref AuthTable}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # The read ceiling binding. Logins, session lookups and — once the hosted UI is
+  # on — two reads per rendered page. A read throttle is a login that fails for a
+  # reason the user cannot act on.
+  AuthTableReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-table-read-throttles'
+      AlarmDescription: >-
+        DynamoDB refused a read against the auth table — MaxReadRequestUnits
+        binding. Logins and session checks are failing for a reason no caller can
+        do anything about.
+      Namespace: AWS/DynamoDB
+      MetricName: ReadThrottleEvents
+      Dimensions:
+        - {Name: TableName, Value: !Ref AuthTable}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # Consumed capacity, which is the same incident caught a step earlier and is
+  # why both pairs exist. A throttle alarm says the ceiling is binding; this says
+  # the ceiling is being approached, while there is still room to decide whether
+  # to raise it or to stop what is causing it. It is also the one alarm that maps
+  # directly onto money: 1.25 USD per million writes, 0.25 per million reads.
+  AuthTableWriteCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-table-write-capacity'
+      AlarmDescription: >-
+        Consumed write capacity on the auth table is approaching the
+        MaxWriteRequestUnits ceiling. The rate limiter spends 1 WCU per limited
+        request whether it allows or refuses it, so sustained write capacity at
+        this level is a credential-attempt rate, not a user base.
+      Namespace: AWS/DynamoDB
+      MetricName: ConsumedWriteCapacityUnits
+      Dimensions:
+        - {Name: TableName, Value: !Ref AuthTable}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref CapacityAlarmUnits
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  AuthTableReadCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-table-read-capacity'
+      AlarmDescription: >-
+        Consumed read capacity on the auth table is approaching the
+        MaxReadRequestUnits ceiling. With sessions.checkOn "allcalls" every
+        authenticated request is a strongly-consistent read, so this is the alarm
+        that moves first when that knob is turned up — and it is also where a
+        polling event stream will show up.
+      Namespace: AWS/DynamoDB
+      MetricName: ConsumedReadCapacityUnits
+      Dimensions:
+        - {Name: TableName, Value: !Ref AuthTable}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref CapacityAlarmUnits
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # ── the logs ────────────────────────────────────────────────────────
+  #
+  # The bill retention cannot touch. RetentionInDays bounds what is STORED, at
+  # ~0.03 USD per GB-month; nothing bounds what is INGESTED, at ~0.50 USD per GB,
+  # and ingestion is charged once whether the line is read or not. A loop that
+  # logs per iteration therefore spends money at the rate it spins, and the log
+  # group is usually where that incident is visible first — a function looping
+  # inside one invocation does not even move the Invocations metric.
+  #
+  # Deliberately hourly rather than five-minutely: this is a bleed, not a spike,
+  # and an hour of data is what distinguishes the two.
+  AuthLogIngestionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AlarmsEnabled
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-auth-log-ingestion'
+      AlarmDescription: >-
+        The auth log group is ingesting far more than this deployment's traffic
+        can explain. Log ingestion is billed per GB on the way in, so a loop that
+        logs per iteration spends money at the rate it spins — and retention,
+        which bounds storage only, does nothing about it.
+      Namespace: AWS/Logs
+      MetricName: IncomingBytes
+      Dimensions:
+        - {Name: LogGroupName, Value: !Ref AuthLogGroup}
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref LogIngestionAlarmBytes
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTarget
+        - [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
+        - !Ref 'AWS::NoValue'
+
+  # =====================================================================
+  # The budget, and why it is not a second zero-spend budget
+  # =====================================================================
+  #
+  # THE DECISION: add one, off by default, and make it blind to credits.
+  #
+  # The argument, because "add a budget" is otherwise indistinguishable from
+  # duplicating something the account already has.
+  #
+  # 1. **A budget is an alert, not a cap.** AWS does not stop services when one
+  #    trips; it sends a notification. If credit runs out and spend continues,
+  #    the charge falls to the payment method on file whatever any budget says.
+  #    Nothing in AWS caps spend. The only caps in this stack are
+  #    ReservedConcurrentExecutions and the two DynamoDB request-unit ceilings.
+  #
+  # 2. **The zero-spend budget an account already has cannot fire while credit is
+  #    covering the bill.** AWS's own "My Zero-Spend Budget" template alerts above
+  #    USD 0.01 of *actual* cost, and actual cost is computed with credits
+  #    included — a credit applied to a charge is a negative line that nets it to
+  #    zero. So a deployment burning USD 40 a month against a promotional grant
+  #    shows USD 0.00 to that budget and it stays silent for the entire period in
+  #    which the money is being spent. It fires the month the credit runs out,
+  #    which is the month it is no longer useful.
+  #
+  # 3. **This one sets IncludeCredit: false**, so it measures gross consumption —
+  #    which is both a different number from the console budget's and the exact
+  #    number a "stop when cumulative consumption approaches N" rule is written
+  #    against. That is why it is not a duplicate: two budgets on the same account
+  #    measuring the same thing would be noise; these two measure different things
+  #    and the second one is the one that can speak.
+  #
+  # 4. **No public API reports a promotional credit balance.** It cannot be read,
+  #    only inferred — consumption comes from Cost Explorer and the remaining
+  #    credit is the grant minus that. This budget is an alert on the half that
+  #    can be measured, and .tools/credit.sh does the same arithmetic by hand.
+  #    docs/cost-model.md §6 states the method.
+  #
+  # 5. **Cost, and why "two" matters.** The first two budgets per account are
+  #    free; past that it is about USD 0.02 per budget per day. An account with
+  #    the AWS zero-spend budget is at one, so this is the free second — and a
+  #    third, added later without noticing, is ~USD 0.60/month for the privilege.
+  #
+  # Scope is the whole account and not this stack. Scoping a budget to a stack
+  # needs cost allocation tags activated in the billing console, which
+  # CloudFormation cannot do and which only start collecting data from the day
+  # they are switched on. Account-wide is also the honest scope for the question
+  # being asked, which is "how much of the grant is gone", not "how much did this
+  # one stack cost".
+  AuthBudget:
+    Type: AWS::Budgets::Budget
+    Condition: BudgetEnabled
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-gross-consumption'
+        BudgetType: COST
+        TimeUnit: !Ref BudgetTimeUnit
+        BudgetLimit:
+          Amount: !Ref BudgetLimitUsd
+          Unit: USD
+        CostTypes:
+          # The two that make this budget different from the console's. Credits
+          # excluded means the number tracks what was consumed, not what was
+          # charged; refunds excluded means a refund cannot make consumption
+          # appear to go down.
+          IncludeCredit: false
+          IncludeRefund: false
+          # Everything else is left as AWS's defaults, spelled out rather than
+          # omitted so a reader can see that nothing else was quietly changed.
+          IncludeDiscount: true
+          IncludeOtherSubscription: true
+          IncludeRecurring: true
+          IncludeSubscription: true
+          IncludeSupport: true
+          IncludeTax: true
+          IncludeUpfront: true
+          UseAmortized: false
+          UseBlended: false
+      # Three notifications, and the forecast one is the only one that arrives in
+      # time to do anything about. AWS needs roughly five weeks of history before
+      # it will forecast at all, so a new account gets the two actual thresholds
+      # and starts getting the third later.
+      NotificationsWithSubscribers: !If
+        - BudgetNotifies
+        - - Notification:
+              NotificationType: ACTUAL
+              ComparisonOperator: GREATER_THAN
+              Threshold: 80
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: SNS
+                Address: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
+          - Notification:
+              NotificationType: ACTUAL
+              ComparisonOperator: GREATER_THAN
+              Threshold: 100
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: SNS
+                Address: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
+          - Notification:
+              NotificationType: FORECASTED
+              ComparisonOperator: GREATER_THAN
+              Threshold: 100
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: SNS
+                Address: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
+        - !Ref 'AWS::NoValue'
+
+  # Cost anomaly detection: the spend alarm that needs no threshold agreed in
+  # advance, which is the reason it is here alongside a budget rather than
+  # instead of one. A budget answers "have we passed a number we chose"; this
+  # answers "is this month shaped like the last ones", and the incident this
+  # stack is exposed to — steady USD 0.75 a month becoming USD 40 in a week — is
+  # a shape long before it is a number.
+  #
+  # It is also the ONLY spend signal available to a CloudFormation stack at all.
+  # A CloudWatch alarm on AWS/Billing EstimatedCharges is not an option here:
+  # billing metrics are published in us-east-1 only, and a CloudWatch alarm can
+  # only watch metrics in its own region — so a eu-west-1 stack cannot create
+  # one, and a template that appeared to would create an alarm on a metric that
+  # never reports. Budgets and Cost Explorer are global services and are
+  # reachable from any region, which is why both of these resources can live
+  # here.
+  #
+  # THE ONE CAVEAT, stated because this block is validated by reading and never
+  # by a deploy: Cost Explorer's own API endpoint is us-east-1. CloudFormation
+  # resolves that for a global service and these are documented as ordinary
+  # resource types with no region constraint, but if a changeset ever rejects
+  # them, the fix is a small companion stack in us-east-1 and not a redesign —
+  # which is also why this is the one thing in the section that defaults to off.
+  CostAnomalyMonitor:
+    Type: AWS::CE::AnomalyMonitor
+    Condition: CostAnomalyDetectionEnabled
+    Properties:
+      MonitorName: !Sub '${AWS::StackName}-by-service'
+      # DIMENSIONAL over SERVICE: anomalies are attributed to the service that
+      # caused them, so the notification says "Lambda" or "CloudWatch Logs"
+      # rather than "your account". Given how few services this stack uses, that
+      # is most of the triage done before anybody opens the console.
+      MonitorType: DIMENSIONAL
+      MonitorDimension: SERVICE
+
+  CostAnomalySubscription:
+    Type: AWS::CE::AnomalySubscription
+    Condition: CostAnomalyDetectionEnabled
+    Properties:
+      SubscriptionName: !Sub '${AWS::StackName}-anomalies'
+      MonitorArnList: [!Ref CostAnomalyMonitor]
+      # IMMEDIATE is not a preference: an SNS subscriber requires it. DAILY and
+      # WEEKLY are available to email subscribers only, and this stack notifies
+      # through a topic so that one address is configured in one place.
+      Frequency: IMMEDIATE
+      Subscribers:
+        - Type: SNS
+          Address: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
+      # An absolute impact of USD 5, not a percentage. Against a baseline under a
+      # dollar a month, a percentage threshold fires on rounding — 0.75 becoming
+      # 1.50 is +100% and is also nothing. Five dollars of anomalous spend in a
+      # day is more than half a year of this stack's steady state, which is the
+      # scale at which somebody should be told.
+      ThresholdExpression: '{"Dimensions":{"Key":"ANOMALY_TOTAL_IMPACT_ABSOLUTE","MatchOptions":["GREATER_THAN_OR_EQUAL"],"Values":["5"]}}'
+
 Outputs:
 
   ApiEndpoint:
@@ -2160,6 +3028,21 @@ Outputs:
     Value: !Ref AuthTable
     Export:
       Name: !Sub '${AWS::StackName}-TableName'
+
+  # Where alarms actually go, whichever way it was configured — so that a second
+  # stack, a chat bridge or a runbook can subscribe to the same topic instead of
+  # growing a second one, and so that "which topic is this deployment using" is
+  # answerable without reading the parameters. Absent when neither parameter is
+  # set, which is also the deployment where every alarm is decoration.
+  AlarmNotificationTopic:
+    Condition: HasAlarmTarget
+    Description: >-
+      SNS topic every alarm, budget notification and cost anomaly publishes to.
+      If this stack created it, the email subscription on it is PENDING until the
+      confirmation mail is clicked — until then the topic delivers to nobody.
+    Value: !If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmNotificationTopic'
 
   FunctionName:
     Description: Lambda function running the auth router.
