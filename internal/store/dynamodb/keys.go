@@ -57,6 +57,13 @@ const (
 	// record — it carries the client, the redirect URI and the PKCE challenge —
 	// and a sweep over the two has nothing in common.
 	typeAuthCode = "authcode"
+
+	// typeSettings is the deployment's runtime settings document
+	// (data-model.md §1.8). There is exactly one of them in the table, which is
+	// a reason for _t rather than against it: the singleton is the item a
+	// migration sweep is most likely to have to find, and finding it by type is
+	// what stops that sweep from hardcoding the key.
+	typeSettings = "settings"
 )
 
 // Sort keys and partition-key prefixes for the item types this package writes.
@@ -103,6 +110,28 @@ const (
 	// against idPattern, so neither can be forged into the other.
 	skMailTemplatePrefix  = "MAIL" + keySep
 	skUITranslationPrefix = "UI" + keySep
+
+	// settingsPK is the partition of the runtime settings document
+	// (data-model.md §1.8). A constant with no separator and no caller-supplied
+	// segment, like templatesPK: auth.SettingsStore carries no tenant, no owner
+	// and no id — GetSettings takes a context and nothing else — because the
+	// settings are deployment-global in the reference too, one object the admin
+	// Control panel patches (settings-store.interface.ts:28-40).
+	//
+	// Its own partition rather than a second sort key under TEMPLATES, even
+	// though both are deployment-global configuration. TEMPLATES is a
+	// *directory*: its two list methods are single Queries over the whole
+	// partition with a begins_with, and an item that is not a template sitting in
+	// it would either have to be excluded by every one of them or be returned to
+	// a caller expecting a MailTemplate. A partition that holds exactly one item
+	// costs nothing extra — DynamoDB charges per item, not per partition — and
+	// keeps both key spaces describable in one line each.
+	settingsPK = "SETTINGS"
+
+	// skSettings is the single sort key of that partition. The settings are a
+	// singleton, so the sort key is a constant, as SESSION's and PLINK's are;
+	// there is nothing to name because there is nothing to distinguish.
+	skSettings = "SETTINGS"
 
 	// skAuthCode is the single sort key of the OIDC partition. The partition
 	// holds exactly one item — the code — so the sort key is a constant, as

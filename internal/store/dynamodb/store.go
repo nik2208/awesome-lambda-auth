@@ -23,7 +23,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // API is the slice of the DynamoDB client this store actually uses. Taking an
@@ -101,11 +103,11 @@ type Options struct {
 // Store implements, from awesome-go-auth's store.go: UserStore,
 // UserAccountStore, UserPasswordStore, SessionStore, SessionLookupStore,
 // SessionAdminStore, MagicLinkStore, SMSStore, EmailVerificationStore,
-// EmailChangeStore and TOTPStore; from account.go, UserPhoneStore; and from
-// template_store.go, TemplateStore (templates.go). The two OAuth stores of
-// oauth.go are reached through Store.LinkedAccounts() and Store.PendingLinks(),
-// because their interfaces both declare Save and Delete and no single type can
-// satisfy both.
+// EmailChangeStore and TOTPStore; from account.go, UserPhoneStore; from
+// template_store.go, TemplateStore (templates.go); and from settings_store.go,
+// SettingsStore (settings.go). The two OAuth stores of oauth.go are reached
+// through Store.LinkedAccounts() and Store.PendingLinks(), because their
+// interfaces both declare Save and Delete and no single type can satisfy both.
 //
 // The remaining optional interfaces land with their item types (data-model.md
 // §1.4-§1.5) and are deliberately absent rather than stubbed, because the core
@@ -239,6 +241,63 @@ func (s *Store) transactWrite(ctx context.Context, in *awsddb.TransactWriteItems
 			return sleepErr
 		}
 	}
+}
+
+// The optimistic-lock primitive the two document stores share.
+//
+// Both the template directory (templates.go) and the runtime settings
+// (settings.go) are read-modify-writes behind an interface that carries only
+// the fields a patch changes: the rest has to come from somewhere, and the
+// interface does not supply it. What makes the read safe in both is the same
+// thing — the write re-asserts it — so the condition is written once here
+// rather than hand-rolled per store, which is the same argument tokenFamily
+// makes for the five single-use families in keys.go: a reviewer who has checked
+// one conditional write has checked both, and a second hand-rolled copy is the
+// one that quietly gets it wrong.
+//
+// These two live in store.go, beside transactWrite, because they are write
+// primitives of the store rather than behaviour of either document.
+
+// putIfUnchanged writes it only if the item's lock token is still the one the
+// caller observed. With no token observed the condition is that none exists —
+// which is also true of an absent item, so create and "an item somebody wrote by
+// hand without a token" are one case; with one observed, it must still be the
+// one. ALL_OLD on failure is what lets the caller retry from the current item
+// without a second read.
+func (s *Store) putIfUnchanged(ctx context.Context, it item, observed string) error {
+	in := &awsddb.PutItemInput{
+		TableName:                           aws.String(s.table),
+		Item:                                it,
+		ConditionExpression:                 aws.String("attribute_not_exists(#updatedAt)"),
+		ExpressionAttributeNames:            exprNames(attrUpdatedAt),
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}
+	if observed != "" {
+		in.ConditionExpression = aws.String("#updatedAt = :observed")
+		in.ExpressionAttributeValues = map[string]types.AttributeValue{":observed": avS(observed)}
+	}
+	_, err := s.api.PutItem(ctx, in)
+	return err
+}
+
+// nextStamp is the lock token a successful patch writes. It is the clock,
+// unless the clock has not moved past the token observed — a pinned test clock,
+// a coarse one, or a wall clock lagging the previous writer's — in which case it
+// is one nanosecond past that token. The condition compares tokens for equality,
+// so a token that failed to change would let the next stale patch through, and
+// that is the one thing the token exists to prevent.
+func (s *Store) nextStamp(observed string) string {
+	stamp := formatTime(s.nowUTC())
+	if stamp > observed {
+		return stamp
+	}
+	last, err := parseTime(observed)
+	if err != nil {
+		// Not a timestamp at all, so it cannot equal one; the clock's value is
+		// already distinct from it.
+		return stamp
+	}
+	return formatTime(last.Add(time.Nanosecond))
 }
 
 // warnUnknownPendingLinkNamespace reports a PendingLinkStore key whose namespace

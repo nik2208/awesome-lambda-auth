@@ -223,44 +223,17 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	}
 
 	coreOpts := coreOptions(cfg, users, sessions, log)
-	coreOpts = append(coreOpts, deliveryOptions(deliver, log)...)
-	// The email flows: site URLs and the template store, seeded from the
-	// artifact. This is the one option set that can do I/O at cold start —
-	// reading email.templatesDir — and the one that can refuse for a store
-	// the driver lacks.
-	emailOpts, err := emailOptions(ctx, cfg, users, deliver, log)
-	if err != nil {
-		return nil, err
+	for _, set := range coreOptionSets(ctx, cfg, opts, users, deliver, log) {
+		if set.build == nil {
+			// A reserved slot. See coreOptionSets.
+			continue
+		}
+		sub, err := set.build()
+		if err != nil {
+			return nil, err
+		}
+		coreOpts = append(coreOpts, sub...)
 	}
-	coreOpts = append(coreOpts, emailOpts...)
-	coreOpts = append(coreOpts, twoFactorOptions(cfg)...)
-	// Token claims. Like emailOptions this one can refuse: a claim mapped from
-	// a field the core does not expose, or named after a reserved session
-	// claim, is a document fault and has to stop the deployment rather than
-	// turn every login into a 500.
-	claimsOpts, err := claimsOptions(cfg, opts.HTTPClient, log)
-	if err != nil {
-		return nil, err
-	}
-	coreOpts = append(coreOpts, claimsOpts...)
-	// OAuth: the provider registry and the provisioning policy. It refuses for
-	// a profileMap or a fieldMap that does not compile, so a mapping expression
-	// is a failed deployment rather than a provider that 500s on its first
-	// callback.
-	oauthOpts, err := oauthOptions(cfg, users, deliver, log)
-	if err != nil {
-		return nil, err
-	}
-	coreOpts = append(coreOpts, oauthOpts...)
-	// Identity-provider mode. The second option set that can do I/O at cold
-	// start — a KMS signer fetches its public key here — and it refuses for a
-	// driver with no authorization-code store, for the same reason emailOptions
-	// refuses for one with no template store.
-	idpOpts, err := idpOptions(ctx, cfg, users, opts.IDPKeySource, log)
-	if err != nil {
-		return nil, err
-	}
-	coreOpts = append(coreOpts, idpOpts...)
 
 	core, err := auth.New(coreOpts...)
 	if err != nil {
@@ -418,6 +391,126 @@ func coreOptions(cfg *config.Config, users auth.UserStore, sessions auth.Session
 	}
 }
 
+// coreOptionSet is one contributor to the core's option list: the block it
+// wires, and the builder that turns that block's configuration into options or
+// refuses the cold start.
+//
+// A slot with no builder contributes nothing and costs nothing — New skips it —
+// and is not a stub: there is no function to call, no option to append and no
+// branch to evaluate. It is a reservation, so that the block which fills it
+// edits one line of the slice and no other line in this file.
+type coreOptionSet struct {
+	// name is the configuration block this set wires, spelled as the document
+	// spells it. It is what TestCoreOptionSetsAreOrderedAndReserved reads, which
+	// is what makes the reserved order a fact about the build rather than a
+	// comment about it.
+	name string
+
+	// build returns this set's options, or the error that must abort the init.
+	// Nil means the slot is reserved and unfilled.
+	build func() ([]auth.Option, error)
+}
+
+// coreOptionSets is the ordered list of option sets New appends after
+// coreOptions, and the only place that order is written down.
+//
+// **The order is the contract, not the arrangement.** Four of these can refuse
+// the cold start, and which one refuses first is observable: a document with
+// both a bad claims mapping and a bad OAuth profileMap reports the claims fault,
+// and a test says so. Appending is also not commutative for the core itself —
+// a later WithX of the same knob wins — so reordering these would be a silent
+// behaviour change even where nothing refuses.
+//
+// **Two of them do I/O at cold start** and are marked below. That is the reason
+// this is a list of builders rather than a list of already-built option slices:
+// a slice would do every set's work before the first one's refusal, which for
+// these two means a filesystem walk and a KMS round trip on a deployment that
+// was going to fail anyway.
+//
+// The five slots after the wired sets are reserved in the order the remaining
+// blocks fill them: settings, docs, ui, admin, tools. Each block fills its own
+// and touches nothing else, which is what makes them mergeable in any order —
+// before this, every one of them appended to the same place and therefore
+// conflicted with every other.
+func coreOptionSets(
+	ctx context.Context,
+	cfg *config.Config,
+	opts Options,
+	users auth.UserStore,
+	deliver *delivery,
+	log *slog.Logger,
+) []coreOptionSet {
+	return []coreOptionSet{
+		{
+			// Credential delivery: the senders behind the five credential-minting
+			// routes. No I/O — both AWS clients are deferred to the first message
+			// actually sent (delivery.go) — and nothing here can refuse, because
+			// newDelivery has already done the refusing, before the core is built.
+			name:  "delivery",
+			build: func() ([]auth.Option, error) { return deliveryOptions(deliver, log), nil },
+		},
+		{
+			// The email flows: site URLs and the template store, seeded from the
+			// artifact. This is the one option set that can do I/O at cold start —
+			// reading email.templatesDir — and the first that can refuse for a store
+			// the driver lacks.
+			name:  "email",
+			build: func() ([]auth.Option, error) { return emailOptions(ctx, cfg, users, deliver, log) },
+		},
+		{
+			// The TOTP issuer label. One string, no I/O, nothing to refuse.
+			name:  "twoFactor",
+			build: func() ([]auth.Option, error) { return twoFactorOptions(cfg), nil },
+		},
+		{
+			// Token claims. Like emailOptions this one can refuse: a claim mapped from
+			// a field the core does not expose, or named after a reserved session
+			// claim, is a document fault and has to stop the deployment rather than
+			// turn every login into a 500.
+			name:  "claims",
+			build: func() ([]auth.Option, error) { return claimsOptions(cfg, opts.HTTPClient, log) },
+		},
+		{
+			// OAuth: the provider registry and the provisioning policy. It refuses for
+			// a profileMap or a fieldMap that does not compile, so a mapping expression
+			// is a failed deployment rather than a provider that 500s on its first
+			// callback.
+			name:  "oauth",
+			build: func() ([]auth.Option, error) { return oauthOptions(cfg, users, deliver, log) },
+		},
+		{
+			// Identity-provider mode. The second option set that can do I/O at cold
+			// start — a KMS signer fetches its public key here — and it refuses for a
+			// driver with no authorization-code store, for the same reason emailOptions
+			// refuses for one with no template store.
+			name:  "idp",
+			build: func() ([]auth.Option, error) { return idpOptions(ctx, cfg, users, opts.IDPKeySource, log) },
+		},
+
+		// ── The reserved slots ───────────────────────────────────────────────
+		//
+		// Filling one is replacing that entry's nil build with a builder, and
+		// nothing else. Leaving one empty costs nothing at runtime.
+		{
+			// Runtime settings: the store the admin surface mutates at run time,
+			// seeded from runtimeSettings. The third set that can do I/O at cold
+			// start — and only when the document declares a seed, since with
+			// nothing declared there is nothing to compare against — and the
+			// third that refuses for a driver that lacks the store.
+			name:  "settings",
+			build: func() ([]auth.Option, error) { return settingsOptions(ctx, cfg, users, log) },
+		},
+		// docs.* — the OpenAPI document and the docs route.
+		{name: "docs"},
+		// ui.* — the hosted UI and its config route.
+		{name: "ui"},
+		// admin.* — the admin router and its access policy.
+		{name: "admin"},
+		// tools.* — telemetry, SSE and the inbound-webhook sandbox.
+		{name: "tools"},
+	}
+}
+
 // httpConfig maps the cookie, CSRF and prefix knobs onto the shared wire layer.
 //
 // Cookie Max-Age is deliberately left at zero: HTTPConfig.resolve derives it
@@ -518,6 +611,7 @@ type memoryStoreBundle struct {
 	links     auth.LinkedAccountStore
 	pending   auth.PendingLinkStore
 	templates auth.TemplateStore
+	settings  auth.SettingsStore
 	codes     auth.AuthCodeStore
 }
 
@@ -530,6 +624,13 @@ func newMemoryStoreBundle() memoryStoreBundle {
 		links:           auth.NewMemoryLinkedAccounts(),
 		pending:         auth.NewMemoryPendingLinks(),
 		templates:       auth.NewMemoryTemplateStore(),
+		// Per execution environment, with the consequence that a runtime settings
+		// edit made through one is invisible to the next and is lost on its next
+		// cold start — where it would also be re-seeded from the document, since
+		// an empty store holds none of the declared keys. RS-12 already refuses
+		// this driver in production; internal/store/dynamodb/settings.go is what
+		// makes an administrator's toggle outlive the execution environment.
+		settings: auth.NewMemorySettingsStore(),
 		// Per execution environment, like everything else on this driver, and
 		// with a consequence worth knowing on Lambda even in development: an
 		// authorization code minted by one environment is unknown to the next,
@@ -544,6 +645,7 @@ func newMemoryStoreBundle() memoryStoreBundle {
 func (m memoryStoreBundle) LinkedAccounts() auth.LinkedAccountStore { return m.links }
 func (m memoryStoreBundle) PendingLinks() auth.PendingLinkStore     { return m.pending }
 func (m memoryStoreBundle) Templates() auth.TemplateStore           { return m.templates }
+func (m memoryStoreBundle) Settings() auth.SettingsStore            { return m.settings }
 func (m memoryStoreBundle) AuthCodes() auth.AuthCodeStore           { return m.codes }
 
 // driverStores lists the stores.enable.<store> keys each driver can actually
@@ -562,20 +664,26 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// "templates" joined the set when the store gained its TEMPLATES
 		// partition: mail templates and UI translations are readable and
 		// patchable on this driver, so email.templatesDir seeds a store that
-		// outlives the execution environment.
+		// outlives the execution environment. "settings" joined it the same way,
+		// with the SETTINGS singleton (data-model.md §1.8): a require2FA an
+		// administrator switches on is seen by every execution environment and
+		// survives a redeploy.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
+			"settings": true,
 		}, true
 	case config.StoreDriverMemory:
-		// awesome-go-auth ships MemoryLinkedAccounts, MemoryPendingLinks and
-		// MemoryTemplateStore, and newMemoryStoreBundle hangs all three off the
-		// user store, so the development driver backs the same set as the
-		// production one. A driver that backs fewer is still refused by name in
-		// emailOptions, which is why that refusal exists.
+		// awesome-go-auth ships MemoryLinkedAccounts, MemoryPendingLinks,
+		// MemoryTemplateStore and MemorySettingsStore, and newMemoryStoreBundle
+		// hangs all four off the user store, so the development driver backs the
+		// same set as the production one. A driver that backs fewer is still
+		// refused by name in emailOptions and settingsOptions, which is why those
+		// refusals exist.
 		return map[string]bool{
 			"users": true, "sessions": true, "tokens": true,
 			"linkedAccounts": true, "pendingLinks": true, "templates": true,
+			"settings": true,
 		}, true
 	default:
 		return nil, false
@@ -721,6 +829,7 @@ func unwiredKnobs(cfg *config.Config) []knobGap {
 	gaps = append(gaps, deliveryKnobGaps(cfg)...)
 	gaps = append(gaps, oauthKnobGaps(cfg)...)
 	gaps = append(gaps, idpKnobGaps(cfg)...)
+	gaps = append(gaps, runtimeSettingsKnobGaps(cfg)...)
 
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Path < gaps[j].Path })
 	return gaps

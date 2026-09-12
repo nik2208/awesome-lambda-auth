@@ -21,6 +21,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"oauth-callback-skips-the-second-factor",
 		"production-by-default",
 		"refresh-token-families",
+		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",
 	}
 	var got []string

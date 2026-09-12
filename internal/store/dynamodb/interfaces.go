@@ -62,6 +62,18 @@ var (
 	// either, it is handed over explicitly through auth.WithTemplateStore, which
 	// is what Store.Templates() exists for and why cmd/auth pins the shape.
 	_ auth.TemplateStore = (*Store)(nil)
+
+	// The runtime settings store (settings_store.go), on *Store directly for the
+	// same reason the template store is: GetSettings and UpdateSettings collide
+	// with nothing here. It is the third capability the core does not discover by
+	// type assertion — Config.Settings is set explicitly, by
+	// auth.WithSettingsStore — and the consequence of drifting out of shape is
+	// not a build failure but a deployment where POST /2fa/disable silently
+	// stops honouring a stored require2FA, because the core skips the settings
+	// check altogether when Config.Settings is nil. Store.Settings() is what
+	// cmd/auth hands over, and this assertion is what keeps the two methods in
+	// the shape the core will call.
+	_ auth.SettingsStore = (*Store)(nil)
 )
 
 // Interfaces deliberately NOT implemented yet, listed so their absence reads as a

@@ -15,7 +15,6 @@ package contract
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -55,24 +54,13 @@ const (
 // never assumed: a route gated on a store the operator did not configure is a
 // deployment difference, not a contract break, and a suite that fails on it is
 // a broken suite.
+//
+// The capabilities themselves are not listed here. Each one declares its own
+// name, its stage and its probe in a single contiguous region of
+// capabilities_test.go — see capabilityDecl — and everything this file needs
+// about the set (the probe order, the names AWESOME_AUTH_CONTRACT_REQUIRE
+// accepts, the report) is derived from that registry rather than repeated.
 type Capability string
-
-const (
-	CapRegister       Capability = "register"
-	CapCSRF           Capability = "csrf"
-	CapSessions       Capability = "sessions"
-	CapTOTP           Capability = "totp"
-	CapLinkedAccounts Capability = "linked-accounts"
-	CapCookieSecure   Capability = "secure-cookies"
-	CapOAuthGoogle    Capability = "oauth-google"
-
-	// CapIDP is identity-provider mode: the deployment publishes a JWKS document
-	// and mounts the OIDC endpoints. Probed on the JWKS route, which is the one
-	// endpoint of the set that is public by construction and answers without any
-	// client being registered — so the probe cannot be confused by an IdP that is
-	// on but has no clients.
-	CapIDP Capability = "idp"
-)
 
 // capState is the three-way answer a probe can get, and the distinction the
 // suite turns on. "Off" is not one state but two, and collapsing them is how a
@@ -125,34 +113,159 @@ func classify(r *Resp) capability {
 	return capability{state: capBroken, why: fmt.Sprintf("%s answered %d %s, which is neither the feature nor a declared absence", r.Target, r.Status, r.snippet())}
 }
 
-// classifyOAuth reads the probe answer for GET <prefix>/oauth/google, whose two
-// documented shapes are not the two classify knows about.
+// probeStage orders the registry. A probe cannot choose its neighbours, only the
+// point in the pass it belongs to, and there are exactly three such points
+// because there are exactly two things a probe can need that do not exist yet
+// when the pass starts: a provisioned account, and a session on it.
 //
-// "On" is a 302 to the provider carrying a state — the route answers a redirect,
-// never a 200 — and the documented absence is the reference's own stub for a
-// strategy the host app never passed: 404 {"error":"Google OAuth not
-// configured"} (auth.router.ts:1361), which is a JSON body rather than an
-// unmounted route's fall-through. Anything else is a fault: a 500 from a
-// half-wired provider must not read as "nobody configured Google".
-func classifyOAuth(r *Resp) capability {
-	switch r.Status {
-	case 302:
-		loc := r.Header.Get("Location")
-		if loc == "" {
-			return capability{state: capBroken, why: fmt.Sprintf("%s answered 302 with no Location", r.Target)}
-		}
-		u, err := url.Parse(loc)
-		if err != nil || u.Query().Get("state") == "" {
-			return capability{state: capBroken, why: fmt.Sprintf("%s answered 302 to %q, which carries no state parameter", r.Target, loc)}
-		}
-		return capability{state: capOn, why: fmt.Sprintf("%s answered 302 to %s with a state", r.Target, u.Host)}
-	case 404:
-		var m map[string]any
-		if json.Unmarshal(r.Body, &m) == nil && m["error"] == "Google OAuth not configured" {
-			return capability{state: capAbsent, why: fmt.Sprintf("%s answered the reference's 404 stub — no Google provider is configured", r.Target)}
-		}
+// Within one stage the order is the registration order, and it is deliberately
+// not meaningful: two probes in the same stage must not depend on each other,
+// because a later block adds its declaration in its own file and Go runs the
+// init functions of a package in file-name order. Anything that does care —
+// the account everything else is provisioned from, the login that follows it —
+// is a stage boundary or a lazily-resolved accessor on probeRun, not a
+// neighbour.
+type probeStage int
+
+const (
+	// stageAnonymous runs before anything has been registered. It is the only
+	// point at which the shared client is genuinely unauthenticated, which is
+	// what the CSRF auto-init probe reads.
+	stageAnonymous probeStage = iota
+
+	// stageProvision is the account the rest of the pass is run on. Exactly one
+	// declaration belongs here — CapRegister — and it is the one that may stand
+	// the whole suite down.
+	stageProvision
+
+	// stageProbed is everything that needs the account: directly, through
+	// probeRun.LoggedIn, or indirectly by being a route whose answer is only
+	// worth reading once the deployment has been shown to work at all.
+	stageProbed
+)
+
+// capabilityDecl is one capability's whole declaration: the name cases gate on,
+// the point in the pass its probe belongs to, and the probe itself. Adding a
+// capability is adding one of these, in its own contiguous region or its own
+// file; nothing in this file enumerates them.
+//
+// Settles exists for the one probe that answers about more than one capability:
+// a single response can be evidence about two things — the CSRF cookie is also
+// the only place the Secure flag can be observed — and splitting that into two
+// probes would mean two requests and two chances for them to disagree.
+type capabilityDecl struct {
+	// Name is the capability this declaration owns, and the name
+	// AWESOME_AUTH_CONTRACT_REQUIRE accepts for it.
+	Name Capability
+
+	// Settles names the further capabilities this declaration's probe decides
+	// out of the same observation. They are registered names like Name: a case
+	// may need one, and RequireEnv may name one.
+	Settles []Capability
+
+	// Stage is where in the pass the probe runs. See probeStage.
+	Stage probeStage
+
+	// Probe records its answers with probeRun.Set, one per name this
+	// declaration claims, and is checked afterwards for having recorded exactly
+	// those. It runs on the suite's own *testing.T, never a subtest, so a probe
+	// that decides the whole suite cannot run — CapRegister's — can still
+	// t.Skipf or t.Fatalf out of the pass.
+	Probe func(t *testing.T, p *probeRun)
+}
+
+// names is everything this declaration is responsible for recording.
+func (d capabilityDecl) names() []Capability {
+	return append([]Capability{d.Name}, d.Settles...)
+}
+
+var capabilityRegistry []capabilityDecl
+
+// registerCapability is what a capability's declaration calls from its init.
+func registerCapability(decls ...capabilityDecl) {
+	capabilityRegistry = append(capabilityRegistry, decls...)
+}
+
+// orderedCapabilities is the registry in probe order: by stage, and within a
+// stage in registration order (sort.SliceStable, so the registration order is
+// kept rather than replaced by an arbitrary one).
+func orderedCapabilities() []capabilityDecl {
+	out := append([]capabilityDecl(nil), capabilityRegistry...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Stage < out[j].Stage })
+	return out
+}
+
+// knownCapabilities is every registered name, in probe order. It is what
+// RequireEnv is validated against and what its error message lists, so a
+// capability cannot be probed without being nameable, or nameable without being
+// probed — which is exactly the drift two hand-maintained lists used to allow.
+func knownCapabilities() []Capability {
+	var out []Capability
+	for _, decl := range orderedCapabilities() {
+		out = append(out, decl.names()...)
 	}
-	return capability{state: capBroken, why: fmt.Sprintf("%s answered %d %s, which is neither a provider redirect nor the documented 404 stub", r.Target, r.Status, r.snippet())}
+	return out
+}
+
+// probeRun is the state one probe pass shares. Everything a probe may need is
+// here rather than in a closure, so that a declaration is a value in a slice and
+// not a line in a function.
+type probeRun struct {
+	// Env is the deployment under test. Probes read Prefix and BaseURL from it
+	// for their diagnostics; they record through Set, never into Env.Caps.
+	Env *Env
+
+	// Req is what the operator claimed. Only CapRegister's probe reads it: it is
+	// the one probe whose absence branch is a skip rather than a recorded state,
+	// so it has to know whether the operator forbade that skip.
+	Req required
+
+	// Anon is the client every probe outside stageProbed uses, and the one the
+	// two deliberately-credential-free probes keep using afterwards. It is NOT
+	// re-created between stages: it registers the account in stageProvision and
+	// therefore carries that registration's cookies from then on (the core's
+	// register-issues-a-session deviation). Probes that want the account's
+	// session use LoggedIn, which is a separate identity with its own jar.
+	Anon *Client
+
+	// account is what CapRegister's probe provisioned, and LoggedIn's
+	// credentials.
+	account Account
+
+	user *Client
+
+	// settled records what the running declaration claimed, so the pass can hold
+	// each one to the names it declared.
+	settled []Capability
+}
+
+// Set records one probe's answer. It is the only way into Env.Caps, which is
+// what lets the pass check a declaration against what it said it would settle.
+func (p *probeRun) Set(c Capability, answer capability) {
+	p.Env.Caps[c] = answer
+	p.settled = append(p.settled, c)
+}
+
+// LoggedIn is a client holding a session on the provisioned account, created on
+// the first probe that asks for one and shared by the rest.
+//
+// It is lazy rather than a stage of its own because the login is not an
+// observation: nothing about it is recorded, and a deployment that cannot log a
+// freshly registered account in is broken in a way no capability can express, so
+// it is a t.Fatalf here exactly as it was when this ran inline.
+func (p *probeRun) LoggedIn(t *testing.T) *Client {
+	t.Helper()
+	if p.user != nil {
+		return p.user
+	}
+	cli := p.Env.NewClient()
+	login := cli.POST(t, "/login", body{"email": p.account.Email, "password": p.account.Password})
+	if login.Status != 200 {
+		t.Fatalf("probe: cannot log the freshly registered account in: POST %s/login -> %d %s",
+			p.Env.Prefix, login.Status, login.snippet())
+	}
+	p.user = cli
+	return cli
 }
 
 // Case is one assertion about the wire. Adding a route to the covered surface is
@@ -211,11 +324,19 @@ func readRequired(t *testing.T) required {
 	if raw == "" {
 		return req
 	}
-	known := map[Capability]bool{
-		CapRegister: true, CapCSRF: true, CapSessions: true,
-		CapTOTP: true, CapLinkedAccounts: true, CapCookieSecure: true,
-		CapOAuthGoogle: true, CapIDP: true,
+	// Both the accepted set and the message that lists it come from the
+	// registry. They used to be two hand-written lists beside a third one in the
+	// probe, and a capability added to one of the three was accepted, probed and
+	// unnameable in whichever combination the author happened to miss.
+	names := knownCapabilities()
+	known := make(map[Capability]bool, len(names))
+	spelled := make([]string, 0, len(names)+1)
+	for _, c := range names {
+		known[c] = true
+		spelled = append(spelled, string(c))
 	}
+	spelled = append(spelled, "all")
+
 	for _, f := range strings.Split(raw, ",") {
 		f = strings.TrimSpace(f)
 		if f == "" {
@@ -226,8 +347,8 @@ func readRequired(t *testing.T) required {
 			continue
 		}
 		if !known[Capability(f)] {
-			t.Fatalf("%s names an unknown capability %q; known: register, csrf, sessions, totp, linked-accounts, secure-cookies, oauth-google, idp, all",
-				RequireEnv, f)
+			t.Fatalf("%s names an unknown capability %q; known: %s",
+				RequireEnv, f, strings.Join(spelled, ", "))
 		}
 		req.set[Capability(f)] = true
 	}
@@ -339,84 +460,22 @@ func announce(format string, args ...any) {
 // stack, never a decision about the contract: the contract is the same
 // everywhere, and what changes between deployments is which parts of it are
 // reachable.
+//
+// What each capability observes, and with which client, is the capability's own
+// business and lives with its declaration (capabilities_test.go). This function
+// owns only what is true of the pass as a whole: that it runs on the suite's own
+// *testing.T so a probe can stand the suite down, that every declaration records
+// exactly what it declared, and that what came back is reported once and loudly.
 func probe(t *testing.T, e *Env, req required) {
 	t.Helper()
 	e.Caps = map[Capability]capability{}
+	run := &probeRun{Env: e, Req: req, Anon: e.NewClient()}
 
-	// CSRF: the cookie is distributed solely by the router's auto-init
-	// middleware (§0.6), so any request through the router reveals whether the
-	// feature is on. An unauthenticated GET /me is the cheapest one.
-	//
-	// This is the one capability with no status to classify — a router with
-	// csrf.enabled off and a router that stopped setting the cookie look the
-	// same from outside — so absence here is exactly what RequireEnv is for.
-	anon := e.NewClient()
-	r := anon.GET(t, "/me")
-	if c := r.cookie("csrf-token"); c != nil {
-		e.Caps[CapCSRF] = capability{state: capOn, why: fmt.Sprintf("auto-init cookie %q observed", c.Name)}
-		secure := capAbsent
-		if c.Secure {
-			secure = capOn
-		}
-		e.Caps[CapCookieSecure] = capability{state: secure, why: fmt.Sprintf("csrf cookie Secure=%v", c.Secure)}
-	} else {
-		e.Caps[CapCSRF] = capability{state: capAbsent, why: "no csrf-token cookie is auto-initialised, so config.csrf.enabled is off"}
-		e.Caps[CapCookieSecure] = capability{state: capAbsent, why: "no cookie observed during the probe"}
+	for _, decl := range orderedCapabilities() {
+		run.settled = nil
+		decl.Probe(t, run)
+		assertSettled(t, decl, run.settled)
 	}
-
-	// Registration, without which the suite cannot provision anything: it
-	// cannot seed a store it is not allowed to reach.
-	//
-	// Only the reference's documented absence — Express's 404 fall-through for
-	// a route mounted only when the host app passes onRegister (§3.7,
-	// auth.router.ts:713) — is a reason to stand down. A 500 here used to skip
-	// the entire suite and exit 0, which meant a deployment answering 500 to
-	// every request produced the same green `ok` as a healthy one.
-	acct := randomAccount()
-	reg := anon.POST(t, "/register", body{"email": acct.Email, "password": acct.Password})
-	switch {
-	case reg.Status == 200 || reg.Status == 201:
-		e.Caps[CapRegister] = capability{state: capOn, why: fmt.Sprintf("POST %s/register answered %d", e.Prefix, reg.Status)}
-	case reg.Status == 404 && !req.wants(CapRegister):
-		e.Caps[CapRegister] = capability{state: capAbsent, why: fmt.Sprintf("POST %s/register answered 404 — the route is not mounted", e.Prefix)}
-		announce("SKIPPED: %s does not mount POST %s/register, so the suite could not provision an account.\n"+
-			"None of the %d contract cases ran. Set %s=register to make this a failure.",
-			e.BaseURL, e.Prefix, len(registry), RequireEnv)
-		t.Skipf(`this deployment does not mount registration: POST %s/register answered 404.
-
-The suite is black-box and self-provisioning — it registers the accounts it
-needs because it cannot seed a store it cannot reach — so it cannot run against
-a stack with the route unmounted (the reference mounts it only when the host app
-passes onRegister; wire-contract.md §3.7).`, e.Prefix)
-	default:
-		t.Fatalf(`probe: POST %s/register answered %d %s
-
-That is a broken deployment, not an unconfigured one: the documented absence of
-this route is Express's 404 fall-through (§3.7), and nothing else. The suite
-refuses to treat a fault as a reason to stand down — this used to be a skip, and
-a stack answering 500 to every route exited 0.`, e.Prefix, reg.Status, reg.snippet())
-	}
-
-	// A logged-in client for the store-gated probes below.
-	cli := e.NewClient()
-	login := cli.POST(t, "/login", body{"email": acct.Email, "password": acct.Password})
-	if login.Status != 200 {
-		t.Fatalf("probe: cannot log the freshly registered account in: POST %s/login -> %d %s",
-			e.Prefix, login.Status, login.snippet())
-	}
-
-	e.Caps[CapSessions] = classify(cli.GET(t, "/sessions"))
-	e.Caps[CapLinkedAccounts] = classify(cli.GET(t, "/linked-accounts"))
-	e.Caps[CapTOTP] = classify(cli.POST(t, "/2fa/setup", nil, CSRF()))
-	// The OAuth entry point reads no credential (§4: "Auth gate: none"), so the
-	// anonymous client is the honest probe for it.
-	e.Caps[CapOAuthGoogle] = classifyOAuth(anon.GET(t, "/oauth/google"))
-
-	// Identity-provider mode, probed anonymously on purpose: the JWKS document is
-	// public by construction — a relying party fetches it with no credential of
-	// any kind — so probing it with the logged-in client would hide a deployment
-	// that had put it behind a session.
-	e.Caps[CapIDP] = classify(anon.GET(t, "/.well-known/jwks.json"))
 
 	names := make([]string, 0, len(e.Caps))
 	for k := range e.Caps {
@@ -448,5 +507,36 @@ a stack answering 500 to every route exited 0.`, e.Prefix, reg.Status, reg.snipp
 			t.Errorf(`%s=%q names %q as a capability this deployment offers, and the probe could not find it.
   %s`, RequireEnv, req.spec, c, st.why)
 		}
+	}
+}
+
+// assertSettled holds one declaration to what it declared: every name in it
+// recorded, and nothing recorded that it did not name.
+//
+// It is a check on the registry rather than on the deployment, and it is here
+// because the registry is what later blocks extend. A declaration that names a
+// capability its probe never records would leave that capability at the zero
+// capState — capOn — so every case needing it would run against a deployment
+// nobody looked at; one that records a name it did not declare would be
+// invisible to RequireEnv, which is built from the declarations. Both are silent
+// without this, and both are the exact mistake a copied declaration makes.
+func assertSettled(t *testing.T, decl capabilityDecl, settled []Capability) {
+	t.Helper()
+	got := make(map[Capability]bool, len(settled))
+	for _, c := range settled {
+		got[c] = true
+	}
+	for _, want := range decl.names() {
+		if !got[want] {
+			t.Fatalf("capability %q declares that it settles %q, and its probe recorded no answer for it;"+
+				" an unrecorded capability reads as \"on\" and would switch no case off",
+				decl.Name, want)
+		}
+		delete(got, want)
+	}
+	for c := range got {
+		t.Fatalf("capability %q recorded an answer for %q, which it does not declare;"+
+			" add it to that declaration's Settles or %s could never name it",
+			decl.Name, c, RequireEnv)
 	}
 }
