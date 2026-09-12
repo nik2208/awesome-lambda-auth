@@ -21,6 +21,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"idp-kid-derived-from-key-material",
 		"oauth-callback-skips-the-second-factor",
 		"production-by-default",
+		"rate-limited-routes-answer-429",
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",

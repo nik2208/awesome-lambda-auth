@@ -277,7 +277,23 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// guard: mountAuthSurface returns an error rather than panicking on the one
 	// configuration that can still register a pattern twice, an
 	// idProvider.jwksPath pointed at a route the adapter already serves (idp.go).
-	if err := mountAuthSurface(mux, core, cfg); err != nil {
+	// The rate limiter. It is built here, before the mount, because
+	// auth.HTTPConfig.RateLimiter is a constructor the adapter calls once per
+	// route: whatever it counts with has to exist before the first of those
+	// thirty calls and be captured by all of them, or every route would get a
+	// private budget instead of the one shared with the rest (ratelimit.go).
+	//
+	// The shared counter is found structurally on whatever the driver returned,
+	// the way the settings store is. A driver without one is not a refusal: it
+	// is the development driver, where a per-process bound is the honest
+	// maximum and RS-12 already refuses the driver in production.
+	// logRateLimitSurface says so at cold start.
+	var counter rateLimitCounter
+	if provider, ok := users.(rateLimitCounter); ok {
+		counter = provider
+	}
+	logRateLimitSurface(cfg, counter, log)
+	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log)); err != nil {
 		return nil, err
 	}
 	logDocsSurface(cfg, log)
@@ -607,6 +623,17 @@ func coreOptionSets(
 // is why that block fills no core option slot. docs.go builds the value — it is
 // the one field here that is not a straight copy, because `docs.swagger` is
 // three-valued and DocsOptions.Enabled is a bool.
+//
+// RateLimiter is the one field of HTTPConfig this function deliberately leaves
+// nil, and the reason is that it is not a function of the document. It is a
+// middleware constructor closing over a shared counter and an in-process table,
+// so building it needs the store the composition root opened, which this
+// function does not have and should not take — half a dozen callers here want
+// nothing but Prefix() or UILink(). mountAuthSurface takes it as a parameter and
+// sets it on the way to the adapter, which is the only place it is read
+// (ratelimit.go, idp.go). A nil RateLimiter is exactly "no limiter" to the core,
+// which composes a pass-through for it, so the omission is also the correct
+// value for every caller that is not mounting.
 func httpConfig(cfg *config.Config) auth.HTTPConfig {
 	return auth.HTTPConfig{
 		APIPrefix: cfg.HTTP.APIPrefix,

@@ -440,9 +440,19 @@ var idpMountedEndpoints = []string{
 // gets. The guard is installed only when an IdP exists, which is what keeps the
 // message honest: with no IdP the adapter mounts exactly what it always mounts,
 // and a panic there is a bug that should look like one.
-func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config) (err error) {
+//
+// rl is the rate limiter, and it arrives as a parameter rather than through
+// httpConfig because it is the one field of auth.HTTPConfig that is not a
+// function of the document: it captures a store handle and a counter, which only
+// the composition root has. nil means no limiter, which the core reads as a
+// pass-through. This is also the only place the value is needed — the adapter
+// calls it once per route from here — so passing it down one call is cheaper
+// than making every other caller of httpConfig say it has none.
+func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, rl func(http.Handler) http.Handler) (err error) {
+	hc := httpConfig(cfg)
+	hc.RateLimiter = rl
 	if core.IDP() == nil {
-		nethttp.MountWithConfig(mux, core, httpConfig(cfg))
+		nethttp.MountWithConfig(mux, core, hc)
 		return nil
 	}
 	defer func() {
@@ -461,7 +471,7 @@ func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config) (
 			"config: refusing to start: idProvider.jwksPath %q collides with a route this deployment already mounts, so the JWKS document and that route would claim one pattern: %v",
 			jwksPathOf(cfg), r)
 	}()
-	nethttp.MountWithConfig(mux, core, httpConfig(cfg))
+	nethttp.MountWithConfig(mux, core, hc)
 	return nil
 }
 

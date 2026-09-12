@@ -274,6 +274,17 @@ func envBindings() []envBinding {
 		envInt("AWESOME_AUTH_RATE_LIMIT_WINDOW_SECONDS", "rateLimit.windowSeconds", func(c *Config, v int) { c.RateLimit.WindowSeconds = v }),
 		envInt("AWESOME_AUTH_RATE_LIMIT_MAX", "rateLimit.max", func(c *Config, v int) { c.RateLimit.Max = v }),
 		envString("AWESOME_AUTH_RATE_LIMIT_KEY_BY", "rateLimit.keyBy", func(c *Config, v string) { c.RateLimit.KeyBy = v }),
+		// §1.16 left the scope file-only in Phase 0, on the assumption that a
+		// list belongs in a document. Every other list in this schema has an
+		// override anyway — siteUrls, cors.origins, the two IdP lists — and this
+		// one has a reason of its own: the scope is the knob an operator reaches
+		// for in an incident, to widen it while something is under attack or to
+		// narrow it while a client is being fixed, and an environment variable is
+		// the only change a Lambda takes without a redeploy of the artifact. Comma
+		// separated, like the rest; an empty value is an empty scope and therefore
+		// switches the limiter off, which is the same thing an empty list in the
+		// document means.
+		envList("AWESOME_AUTH_RATE_LIMIT_SCOPE", "rateLimit.scope", func(c *Config, v []string) { c.RateLimit.Scope = v }),
 
 		// §1.17 stores
 		envString("AWESOME_AUTH_STORES_DRIVER", "stores.driver", func(c *Config, v string) { c.Stores.Driver = v }),

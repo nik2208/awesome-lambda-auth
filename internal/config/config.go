@@ -616,8 +616,9 @@ type OutboundWebhookDefaults struct {
 //
 // The reference has no rate limiting at all unless the integrator injects
 // Express middleware (src/router/auth.router.ts:46,468), so every value here is
-// a product decision and the spec marks them all TBD. The defaults below are
-// placeholders chosen to be inert (disabled), not recommendations.
+// a product decision. The spec marked them all TBD in Phase 0 and they are
+// decided now, in Defaults() below; docs/config-reference.md argues each one to
+// an operator and cmd/auth/ratelimit.go implements them.
 type RateLimit struct {
 	Enabled       bool     `json:"enabled"`
 	WindowSeconds int      `json:"windowSeconds"`
@@ -921,10 +922,45 @@ func Defaults() *Config {
 				},
 			},
 		},
+		// Rate limiting. The reference has none and therefore no defaults to
+		// inherit; every value here is a product decision and each is argued in
+		// docs/config-reference.md §13. The short form:
+		//
+		// Enabled is true because this product's house rule is that forgetting
+		// tightens rather than loosens — the same rule that makes CSRF on by
+		// default and the environment production by default, and the same
+		// reasoning: a deployable product has to be safe with an empty
+		// configuration where a library can leave the choice to its integrator.
+		// A deployment that never mentions the block gets a limiter, and the 429
+		// it can then answer where the reference answers 200 is the registered
+		// wire deviation rate-limited-routes-answer-429.
+		//
+		// KeyBy is email and not ip. The threat these routes face is credential
+		// stuffing and password spraying against accounts, which is
+		// account-shaped; an IP-keyed default would put a corporate NAT's whole
+		// office in one bucket and one DynamoDB partition, so the limiter would
+		// become the outage for exactly the people it is not aimed at
+		// (data-model.md §2.3, whose own conclusion is that the account-scoped
+		// limiter must be the primary control). Volumetric defence by source
+		// address belongs at the edge, where a WAF can do it properly.
+		//
+		// Max 10 in a 60-second window, per subject per scope. A real person
+		// mistypes a password a few times a minute and no more; ten leaves room
+		// for that plus a client retry, and holds an attacker to six seconds per
+		// guess against one account. Sixty seconds is also the longest a false
+		// positive can cost someone, because Retry-After can never exceed the
+		// window.
+		//
+		// Scope is the five flows data-model.md §1.5 row #61 names — the ones
+		// that mint or spend a credential without a session to lose. Nothing
+		// else is in by default: `refresh`, `verify-email` and the rest are
+		// nameable, and an operator who wants them says so.
 		RateLimit: RateLimit{
+			Enabled:       true,
 			WindowSeconds: 60,
 			Max:           10,
-			KeyBy:         RateLimitKeyByIP,
+			KeyBy:         RateLimitKeyByEmail,
+			Scope:         []string{"login", "forgot-password", "magic-link", "sms-code", "2fa-verify"},
 		},
 		Stores: Stores{
 			Driver: StoreDriverMemory,
