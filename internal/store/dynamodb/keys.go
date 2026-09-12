@@ -28,6 +28,14 @@ const (
 // tenant's partition key.
 const keySep = "#"
 
+// keySepSuccessor is the byte immediately after keySep. It is the upper bound of
+// a range query over every key of the form "<fixed-width prefix><keySep><tail>",
+// whatever the tail: every such key sorts below it, and every key with a larger
+// fixed-width prefix sorts above it. Appending a maximal *character* instead
+// would depend on what bytes the tail may contain, which for a caller-supplied
+// id is not this package's to assume.
+const keySepSuccessor = "$"
+
 // schemaVersion is stamped into _v on every item this build writes. Readers
 // accept anything at or below it and must tolerate unknown attributes (§7).
 const schemaVersion = 1
@@ -88,7 +96,7 @@ const (
 	// written one.
 	typeTenant = "tenant"
 
-	// typeWebhook is one webhook subscription, outgoing or inbound (§1.5 #62).
+	// typeWebhook is one webhook subscription, outgoing or inbound (§1.5 #72).
 	typeWebhook = "webhook"
 
 	// typeTelemetry is one recorded auth event (§1.5 #59).
@@ -375,6 +383,12 @@ const (
 	maxRoleNameLen  = 256
 	maxMetaKeyLen   = 256
 	maxServiceIDLen = 256
+
+	// maxAPIKeyPrefixLen is generous for the same reason and tighter for one
+	// more: the core mints an 11-character prefix (`ak_` plus 8 hex, api_keys.go)
+	// and nothing longer is reachable through it, so this bound exists only to
+	// stop a hand-built record from producing a key DynamoDB refuses.
+	maxAPIKeyPrefixLen = 128
 )
 
 // checkOpaque validates a caller-supplied value that occupies the *only*

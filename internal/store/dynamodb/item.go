@@ -2,6 +2,7 @@ package dynamodb
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -33,6 +34,51 @@ func parseTime(s string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("dynamodb: parse timestamp %q: %w", s, err)
 	}
 	return t.UTC(), nil
+}
+
+// descendingStamp encodes an instant so that *ascending* byte order is
+// *descending* time: it is the fixed-width decimal complement of the instant's
+// Unix nanoseconds.
+//
+// It exists for one contract. APIKeyAdminStore's normative order is "CreatedAt
+// descending, ties broken by ID ascending", and a DynamoDB sort key can only be
+// read forwards or backwards as a whole — so a plain `<createdAt>#<id>` key read
+// with ScanIndexForward=false would give CreatedAt descending and ID
+// *descending*, which is a different total order from the one the core states.
+// Complementing the timestamp instead puts the descending half inside the key,
+// so an ordinary forward Query yields exactly (CreatedAt desc, ID asc) and no
+// deviation has to be registered for an order that could have been reproduced.
+//
+// Nineteen digits because that is the width of math.MaxInt64, and fixed width
+// because DynamoDB compares strings bytewise — the same reason tsLayout pads.
+//
+// Saturating rather than wrapping at both ends, and the zero time deliberately
+// maps to the same complement as the epoch: the core says "records with a zero
+// CreatedAt sort last, after every record that has one", and treating a zero (or
+// a pre-1970, or an unrepresentable) instant as the earliest possible one puts it
+// exactly there. time.Time.UnixNano is undefined outside roughly 1678-2262, so
+// the guard is also what keeps this from returning nonsense for a hand-edited
+// item.
+func descendingStamp(t time.Time) string {
+	return fmt.Sprintf("%019d", uint64(math.MaxInt64)-uint64(unixNanosSaturating(t)))
+}
+
+// maxNanoSecond is the largest Unix second whose nanosecond count still fits in
+// an int64 (math.MaxInt64 / 1e9, rounded down).
+const maxNanoSecond = math.MaxInt64 / int64(time.Second)
+
+func unixNanosSaturating(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	switch sec := t.Unix(); {
+	case sec < 0:
+		return 0
+	case sec >= maxNanoSecond:
+		return math.MaxInt64
+	default:
+		return t.UnixNano()
+	}
 }
 
 // item is a small builder. Its only real job is the omission rule: an absent
@@ -84,6 +130,18 @@ func (it item) tp(name string, v *time.Time) item {
 // omission decision.
 func (it item) av(name string, v types.AttributeValue) item {
 	it[name] = v
+	return it
+}
+
+// avIf is av with the omission decision made in the chain rather than around it,
+// for the composite attributes whose nil and empty forms mean different things.
+// The value is built lazily so the caller need not construct what will be
+// dropped.
+func (it item) avIf(name string, write bool, build func() types.AttributeValue) item {
+	if !write {
+		return it
+	}
+	it[name] = build()
 	return it
 }
 

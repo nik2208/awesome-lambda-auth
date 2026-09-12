@@ -46,11 +46,21 @@ import (
 
 // Tenant directory attributes (data-model.md §5). The id is not duplicated into
 // an attribute: it is the tail of SK, as a mail template's id is.
-const (
-	attrTenantName   = "name"
-	attrTenantActive = "isActive"
-	attrTenantConfig = "config"
-)
+//
+// `name` is not among them: the constant is already declared in users.go, where
+// the linked-account item uses the same spelling of the same word, and the rule
+// this package follows is that one attribute name is one constant — a second
+// declaration of the same string is what lets a codec and a condition drift
+// apart. Same argument settings.go makes for sharing attrRequire2FA with the
+// user profile.
+const attrTenantConfig = "config"
+
+// attrIsActive is shared by three item types that never share an item: the
+// tenant directory entry, the API key (api_keys.go) and the webhook
+// subscription (webhooks.go). All three take the name from the same place — it
+// is `isActive` in the reference's JSON for the two that have JSON — so it is
+// one constant rather than three, for the reason above.
+const attrIsActive = "isActive"
 
 // MaxTenantBytes caps a tenant record as itemBytes accounts for it, for
 // MaxTemplateBytes' reason and with its margin: Tenant.Config is a
@@ -217,7 +227,7 @@ func (s *Store) UpdateTenant(ctx context.Context, id string, update auth.Tenant)
 		Key:                       key(tenantsPK, tenantDirSK(id)),
 		UpdateExpression:          aws.String(updateExpression(set, remove)),
 		ConditionExpression:       aws.String("attribute_exists(#SK)"),
-		ExpressionAttributeNames:  exprNames(attrSK, attrTenantName, attrTenantActive, attrTenantConfig, attrUpdatedAt),
+		ExpressionAttributeNames:  exprNames(attrSK, attrName, attrIsActive, attrTenantConfig, attrUpdatedAt),
 		ExpressionAttributeValues: values,
 	}); err != nil {
 		if isConditionFailed(err) {
@@ -463,8 +473,8 @@ func tenantItem(t auth.Tenant) (item, error) {
 		sAlways(attrPK, tenantsPK).
 		sAlways(attrSK, tenantDirSK(t.ID)).
 		stamp(typeTenant).
-		s(attrTenantName, t.Name).
-		b(attrTenantActive, t.IsActive).
+		s(attrName, t.Name).
+		b(attrIsActive, t.IsActive).
 		av(attrTenantConfig, cfg).
 		t(attrCreatedAt, t.CreatedAt), nil
 }
@@ -483,8 +493,8 @@ func tenantFromItem(m map[string]types.AttributeValue) (auth.Tenant, error) {
 	}
 	return auth.Tenant{
 		ID:        id,
-		Name:      getS(m, attrTenantName),
-		IsActive:  getBool(m, attrTenantActive),
+		Name:      getS(m, attrName),
+		IsActive:  getBool(m, attrIsActive),
 		Config:    anyMapFromAV(m[attrTenantConfig]),
 		CreatedAt: createdAt,
 	}, nil
