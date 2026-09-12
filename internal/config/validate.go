@@ -629,6 +629,22 @@ var rateLimitEndpoints = []string{
 	"magic-link", "sms-code", "2fa-verify", "verify-email", "resend-verification",
 }
 
+// RateLimitEndpoints returns the vocabulary rateLimit.scope accepts.
+//
+// Exported for two readers and neither of them is the validator. The deployment
+// tooling checks a document before an upload, the way it does with
+// UnwiredDomains; and cmd/auth holds its own route table against this list
+// (TestEveryScopeNameMapsToRoutes), because the two halves of "what a scope
+// name means" live in different packages — this one says which names exist, that
+// one says which routes each covers — and a name in only one of them is either a
+// knob that validates and limits nothing or a limiter nobody can switch on.
+//
+// A copy, so a caller cannot edit the vocabulary by writing to the slice it was
+// handed.
+func RateLimitEndpoints() []string {
+	return append([]string(nil), rateLimitEndpoints...)
+}
+
 func knownRateLimitEndpoint(name string) bool {
 	for _, e := range rateLimitEndpoints {
 		if e == name {
