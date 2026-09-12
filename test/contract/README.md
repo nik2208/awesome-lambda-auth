@@ -256,7 +256,40 @@ func init() {
 `Doc` is logged before the case runs, so a failure names the clause that broke
 without anyone opening the spec.
 
-The pieces: `harness_test.go` (env, probe, runner), `client_test.go` (client,
+## Adding a capability
+
+A capability is likewise one declaration and never an edit to the harness. It is
+registered in `capabilities_test.go`, or in a file of its own, and carries its
+own name, the point in the probe pass it belongs to, and the probe:
+
+```go
+// CapWhatever is what the deployment either offers or does not.
+const CapWhatever Capability = "whatever"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapWhatever,
+		Stage: stageProbed,                     // see probeStage
+		Probe: func(t *testing.T, p *probeRun) {
+			// Say which client and why: p.Anon holds no session until the
+			// register probe runs and the provisioned account's afterwards,
+			// p.LoggedIn(t) is a separate identity with its own jar.
+			p.Set(CapWhatever, classify(p.LoggedIn(t).GET(t, "/whatever")))
+		},
+	})
+}
+```
+
+Everything else follows from that one declaration: the probe order, the names
+`AWESOME_AUTH_CONTRACT_REQUIRE` accepts, the report, and the "report every fault
+once" loop. A probe that settles two capabilities out of one response — as the
+CSRF one does, since the `Secure` flag can only be read off a cookie — names the
+second in `Settles`. `TestCapabilityRegistryIsWellFormed` runs without a
+deployment and catches a duplicate name, a missing probe, and a `Case` that needs
+a capability nobody registers.
+
+The pieces: `harness_test.go` (env, registry machinery, probe pass, runner),
+`capabilities_test.go` (the capability declarations), `client_test.go` (client,
 request options, response assertions, provisioning), `cookies_test.go` (cookie
 parsing and the prefix rule), `totp_test.go` (RFC 6238, so the suite can mint its
 own second factor rather than shell out).
