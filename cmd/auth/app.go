@@ -172,6 +172,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if newStores == nil {
 		newStores = defaultStoreFactory
 	}
+	// Every outbound request this binary makes on a route's behalf carries the
+	// caller's correlation id from here on. It is done once, on the way in,
+	// rather than at each of the three consumers (delivery webhook, claims
+	// webhook, resource-server JWKS fetch), because the fourth consumer has not
+	// been written yet and the property should hold for it too. See
+	// correlatingClient: it copies, so Options.HTTPClient is not mutated.
+	opts.HTTPClient = correlatingClient(opts.HTTPClient)
 
 	doc, err := loadDocument(getenv, readFile)
 	if err != nil {
@@ -338,6 +345,23 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	}
 	handler = corsMiddleware(cfg.HTTP.CORS.Origins)(handler)
 	handler = accessLog(log, handler)
+	// The last two wraps are the observability pair, and their order is the
+	// argument: the carrier has to exist before anything can read it, and the
+	// access log is one of the things that reads it. So correlationScope sits
+	// between them, and auth.EventContextMiddleware ends up outermost — ahead of
+	// CORS, ahead of the access log, ahead of everything.
+	//
+	// EventContextMiddleware is the core's, not a re-implementation, and
+	// httpConfig(cfg) is the same pure function of the same document that
+	// mountAuthSurface hands the adapter. The adapter installs the carrier again
+	// inside its own guard chain (awesome-go-auth adapter/nethttp/nethttp.go:257)
+	// for the routes it owns; that install recomputes the identical value, so
+	// this one costs a context value on those routes and buys the carrier on the
+	// ones the adapter does not own — GET /healthz today, whatever a later block
+	// mounts outside the api prefix tomorrow. See the correlation section of
+	// logging.go for why this binary never reads the header itself.
+	handler = correlationScope(log)(handler)
+	handler = auth.EventContextMiddleware(httpConfig(cfg))(handler)
 
 	app := &App{Config: cfg, Logger: log, Handler: handler}
 

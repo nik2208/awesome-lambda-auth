@@ -524,6 +524,161 @@ redirect allowlist, `?lang=` on the UI routes and the whole OAuth and OIDC
 callback vocabulary elsewhere. `Host` is the exception because API Gateway
 routes on it and rejects the viewer's.
 
+## Observability
+
+Nine alarms, an optional notification target, an optional budget and one rule
+about log groups that every later block has to follow. The reasoning for each
+threshold is in the template beside the alarm; the money is in
+[docs/cost-model.md](../../docs/cost-model.md).
+
+### Log retention is a convention with a test behind it
+
+**Every function this stack declares gets an explicit log group**, named
+`/aws/lambda/<its FunctionName>`, with `RetentionInDays: !Ref LogRetentionDays`,
+and the function `DependsOn` it. Three properties, each load-bearing:
+
+- **Explicit**, because a log group Lambda creates for itself has *no expiry at
+  all* — and that is not something this template can fix afterwards for a group
+  CloudFormation does not own. It is the one cost mistake in a serverless stack
+  that compounds silently: ingestion is paid once at ~$0.50/GB, storage is paid
+  every month forever at ~$0.03/GB.
+- **Named exactly** as Lambda would name it. One character wrong and the
+  deployment still succeeds: CloudFormation creates a group nothing writes to,
+  Lambda creates the real one with no expiry, and the stack looks correct.
+- **`DependsOn`**, because it is a race. Without the ordering the function can be
+  invoked — and create its own group — before CloudFormation creates this one.
+
+`infra/sam/template_test.go` reads this file's template, finds every function in
+it, and fails the build if any of the three is missing. That is what makes this a
+convention rather than something each later block has to remember; the SSE
+function, the webhook worker, the script runner and the migrate job all get a red
+test instead of a bill nobody reads.
+
+`LogRetentionDays` defaults to **14** and applies to every group at once. The
+test pins that default too — 3653 days would satisfy every other assertion and be
+the same mistake in slow motion.
+
+### The alarms
+
+`EnableAlarms` is `true` by default. The set is **nine standard-resolution alarm
+metrics against CloudWatch's always-free ten**, which is a design constraint and
+not a coincidence: in an account with no other alarms this section is free, and
+it is $0.90/month in one that has already spent the allowance.
+
+| alarm | metric | fires at | the incident |
+|---|---|---|---|
+| `-auth-errors` | Lambda `Errors` | ≥ 1 in 5 min | The handler did not answer: a refuse-to-start rule, a panic, an undecodable event. Not a 4xx or 5xx the router returned — those are successful invocations |
+| `-auth-throttles` | Lambda `Throttles` | ≥ 1 in 5 min | The reservation binding, or the account's concurrency pool exhausted. Somebody got a 429 they did not deserve |
+| `-auth-duration` | Lambda `Duration`, Maximum | ≥ `DurationAlarmThresholdMs` (8 000) for 2 periods | A function that has started timing out bills its **whole** timeout per request. 80% of the default 10 s timeout, so it arrives before that, not after |
+| `-auth-concurrency` | Lambda `ConcurrentExecutions`, Maximum | ≥ `ConcurrencyAlarmThreshold` (50) for 5 min | A connection that never closes, or an invocation that re-enters itself. The **only** metric that moves for either, and minutes ahead of any spend signal |
+| `-table-write-throttles` | DynamoDB `WriteThrottleEvents` | ≥ 1 in 5 min | `MaxWriteRequestUnits` binding: registrations and rate-limiter counters being dropped, and the limiter fails open when its counter cannot be written |
+| `-table-read-throttles` | DynamoDB `ReadThrottleEvents` | ≥ 1 in 5 min | `MaxReadRequestUnits` binding: logins failing for a reason no caller can act on |
+| `-table-write-capacity` | DynamoDB `ConsumedWriteCapacityUnits`, Sum | ≥ `CapacityAlarmUnits` (18 000) in 5 min | The same incident one step earlier — 30% of the ceiling. The limiter spends 1 WCU per limited request either way, so this rate is a credential-attempt rate, not a user base |
+| `-table-read-capacity` | DynamoDB `ConsumedReadCapacityUnits`, Sum | ≥ `CapacityAlarmUnits` (18 000) in 5 min | Where `sessions.checkOn: allcalls` shows up, and where a polling event stream will |
+| `-auth-log-ingestion` | Logs `IncomingBytes`, Sum | ≥ `LogIngestionAlarmBytes` (25 MiB) in 1 hour | A loop that logs per iteration. Retention bounds *storage*; nothing bounds *ingestion*, which is where the ~$0.50/GB is charged |
+
+All nine treat missing data as not breaching — an idle stack publishes no Lambda
+or DynamoDB metrics at all, and an alarm that fires because nothing happened is
+an alarm somebody turns off. None has an `OKActions`: "the alarm cleared" is not
+news, and doubling the mail volume is the reliable way to get alerts filtered
+into a folder nobody reads.
+
+Adding a function adds four more (errors, throttles, duration, concurrency) and
+takes the set past the free ten. The template test fails when that happens, on
+purpose, so the ~$0.10/alarm/month is a decision rather than a discovery.
+
+### Where the alarms go
+
+**An alarm with no action is decoration**, so set one of:
+
+- `AlarmEmail` — creates an SNS topic and subscribes the address. SNS then sends
+  a confirmation mail that **must be clicked**; until it is, the subscription is
+  pending and every alarm publishes into nothing.
+- `AlarmTopicArn` — an existing topic, for accounts where alerts already go
+  somewhere. It must be in this stack's region: a CloudWatch alarm can only
+  publish to a topic in its own region. If you also set `BudgetLimitUsd` or
+  `EnableCostAnomalyDetection`, that topic's policy must let
+  `budgets.amazonaws.com` and `costalerts.amazonaws.com` publish to it — this
+  stack can only write that policy for a topic it owns.
+
+Setting both is refused at the changeset. Setting neither is a valid deployment:
+nothing is created, no address appears anywhere in the account, and the alarms
+are visible in the console with no action attached.
+
+The topic this stack creates is **not encrypted**, and that is a decision. A
+topic encrypted with the AWS-managed `aws/sns` key cannot be published to by
+CloudWatch, Budgets or Cost Anomaly Detection, because those services cannot be
+granted use of an AWS-managed key — the result is a stack that deploys, a topic
+that looks right, and alarms that silently reach nobody. A customer-managed key
+would work and costs $1.00/month; what travels through here is an alarm name and
+a metric value.
+
+### The budget, and why it is not a second zero-spend budget
+
+`BudgetLimitUsd` defaults to `0`, which creates nothing — a template deployed by
+a stranger must not silently add a budget to their account. Set it and you get
+one `AWS::Budgets::Budget` with `CostTypes.IncludeCredit: false`.
+
+That one property is the entire argument for it existing. AWS's own "My
+Zero-Spend Budget" alerts above $0.01 of *actual* cost, and actual cost is
+computed with credits included — a credit is a negative line that nets the charge
+to zero. An account burning $40 a month against promotional credit therefore
+shows $0.00 to that budget and it stays silent for exactly the period in which
+the money is being spent, firing the month the credit runs out. This one measures
+**gross consumption**, which is a different number and the one a "stop at N"
+rule is written against. Two budgets measuring the same thing would be noise;
+these two measure different things.
+
+Three more facts that decide how to use it:
+
+- **A budget notifies and never caps.** AWS does not stop services when one
+  trips. The only hard stops in this template are
+  `ReservedConcurrentExecutions` and the two DynamoDB request-unit ceilings, and
+  both cause outages when they bind.
+- **The first two budgets per account are free**, then about $0.02 per budget per
+  day. An account with the AWS zero-spend budget is at one, so this is the free
+  second — and a third, added later without noticing, is ~$0.60/month.
+- **It is account-wide, not stack-scoped.** Scoping a budget to a stack needs
+  cost allocation tags activated in the billing console, which CloudFormation
+  cannot do and which only collect data from the day they are switched on.
+
+`BudgetTimeUnit` defaults to `ANNUALLY`: the question a credit-covered deployment
+has to answer is cumulative, and a monthly budget resets before it can answer it.
+Notifications fire at 80% and 100% of actual and 100% of forecast — the forecast
+one is the only one that arrives in time to act on, and AWS needs about five
+weeks of history before it will forecast at all.
+
+### Cost anomaly detection
+
+`EnableCostAnomalyDetection` is off by default and requires a notification
+target. It is free, and it is the one spend signal that needs no threshold agreed
+in advance: a budget answers "have we passed a number we chose", this answers "is
+this month shaped like the last ones", and $0.75/month becoming $40 is a shape
+long before it is a number.
+
+It is also the **only** spend signal a stack in this region can create. A
+CloudWatch alarm on `AWS/Billing EstimatedCharges` is not an option: billing
+metrics are published in `us-east-1` only and an alarm can only watch metrics in
+its own region, so a template that appeared to create one would be creating an
+alarm on a metric that never reports. Budgets and Cost Explorer are global
+services and are reachable from any region.
+
+The caveat, stated because this stack's template is validated by reading rather
+than by a deploy: Cost Explorer's own API endpoint is `us-east-1`.
+CloudFormation resolves that for a global service and `AWS::CE::*` are documented
+as ordinary resource types with no region constraint — but if a changeset ever
+rejects them, the fix is a small companion stack in `us-east-1`, not a redesign.
+That is why this is the one thing in the section that defaults to off.
+
+### None of this is faster than watching the resources
+
+CloudWatch's billing metrics refresh roughly every six hours and Cost Explorer is
+about a day behind, so a cost anomaly notification can arrive a day after the
+spend it describes. `ConcurrentExecutions` is a minute behind. **For this product
+the fastest spend alarm is not a spend alarm** — which is why the money-shaped
+resources above are the small half of this section and the four Lambda and four
+DynamoDB alarms are the large one.
+
 ## Cost at rest
 
 Idle, with no traffic and an empty table, this stack costs roughly **$0.80 a
@@ -551,7 +706,15 @@ at rest or billed per request:
   not multiplied and not reduced.
 - CloudWatch Logs: ~$0.50 per GB ingested and ~$0.03 per GB-month stored.
   Retention is capped at 14 days by default because never-expire is a bill that
-  only grows.
+  only grows. Ingestion is the line that scales with traffic — roughly **$0.30
+  per million requests** at the two lines this binary writes per request, which
+  is a quarter of the API Gateway charge for the same traffic.
+- The observability block — nine alarms, the SNS topic, the budget, the anomaly
+  monitor: **$0 at rest.** Nine alarm metrics fit inside CloudWatch's always-free
+  ten, the topic and its subscription have no standing charge (and the first
+  1 000 email notifications a month are free), the budget is the free second of
+  two, and cost anomaly detection is free. In an account that has already spent
+  its ten alarm metrics elsewhere, $0.90/month.
 - S3 artifact bucket: a few megabytes per deployed version. Cents.
 
 Under traffic the shape is roughly $1 per million API requests, $0.20 per
@@ -562,7 +725,16 @@ budgeting on them.
 
 `MaxReadRequestUnits` / `MaxWriteRequestUnits` default to 200 each. That is a
 deliberate cap: a credential-stuffing run against `/login` becomes a DynamoDB
-bill before it becomes an outage. Raise it on purpose, and alarm on it.
+bill before it becomes an outage. Raise it on purpose — and it is alarmed on,
+twice each, at the ceiling and at 30% of it (see **Observability** above).
+
+**Per-request costs, path by path, are in
+[docs/cost-model.md](../../docs/cost-model.md)** — including the one number this
+section's order-of-magnitude figures hide: DynamoDB is about three quarters of
+the cost of a login, and six of its nine write units are the single transaction
+that writes the session, its directory entry and its refresh pointer together.
+That document also carries the cost *shape* of what is coming, which is what the
+SSE block needs before it picks a transport rather than after.
 
 ### The identity provider's KMS key
 

@@ -8,6 +8,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	auth "github.com/nik2208/awesome-go-auth"
 )
 
 // RedactedValue replaces the value of any attribute whose key is on the
@@ -27,6 +30,35 @@ const RedactedValue = "[REDACTED]"
 // reviewable omission. Every name is matched case-insensitively, and both the
 // camelCase wire spelling and the HTTP header spelling are listed where they
 // differ, because an attribute may be built from either.
+//
+// The list grows with the surface. Five credential shapes were added with the
+// observability block, and only two of them were missing — which is the point of
+// writing down why each is here rather than adding names that look dangerous:
+//
+//   - `clientSecret` / `client_secret`: the OIDC client's password. The camelCase
+//     spelling was already listed; `client_secret` is the snake_case form the
+//     token endpoint actually receives, because /token is a form POST in
+//     client_secret_post (idp.go, and the discovery document advertises no other
+//     method). A key spelled the way the wire spells it is the one an attribute
+//     built from the parsed form would carry.
+//   - `privateKey`: already listed. idProvider.privateKey is the PEM alternative
+//     to the KMS key — the one signing arrangement where this process holds a key
+//     it could print (docs/oidc.md §2).
+//   - `signature` / `x-webhook-signature`: the HMAC over a webhook body,
+//     `X-Webhook-Signature: sha256=<hex>` (awesome-go-auth webhook_sender.go:64,
+//     :376). It is not the credential being delivered, it is the proof of
+//     authorship: an attacker holding a logged signature plus the body it signed
+//     can replay that delivery against the receiver forever, because the receiver
+//     verifies exactly those bytes.
+//   - `code`: already listed, and it is now carrying more than it was. It is the
+//     SMS one-time code AND the OIDC authorization code that /token exchanges for
+//     an id_token — single-use, but "single" means "until the first use", and a
+//     code in a log is readable before the client gets round to spending it.
+//   - `tempToken`: the 2FA step-up handle. wire-contract.md §3 and
+//     docs/spec/serverless-gap-analysis.md §1.2 record the reference caveat this
+//     product inherited: the tempToken is a *full* access token — same secret,
+//     same verifier — so for its five minutes it passes authMiddleware. Logging
+//     one is logging a session.
 var redactedKeys = []string{
 	"accessToken",
 	"access_token",
@@ -36,6 +68,7 @@ var redactedKeys = []string{
 	"bearer",
 	"bootstrapSecret",
 	"clientSecret",
+	"client_secret",
 	"code",
 	"cookie",
 	"csrf",
@@ -54,12 +87,15 @@ var redactedKeys = []string{
 	"session",
 	"sessionToken",
 	"set-cookie",
+	"signature",
 	"smsCode",
+	"tempToken",
 	"token",
 	"tokenHash",
 	"totp",
 	"x-api-key",
 	"x-csrf-token",
+	"x-webhook-signature",
 }
 
 var redactedKeySet = func() map[string]struct{} {
@@ -146,6 +182,182 @@ func loggerFrom(ctx context.Context, fallback *slog.Logger) *slog.Logger {
 	return slog.Default()
 }
 
+// ── the correlation id ──────────────────────────────────────────────────────
+//
+// One caller-supplied handle, `X-Correlation-Id`, on every line this deployment
+// writes about a request — so that a client's "my login failed at 14:02" can be
+// resolved to the invocation that failed rather than to the sixty that did not.
+//
+// THIS BINARY DOES NOT READ THE HEADER. That is the whole design, and it is a
+// change of mind forced by the core: awesome-go-auth v0.9.0 ships the carrier
+// (event_context.go), every adapter installs it outermost, and the value it
+// reads is published under every Event the core emits. A second parse here would
+// produce a second answer to the same question, and the two would be identical
+// right up until the day they were not — a host setting HTTPConfig.ClientIP, a
+// change in the reference's array-first quirk for a repeated header
+// (node-auth auth.router.ts:407-410, ported in EventContextFromRequest), a
+// different notion of "absent". So:
+//
+//	auth.EventContextMiddleware(httpConfig(cfg))   installs it, outermost
+//	correlationScope                               copies it onto the logger
+//	correlatingTransport                           forwards it outbound
+//
+// and correlationIDOf below is the only place any of this gets a value from.
+// The adapter installs the carrier a second time, further in, for the routes it
+// owns; that install recomputes the same function of the same request with the
+// same HTTPConfig, so the two cannot disagree by construction rather than by
+// agreement. What the outer install adds is coverage: GET /healthz and anything
+// else this binary mounts outside the adapter's guard chain.
+//
+// An absent header stays absent. The core does not mint an id when the caller
+// sent none (event_context.go, EventContext.CorrelationID) because an invented
+// id joins nothing to anything, and a consumer could not tell it from one the
+// caller's gateway assigned — so a request with no header logs no
+// correlationId attribute at all, and the absence is the honest answer.
+//
+// Nothing is echoed back to the caller either. An echo would hand the client a
+// value the client just sent, which buys it nothing, and it would put an
+// attacker-controlled string into a response header on a credential origin.
+
+// CorrelationIDLogKey is the attribute name every correlated line carries. It is
+// not on the redaction list: a correlation id is the one caller-supplied value
+// here that is worth nothing to whoever reads the log and everything to whoever
+// has to find the line.
+const CorrelationIDLogKey = "correlationId"
+
+// maxCorrelationIDBytes bounds what is logged and what is forwarded.
+//
+// The bound is a cost control, which is why it lives in this block and not in a
+// validator. CloudWatch bills ~0.50 USD per GB ingested; API Gateway accepts a
+// header of up to ~10 KB, and the access log writes one line per request. A
+// caller that sends 10 KB of "correlation id" therefore buys ~5 USD per million
+// requests of somebody else's log bill, and 128 bytes is longer than a UUID, an
+// X-Ray trace id or a W3C traceparent — the three things a real one ever is.
+const maxCorrelationIDBytes = 128
+
+// correlationIDOf returns the correlation id the core's carrier installed, or ""
+// when the context has no carrier (a background job, a cold-start line) or the
+// request carried no header.
+func correlationIDOf(ctx context.Context) string {
+	ec, _ := auth.EventContextFromContext(ctx)
+	return ec.CorrelationID
+}
+
+// loggableCorrelationID is what reaches slog: trimmed, and truncated on a rune
+// boundary with an ellipsis so that a truncated id is visibly truncated instead
+// of looking like a short one that does not match anything.
+//
+// Nothing else is stripped. The JSON handler escapes control characters, so a
+// hostile value is a noisy log line and not an injected one, and mangling what
+// arrived would make the log disagree with the events the core publishes — which
+// is the one property this block exists to keep.
+func loggableCorrelationID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if len(raw) <= maxCorrelationIDBytes {
+		return raw
+	}
+	cut := maxCorrelationIDBytes
+	for cut > 0 && !utf8.RuneStart(raw[cut]) {
+		cut--
+	}
+	return raw[:cut] + "…"
+}
+
+// forwardableCorrelationID is the stricter filter for an outbound header, and it
+// refuses rather than repairs.
+//
+// Two reasons it cannot be loggableCorrelationID. A header value outside
+// 0x20..0x7E is rejected by net/http's own transport ("invalid header field
+// value"), so forwarding one unchecked would turn a poisoned inbound header into
+// a webhook this deployment can no longer deliver — a caller-triggered outage on
+// a path that carries credentials. And repairing it would forward an id that
+// matches nothing at either end, which is worse than forwarding none: the log
+// still shows what actually arrived, so the mismatch stays diagnosable.
+func forwardableCorrelationID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > maxCorrelationIDBytes {
+		return ""
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < 0x20 || raw[i] > 0x7e {
+			return ""
+		}
+	}
+	return raw
+}
+
+// correlationScope copies the carrier's id onto the request-scoped logger.
+//
+// Onto the logger and not into one log call: every later line — the access log,
+// the adapter's OnError, anything a handler writes through loggerFrom — is then
+// correlated without any of them knowing this exists. It must sit INSIDE
+// auth.EventContextMiddleware (the carrier has to be installed before it is
+// read) and OUTSIDE accessLog (whose line is one of the ones that wants it).
+func correlationScope(fallback *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id := loggableCorrelationID(correlationIDOf(r.Context()))
+			if id == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			log := loggerFrom(r.Context(), fallback).With(slog.String(CorrelationIDLogKey, id))
+			next.ServeHTTP(w, r.WithContext(withLogger(r.Context(), log)))
+		})
+	}
+}
+
+// correlatingTransport puts the id on every outbound request this binary makes
+// on a route's behalf — the delivery webhook, the claims webhook, the JWKS fetch
+// of resource-server mode — so that the receiver's logs and this deployment's
+// logs name the same request.
+//
+// It works because the core builds those with http.NewRequestWithContext from
+// the request's own context (awesome-go-auth delivery_webhook.go:207,
+// claims_webhook.go:162, resource_server.go:332), so the carrier is still
+// reachable at the point the request is issued. A call made from a background
+// context simply carries no header.
+//
+// An id the caller already set on the outbound request wins, because the only
+// way one gets there is that something closer to the call site knew better.
+type correlatingTransport struct{ next http.RoundTripper }
+
+func (t correlatingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	next := t.next
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	if r.Header.Get(auth.CorrelationIDHeader) != "" {
+		return next.RoundTrip(r)
+	}
+	id := forwardableCorrelationID(correlationIDOf(r.Context()))
+	if id == "" {
+		return next.RoundTrip(r)
+	}
+	// RoundTrip must not modify the request it is given; Clone is the documented
+	// way to add a header, and it is shallow enough to be free here.
+	clone := r.Clone(r.Context())
+	clone.Header.Set(auth.CorrelationIDHeader, id)
+	return next.RoundTrip(clone)
+}
+
+// correlatingClient wraps the outbound HTTP client in correlatingTransport,
+// copying rather than mutating: Options.HTTPClient belongs to the caller, and a
+// test that injects an httptest server's client hands over a value it goes on
+// using itself.
+//
+// A nil client is http.DefaultClient wrapped, which is what every consumer of
+// Options.HTTPClient already resolves nil to — so wrapping changes which
+// transport runs and nothing about timeouts, redirects or TLS.
+func correlatingClient(base *http.Client) *http.Client {
+	if base == nil {
+		base = http.DefaultClient
+	}
+	dup := *base
+	dup.Transport = correlatingTransport{next: dup.Transport}
+	return &dup
+}
+
 // statusWriter records what the handler wrote so the access log can report it.
 type statusWriter struct {
 	http.ResponseWriter
@@ -185,6 +397,20 @@ func (w *statusWriter) Flush() {
 // single-use tokens in it, headers are excluded because Cookie and
 // Authorization live there, and the body is excluded because it carries
 // passwords. Adding a field here means adding it to that argument.
+//
+// The correlation id is the exception that proves it: it is a header, it is on
+// this line, and it is not in the argument list below. correlationScope puts it
+// on the request-scoped logger instead, so it rides every line of the request
+// rather than only this one — and the decision about whether a header may be
+// logged at all stays in one place, next to the redaction list, instead of being
+// re-taken here.
+//
+// The carrier holds two more fields, IP and User-Agent, and neither is logged.
+// They are personal data with no incident they would settle that the correlation
+// id does not: retention is 14 days by default (LogRetentionDays), and a field
+// that would have to be justified to a data protection officer is a field worth
+// not having. The core still publishes both under its events, where a consumer
+// has opted in to them.
 func accessLog(fallback *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

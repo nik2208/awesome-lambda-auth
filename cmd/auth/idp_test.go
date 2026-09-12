@@ -193,6 +193,25 @@ func newIDPApp(t *testing.T, f *fakeKeyring, env map[string]string) *App {
 	return app
 }
 
+// newIDPAppLogging is newIDPApp with the log captured instead of discarded, at
+// debug — for the assertions that are about what does NOT appear in it. It is a
+// second constructor rather than a parameter on the first because every other
+// identity test wants the log gone, and a writer threaded through forty call
+// sites to be used by one of them is noise.
+func newIDPAppLogging(t *testing.T, f *fakeKeyring, log io.Writer, env map[string]string) *App {
+	t.Helper()
+	app, err := New(context.Background(), Options{
+		Getenv:       envFunc(env),
+		Logger:       newLogger(log, slog.LevelDebug),
+		Stores:       memoryStores,
+		IDPKeySource: f.source,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return app
+}
+
 // idpEnv is baseEnv plus identity-provider mode on a named KMS key. The public
 // URL of baseEnv is what the issuer is derived from, so the derivation is
 // exercised by every test that does not override it.
