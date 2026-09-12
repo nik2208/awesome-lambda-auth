@@ -166,20 +166,38 @@ type Options struct {
 	Logger *slog.Logger
 }
 
-// Store implements, from awesome-go-auth's store.go: UserStore,
-// UserAccountStore, UserPasswordStore, SessionStore, SessionLookupStore,
-// SessionAdminStore, MagicLinkStore, SMSStore, EmailVerificationStore,
-// EmailChangeStore and TOTPStore; from account.go, UserPhoneStore; from
-// template_store.go, TemplateStore (templates.go); and from settings_store.go,
-// SettingsStore (settings.go). The two OAuth stores of oauth.go are reached
-// through Store.LinkedAccounts() and Store.PendingLinks(), because their
-// interfaces both declare Save and Delete and no single type can satisfy both.
+// Store implements every store interface awesome-go-auth v0.8.0 declares, with
+// one deliberate exception.
 //
-// The remaining optional interfaces land with their item types (data-model.md
-// §1.4-§1.5) and are deliberately absent rather than stubbed, because the core
-// discovers them by type assertion: a stub that returns "not implemented" would
-// make Service advertise a feature that fails at runtime, where an absent method
-// makes it return ErrFeatureNotSupported.
+// From store.go: UserStore, UserAccountStore, UserPasswordStore, SessionStore,
+// SessionLookupStore, SessionAdminStore, MagicLinkStore, SMSStore,
+// EmailVerificationStore, EmailChangeStore, TOTPStore, AuthCodeStore,
+// UserMetadataStore (metadata.go), RolesPermissionsStore (roles.go), TenantStore
+// (tenants.go) and the three v0.8.0 admin listers — AdminUserStore (users.go),
+// SessionLister (sessions.go) and RoleLister (roles.go). From account.go,
+// UserPhoneStore. From template_store.go, TemplateStore (templates.go). From
+// settings_store.go, SettingsStore (settings.go). From api_keys.go, the
+// completed APIKeyStore and three of its four companions (api_keys.go). From
+// webhook_store.go, all three webhook stores (webhooks.go). From telemetry.go,
+// TelemetryStore (telemetry.go).
+//
+// The two OAuth stores of oauth.go are reached through Store.LinkedAccounts()
+// and Store.PendingLinks(), because their interfaces both declare Save and
+// Delete and no single type can satisfy both.
+//
+// The exception is APIKeyAuditStore, deliberately absent rather than stubbed:
+// nothing calls LogUsage yet, and the core discovers the interface by type
+// assertion, so a stub returning "not implemented" would make Service advertise
+// a feature that fails at runtime where an absent method makes it return
+// ErrFeatureNotSupported. interfaces.go carries the full argument.
+//
+// Implementing an interface is not the same as offering it. Most of these are
+// discovered by type assertion and are therefore live the moment the core is
+// handed this store; the metadata, RBAC, tenant, API key, webhook and telemetry
+// stores are not — the core takes each of those by name — so they reach a route
+// only when the composition root passes them, which is the admin surface's
+// block and not this one's. The accessors exist (Metadata(), Roles(), Tenants(),
+// APIKeys(), Webhooks(), Telemetry()) so that it can.
 type Store struct {
 	api   API
 	table string

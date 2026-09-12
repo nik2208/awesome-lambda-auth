@@ -1109,10 +1109,25 @@ Resources:
   # ---------------------------------------------------------------------
   # Single table — docs/spec/data-model.md §2
   #
-  # PK/SK, one sparse GSI. The four access patterns that need GSI1 are
+  # PK/SK, one sparse GSI, and **no template change was needed for the admin
+  # stores**: the key schema and the projection below already serve them.
+  #
+  # Six access patterns need GSI1 now. Four are per-owner fan-outs:
   # ListSessionsForUser (#15), DeleteRole's assignment sweep (#33),
-  # GetTenantsForUser (#45) and LinkedAccountStore.ListForUser (#54); every
-  # other lookup is served from the main table's key space on purpose (§2.3).
+  # GetTenantsForUser (#45) and LinkedAccountStore.ListForUser (#54). Two are
+  # whole-entity enumerations added with core v0.8.0 — AdminUserStore.ListUsers
+  # (#47) and SessionLister.GetAllSessions (#47b) — and they are served from a
+  # *constant* GSI1 partition key rather than a per-owner one, because that is
+  # the only shape in which a key-value store can enumerate. APIKeyAdminStore's
+  # listing is the same shape (§1.5 #48). Every other lookup is served from the
+  # main table's key space on purpose (§2.3).
+  #
+  # The consequence worth knowing before a deploy: GSI1 is sparse and the user
+  # profile only started setting GSI1PK/GSI1SK with that release, so profiles
+  # written earlier are invisible to ListUsers until a one-time backfill writes
+  # the two attributes. That is a job (a paged sweep driven off _t = "user"),
+  # not a template change; §1.4 and §7 rule 4 describe it. Sessions need no
+  # backfill, because their directory entries expire with them.
   #
   # The GSI projection is INCLUDE of exactly _t, linkId, createdAt, matching
   # gsi1Projection in internal/store/dynamodb/table.go. Not ALL, because that
