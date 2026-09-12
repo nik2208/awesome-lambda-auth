@@ -266,17 +266,64 @@ Reference defaults from `src/router/tools.router.ts:120-128` unless noted.
 
 Per-webhook rows (URL, events, `jsScript`, `allowedActions`, per-row `maxRetries`/`retryDelayMs`) are **data in `stores.webhooks`, not config** — runtime-managed via the admin API. Outbound deliveries carry `X-Webhook-Signature: sha256=<hex>` (HMAC-SHA256) plus `X-Webhook-Event`, `X-Webhook-Delivery`, `X-Webhook-Timestamp` (`src/tools/webhook-sender.ts:24-33`) — preserved as-is. The vm sandbox exposes only `body`, `actions`, `result`, and a dev-only `console` (`src/router/tools.router.ts:272-286`); the action allowlist is `enabledWebhookActions` (runtime setting, §1.19) intersected with per-webhook `allowedActions` (`src/router/tools.router.ts:261-266`) [UNTESTED]; with no settings store, `enabledWebhookActions` is treated as `[]` (`src/router/tools.router.ts:261-264`).
 
-### 1.16 Rate limiting (placeholder — no reference defaults exist)
+### 1.16 Rate limiting (`rateLimit.*`) — net-new, no reference defaults exist
 
-The reference has **no rate limiting anywhere** unless the integrator injects an Express `rateLimiter` middleware — the default is `rl = []` (`src/router/auth.router.ts:468`). The product ships a built-in limiter (§3.5); every default below is a product decision, deliberately left TBD in Phase 0:
+The reference has **no rate limiting anywhere** unless the integrator injects an
+Express `rateLimiter` middleware — the default is `rl = []`
+(`src/router/auth.router.ts:468`). The product ships a built-in limiter (§3.5);
+every default below is a product decision. Phase 0 left them all TBD; they are
+decided here, implemented in `cmd/auth/ratelimit.go` and
+`internal/store/dynamodb/rate_limit.go`, and argued to an operator in
+[config-reference.md](../config-reference.md) §13.
 
 | Path | Type | Default | Validation | Env var |
 |---|---|---|---|---|
-| `rateLimit.enabled` | boolean | `[new]` TBD | — | `AWESOME_AUTH_RATE_LIMIT_ENABLED` |
-| `rateLimit.windowSeconds` | number | `[new]` TBD | integer > 0 | `AWESOME_AUTH_RATE_LIMIT_WINDOW_SECONDS` |
-| `rateLimit.max` | number | `[new]` TBD | integer > 0 | `AWESOME_AUTH_RATE_LIMIT_MAX` |
-| `rateLimit.keyBy` | `ip\|email` | `[new]` TBD | enum | `AWESOME_AUTH_RATE_LIMIT_KEY_BY` |
-| `rateLimit.scope` | string[] | `[new]` TBD — endpoint list, e.g. `[login, refresh, forgot-password]` | known endpoint names | — (file-only) |
+| `rateLimit.enabled` | boolean | `[new]` **`true`** — the `csrf-enabled-by-default` rule: a product must be safe with an empty configuration | — | `AWESOME_AUTH_RATE_LIMIT_ENABLED` |
+| `rateLimit.windowSeconds` | number | `[new]` **`60`** — long enough to be a real bound, short enough that a false positive costs a person one minute (it is also the ceiling on `Retry-After`) | integer > 0 | `AWESOME_AUTH_RATE_LIMIT_WINDOW_SECONDS` |
+| `rateLimit.max` | number | `[new]` **`10`** — more than a real person mistypes in a minute, six seconds per guess to an attacker. Fixed window, so size for `2×max` over any sliding minute | integer > 0 | `AWESOME_AUTH_RATE_LIMIT_MAX` |
+| `rateLimit.keyBy` | `ip\|email` | `[new]` **`email`** — the threat is account-shaped; an address-keyed default puts a NAT's whole office in one bucket and one DynamoDB partition ([data-model.md](data-model.md) §2.3). Volumetric defence by address belongs at the edge | enum | `AWESOME_AUTH_RATE_LIMIT_KEY_BY` |
+| `rateLimit.scope` | string[] | `[new]` **`[login, forgot-password, magic-link, sms-code, 2fa-verify]`** — the five flows [data-model.md](data-model.md) §1.5 row #61 names: a guess costs nothing and there is no session to lose | known endpoint names | `AWESOME_AUTH_RATE_LIMIT_SCOPE` (comma-sep) |
+
+The accepted names are `login`, `register`, `refresh`, `forgot-password`,
+`reset-password`, `magic-link`, `sms-code`, `2fa-verify`, `verify-email`,
+`resend-verification` (`internal/config` `RateLimitEndpoints()`). A name is a
+**flow**, not a path: `magic-link` covers `/magic-link/send` and
+`/magic-link/verify`, `sms-code` covers `/sms/send` and `/sms/verify`. The
+name-to-route table is in `cmd/auth/ratelimit.go` and
+`TestEveryScopeNameMapsToRoutes` fails if the two halves disagree.
+
+`rateLimit.scope` gained an environment override, which Phase 0 marked
+file-only. Every other list in this schema has one, and this one is the knob an
+operator reaches for during an incident — widen it while something is under
+attack, narrow it while a client is being fixed — and an environment variable is
+the only change a Lambda takes without a redeploy of the artifact. An empty value
+is an empty scope and therefore switches the limiter off, exactly as an empty
+list in the document does.
+
+**The refusal.** Over budget, a scoped route answers `429` with
+`Retry-After: <integer seconds, ≥ 1>`, `Content-Type: application/json`,
+`Cache-Control: no-store` and the body
+`{"error":"Too many requests","code":"RATE_LIMITED"}`. No `Set-Cookie` — the
+limiter is outermost, ahead of CSRF and the auth middleware, so nothing that sets
+one has run. No `RateLimit-*` headers, on this response or on a successful one:
+`RateLimit-Remaining` under an account-keyed counter is an oracle about somebody
+else's traffic. This is the registered wire deviation
+`rate-limited-routes-answer-429` ([deviations.md](../deviations.md)).
+
+**Under `keyBy: email`, a route whose body carries no address** resolves its
+subject through a per-route chain ending at the client address — body `email` or
+`userId`, else `sha256(tempToken)`, else the address the Lambda event reported
+(never `X-Forwarded-For`, which the client writes). One shared sentinel subject
+was rejected as a self-inflicted outage, and skipping the limiter was rejected
+because it would leave `POST /2fa/verify`, a six-digit code, unlimited.
+
+**Storage and failure.** One conditional `UpdateItem` per limited request,
+allowed or refused ([data-model.md](data-model.md) §1.5 row #61). When that store
+is unreachable the limiter **fails open**: the counter is in the same table as
+the user store, so a limiter that cannot count and a route that cannot serve are
+one event, and refusing would turn a partial degradation into a total outage. The
+remaining bound during such a window is the in-process pre-filter, which is per
+execution environment and is documented as a floor rather than a limit.
 
 ### 1.17 Stores and adapters (`stores.*`)
 

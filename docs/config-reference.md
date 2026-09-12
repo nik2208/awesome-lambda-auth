@@ -1118,7 +1118,234 @@ already exists, a paging failure halfway through and a record with no email, is
 }
 ```
 
-## 14. Two worked postures
+## 14. `rateLimit.*`, knob by knob
+
+The built-in rate limiter. It is **net-new to this product**: the reference has
+no rate limiting at all — `RouterOptions.rateLimiter`
+(`src/router/auth.router.ts:46`) is an empty slot for a host-supplied Express
+middleware, and absent it the router collapses the slot to an empty list
+(`rl = []`, `:468`) and ships no algorithm. So there is no upstream default to
+inherit, every value below is a product decision, and this section is where each
+one is argued rather than merely stated.
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `rateLimit.enabled` | boolean | `true` | `AWESOME_AUTH_RATE_LIMIT_ENABLED` |
+| `rateLimit.windowSeconds` | integer > 0 | `60` | `AWESOME_AUTH_RATE_LIMIT_WINDOW_SECONDS` |
+| `rateLimit.max` | integer > 0 | `10` | `AWESOME_AUTH_RATE_LIMIT_MAX` |
+| `rateLimit.keyBy` | `ip` \| `email` | `email` | `AWESOME_AUTH_RATE_LIMIT_KEY_BY` |
+| `rateLimit.scope` | endpoint names | `login, forgot-password, magic-link, sms-code, 2fa-verify` | `AWESOME_AUTH_RATE_LIMIT_SCOPE` (comma-separated) |
+
+**A deployment that says nothing is rate limited**, and that is the whole point
+of the default. It is the same house rule `csrf-enabled-by-default` and
+`production-by-default` state: a library can leave the choice to whoever embeds
+it, a product has to be safe with an empty configuration, and an auth stack that
+ships with unlimited login attempts is one that gets credential-stuffed. The
+`429` that follows is the registered wire deviation
+`rate-limited-routes-answer-429` ([deviations.md](deviations.md)), because it is
+a refusal the reference never makes. Set `rateLimit.enabled: false` and you have
+the reference's behaviour exactly.
+
+### 14.1 What `scope` names, and which routes each name covers
+
+A scope name is a flow, not a path, because several flows are two routes and an
+operator who wants one almost never wants only one half. `internal/config`
+validates the vocabulary; `cmd/auth/ratelimit.go` holds the table below, and
+`TestEveryScopeNameMapsToRoutes` fails if the two ever disagree.
+
+| Name | Routes | Subject under `keyBy: email` |
+|---|---|---|
+| `login` | `POST <prefix>/login` | body `email` |
+| `register` | `POST <prefix>/register` | body `email` |
+| `forgot-password` | `POST <prefix>/forgot-password` | body `email` |
+| `magic-link` | `POST <prefix>/magic-link/send`, `POST <prefix>/magic-link/verify` | body `email`, else `sha256(tempToken)`, else the client address |
+| `sms-code` | `POST <prefix>/sms/send`, `POST <prefix>/sms/verify` | body `email` or `userId`, else `sha256(tempToken)`, else the client address |
+| `2fa-verify` | `POST <prefix>/2fa/verify` | `sha256(tempToken)`, else the client address |
+| `refresh` | `POST <prefix>/refresh` | the client address |
+| `reset-password` | `POST <prefix>/reset-password` | the client address |
+| `verify-email` | `GET <prefix>/verify-email` | the client address |
+| `resend-verification` | `POST <prefix>/send-verification-email` | the client address |
+
+The default scope is the five flows `docs/spec/data-model.md` §1.5 row #61 names
+— the ones where a guess costs an attacker nothing and where there is no session
+to lose. The other five are nameable and deliberately off: `refresh` and
+`verify-email` are spent by a client holding a token it was given, and limiting
+them by default would throttle ordinary use of a working deployment to defend
+against guessing a 256-bit value.
+
+**Nothing here mounts a route.** The limiter is a middleware over the whole mux
+that matches on the resolved `http.apiPrefix` plus a path suffix, so moving the
+prefix moves the limiter with it and the adapter still owns every path under it.
+
+### 14.2 `keyBy`, and why the default is not `ip`
+
+`keyBy: email` makes the budget **per account**. `keyBy: ip` makes it **per
+source address**, on every route.
+
+The default is `email`, and the argument is about who gets hurt when the limiter
+fires:
+
+* The threat these routes face is credential stuffing and password spraying
+  against accounts. That is account-shaped, and an account-keyed counter hits it
+  exactly: ten attempts a minute against one address is invisible to a real
+  person and is six seconds per guess to an attacker.
+* An address-keyed default punishes the wrong people. A corporate NAT or a mobile
+  carrier's egress is one address for thousands of users, so one abuser behind it
+  spends everybody's budget — and, because the counter is one DynamoDB partition
+  key capped at 1 000 WCU, it also concentrates the writes
+  (`docs/spec/data-model.md` §2.3, whose own conclusion is that per-IP windows
+  must be short and the account-scoped limiter must be the primary control).
+* Volumetric defence by source address is a real need and belongs at the edge,
+  where a WAF or CloudFront can do it with the whole request rate in view. Doing
+  it here would be a worse copy of it, one DynamoDB write at a time.
+
+What `keyBy: email` does **not** do is bound an attacker who names a million
+different addresses; each gets its own budget. That is the known limit of
+account-keyed limiting, it is the layer above's job, and it is the reason
+`keyBy: ip` exists as a choice rather than being removed.
+
+**The subject never comes from a header.** It is the source address the Lambda
+event reported, not `X-Forwarded-For`, which the client writes: a limiter whose
+subject the caller chooses hands out a fresh budget with every request and is not
+a limiter at all.
+
+#### When `keyBy: email` meets a route with no email
+
+Three of the ten scopes carry no address in the body, and `POST /2fa/verify`
+carries no identity at all. Each route declares an ordered chain (the table in
+§14.1) and every chain ends at the client address. Two alternatives were
+rejected: one shared sentinel subject would put every such request in the
+deployment into a single budget and a single partition — a self-inflicted outage
+an attacker triggers by sending an empty body — and skipping the limiter would
+leave a six-digit TOTP code unlimited, which is the single route a limiter is
+most obviously for.
+
+Where a `tempToken` is present it is preferred over the address, because it names
+the challenge: an attacker brute-forcing the six digits holds one token and
+presents it with every guess, so the counter is exactly per challenge, and one
+who rotates tokens has to log in again for each, which `login` limits. It is
+hashed because it is a bearer credential and must not become a partition key in
+the clear. Nothing in the chain verifies anything or reads a store — a hash is
+not a check — so a refusal still costs nothing downstream.
+
+### 14.3 What a refused request looks like
+
+Byte for byte:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 43
+Content-Type: application/json
+Cache-Control: no-store
+
+{"error":"Too many requests","code":"RATE_LIMITED"}
+```
+
+`Retry-After` is delta-seconds (RFC 9110 §10.2.3), rounded up and never below 1,
+and is the time left in the current window.
+
+**No `Set-Cookie`, not even the CSRF one.** The limiter is the outermost
+middleware — `RateLimiter`, then CSRF, then the auth middleware, which is the
+order the reference uses and the core's adapters reproduce — so a refused request
+reaches nothing that verifies a token, reads a store, compares a CSRF value or
+distributes the auto-init cookie. A client whose very first request is refused
+therefore has no `csrf-token` cookie yet. That is correct rather than an
+oversight: a refused request is one the deployment did no work for.
+
+**No `RateLimit-Limit`, `RateLimit-Remaining` or `RateLimit-Reset`**, on the
+refusal or on a successful response. The obvious objection to those headers — that
+they tell an attacker the limit — is weak on its own, since anyone willing to
+spend requests finds the limit by reaching it. The decisive one is
+`RateLimit-Remaining` on a **successful** response under an account-keyed
+counter: it would be an oracle about somebody else's traffic, letting anyone who
+can name `victim@example.com` read from a `200` whether that person has been
+logging in. The headers would add a side channel the `429` does not have, in
+exchange for something `Retry-After` already gives.
+
+### 14.4 The window is fixed, and what that costs
+
+The counter is a fixed window: the window index is part of the item's key, so
+each window is a new item that starts at zero and there is nothing to reset.
+Windows are aligned to the Unix epoch, not to a subject's first request.
+
+**The boundary is a seam.** A subject can spend its whole budget in the last
+instant of one window and its whole budget again in the first instant of the
+next, so the true worst case over any sliding window of the same length is
+**twice `max`** — 20 per minute on the defaults, not 10. This is accepted, not
+overlooked. Closing it means a sliding window or a token bucket, which needs the
+request history or a timestamp plus a fractional balance, which means a
+read-modify-write on the login path forever; and a factor of two does not change
+what a 10-per-minute limit does to a credential stuffing run. Size `max` for the
+bound you want doubled.
+
+The other consequence of a fixed window is the ceiling on a false positive: a
+legitimate user who trips the limiter waits at most `windowSeconds`. That is why
+60 is the default — long enough to be a real bound, short enough that being wrong
+about someone costs them a minute.
+
+### 14.5 What it costs per request, and what happens when the store is down
+
+The limit lives in DynamoDB, in the same table as everything else
+(`docs/spec/data-model.md` §1.5 row #61). One limited request is **one
+conditional `UpdateItem`, so 1 WCU** — and that is true of a refused request too,
+because DynamoDB bills a conditional write whose condition fails. Unlimited
+routes cost nothing at all; the limiter does not look at them beyond a map
+lookup.
+
+Two things reduce that. A refused request does not increment the counter, so the
+stored number is bounded by `max` however long a flood lasts. And each execution
+environment keeps a small in-process pre-filter holding the same budget over the
+same window, so once an environment has watched a subject exhaust its budget it
+refuses locally and writes nothing — under a sustained flood only the first `max`
+requests per environment per window cost a write.
+
+**The in-process tier is a pre-filter, never the limit.** A Lambda execution
+environment serves one request at a time and AWS runs as many as the arrival rate
+demands, so an in-process counter alone would limit each environment separately
+and the real ceiling would be `max` times a concurrency nobody chose. The shared
+counter is the limit; the local tier only ever refuses what the shared counter
+would have refused, because both hold the same budget over the same
+epoch-aligned window.
+
+**When the shared counter is unreachable, the limiter allows the request.** It
+fails open, deliberately. The counter is in the same table as the user store, so
+on this product "the limiter cannot count" and "the route cannot serve" are the
+same event: every route in the default scope reads or writes that table
+immediately after the limiter. Failing closed would refuse requests that were
+going to fail anyway, turn a partial DynamoDB degradation into a total outage on
+exactly the routes people need during one, and replace a `500` naming the store
+with a `429` blaming the caller.
+
+The cost of that choice is stated rather than hidden: during such a window the
+only remaining bound is the in-process pre-filter, which is **per execution
+environment**, so the effective ceiling is `max` per subject per window
+multiplied by however many environments AWS is running. It is a floor, not the
+limit. The degradation is logged once per cold start at `WARN` — once, not per
+request, because a limiter that logged every failed write during a DynamoDB
+incident would add its own load to the incident.
+
+With `stores.driver: memory` there is no shared counter at all and the in-process
+tier is the whole limiter. The cold-start log says so in as many words. That
+driver is refused in production (RS-12), so this is a development posture and
+never a deployed one.
+
+### 14.6 Reading it from outside
+
+You cannot see a limiter without tripping it, which is why the cold-start log is
+where its resolved shape is written: `rate limiting is on` with `keyBy`, `max`,
+`windowSeconds` and the full list of watched `METHOD /path` patterns, or `rate
+limiting is off` with what that means. Two warnings are worth knowing: `rate
+limiting is on but its scope is empty`, which is a document that enabled the
+block and pointed it at nothing, and `rate limiting has no shared counter`, which
+is the memory driver above.
+
+The contract suite's `rate-limit` capability is **opt-in and off by default**,
+for the reason a probe cannot be written any other way: discovering a limiter
+costs the budget it protects, and a suite that exhausted a live one would flake
+and would leave the deployment throttled for whoever called next. See
+[test/contract/README.md](../test/contract/README.md).
+
+## 15. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that
