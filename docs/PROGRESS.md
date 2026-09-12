@@ -19,9 +19,9 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ### Phases (U half before D half)
 - [x] P2 email flows — U: v0.4.0 · D: wired, deployed, 44 contract cases green
-- [~] P3 2FA issuer and claims — U: v0.5.0 done · D: in flight
-- [~] P4 OAuth — U: v0.6.0 done · D: in flight
-- [~] P5 IdP, JWKS, KMS, resource server — U: v0.6.0 done (JWKS route, resource server, signer, code store) · D: in flight
+- [x] P3 2FA issuer and claims — U: v0.5.0 · D: wired
+- [x] P4 OAuth — U: v0.6.0 · D: wired
+- [x] P5 IdP, JWKS, KMS, resource server — U: v0.6.0 · D: wired, con firma KMS e store dei codici OIDC
 - [ ] P6 settings, UI, docs, admin — U: v0.8.0, v0.9.0 · D: `ui`, `admin`, `docs`, `runtimeSettings`
 - [ ] P7 tools, event plane, SSE, rate limiting — U: v0.10.0 · D: `tools`, `rateLimit`
 
@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Upstream: **v0.6.0** tagged 2026-09-12 (#61 settings store, #62 JWKS well-known route, #63 resource server, #64 OAuth provisioning); main clean, no open PRs. Product pinned to v0.6.0 and green. Workflow `product-p3-p4-p5` running: P3 twoFactor and claims, P4 OAuth, P5 IdP with a KMS signer and resource-server mode, each with an adversarial review and a fix pass. After them: deploy, contract suite with the grown REQUIRE list, then P6.
+Prodotto: P5 chiuso e mergiato (`a8a838e`), sei domini ancora gated (`ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`). Upstream: milestone v0.7.0 in CI, sette PR — #65 mappa dei tag (mergiata), #66 slot rate limiter, #67 password verifier, #68 register INVALID_INPUT piu la deviazione register-issues-a-session, #69 docs serviti, #70 ui/config, #71 endpoint OIDC sugli adapter. Dopo il tag: blocco D3 del prodotto (runtime settings, piu i due refactor abilitanti su harness_test.go e sulle slot di app.go).
 
 ## Blocks
 
