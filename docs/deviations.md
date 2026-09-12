@@ -72,6 +72,8 @@ The ids below are `auth.CompatibilityNotes().KnownDeviations`; the full text of 
 - `ui-config-verify-email-follows-the-effective-mode` — `GET /ui/config` reports `features.verifyEmail: true` only when a sender is wired *and* the effective verification mode is `lazy` or `strict`; the reference's `undefined !== 'none'` makes an unset mode report `true`.
 - `register-route-is-always-mounted` — every adapter mounts `POST /register` and `features.register` is `true` to match; the reference mounts it only when the host supplies `onRegister`.
 - `docs-routes-are-opt-in` — `GET /openapi.json` and `GET /docs` are off until `HTTPConfig.Docs.Enabled` is set; the reference serves both anywhere `NODE_ENV` is not exactly `production`. The served document also describes those two paths, which the reference's generator never does.
+- `event-handler-panic-does-not-fail-the-publisher` — a handler that panics on the event bus is logged, stepped over and the remaining handlers still run, so the route that published answers as though nothing had happened; the reference's EventEmitter lets the throw reach the publisher. No knob restores it: a bus whose delivery semantics depend on configuration is one no downstream consumer can reason about.
+- `ui-ssr-config-json-is-html-escaped` — the `__AUTH_CONFIG__` block the hosted UI injects is serialised with Go's default escaping, so `<`, `>` and `&` leave as `\u003c`, `\u003e` and `\u0026` and a `</script>` inside a branding string cannot end the block. The bytes differ from the reference's; the value `JSON.parse` yields does not. This is the one entry where the port is stricter than the reference.
 
 ## Recording a new deviation
 
