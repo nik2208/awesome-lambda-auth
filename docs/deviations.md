@@ -63,6 +63,10 @@ The ids below are `auth.CompatibilityNotes().KnownDeviations`; the full text of 
 - `jwks-cors-wildcard-string-form` — `JWKSCORSOrigins` of exactly `[]string{"*"}` is the wildcard, where the reference treats any array as an allowlist and only the bare string `'*'` as the wildcard. The empty slice spells the reference's `['*']`.
 - `resource-server-gates-all-credential-routes` — resource-server mode unmounts the whole credential surface; the reference unmounts two routes and leaves the rest mounted to fail at runtime (`reference-issues.md` N26).
 - `jwks-unknown-kid-refetch-is-rate-limited` — an unknown `kid` triggers at most one JWKS refetch per `MinRefreshInterval`, so a token flood cannot turn the verifier into a client of its own issuer; the reference refetches on every unknown `kid`.
+- `register-issues-a-session` — `POST /register` mints a token pair with the `201` and creates a refresh session, so the account is logged in as soon as it exists; the reference creates the account and issues nothing. Kept deliberately (2026-09-12): the family's clients treat the `201` as a sign-in, and the entry carries the second difference on that surface, that the route is mounted at all.
+- `ui-config-verify-email-follows-the-effective-mode` — `GET /ui/config` reports `features.verifyEmail: true` only when a sender is wired *and* the effective verification mode is `lazy` or `strict`; the reference's `undefined !== 'none'` makes an unset mode report `true`.
+- `register-route-is-always-mounted` — every adapter mounts `POST /register` and `features.register` is `true` to match; the reference mounts it only when the host supplies `onRegister`.
+- `docs-routes-are-opt-in` — `GET /openapi.json` and `GET /docs` are off until `HTTPConfig.Docs.Enabled` is set; the reference serves both anywhere `NODE_ENV` is not exactly `production`. The served document also describes those two paths, which the reference's generator never does.
 
 ## Recording a new deviation
 

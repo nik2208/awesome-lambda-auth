@@ -35,17 +35,21 @@ With `idProvider.enabled: true` (or any key material configured — the schema's
 | Route | What it is |
 |---|---|
 | `GET <prefix>/.well-known/jwks.json` | the signing keys, as a JWKS document. The path is `idProvider.jwksPath`. **Reproduced from the reference**, including `Cache-Control: public, max-age=3600` |
-| `GET <prefix>/jwks` | the core's deprecated alias of the same document, kept through the 0.x line |
 | `GET <prefix>/.well-known/openid-configuration` | the discovery document |
 | `GET/POST <prefix>/authorize` | the authorization endpoint: `GET` renders a minimal login form, `POST` authenticates and redirects with a code |
 | `POST <prefix>/token` | the token endpoint: `authorization_code` grant, `client_secret_post` authentication |
 | `GET <prefix>/userinfo` | `sub`, `email`, `name` for a bearer token |
 
-The JWKS document is mounted by the imported adapter, public and ahead of every
-middleware, exactly where the reference registers it. The other five are mounted
-by `cmd/auth` from the core's own `RegisterHandlers`, at the core's own paths —
-see `idpMountedEndpoints` in `cmd/auth/idp.go` for why the two halves are
-separate and why that is not a route this product invented.
+All five are mounted by the imported adapter, public and ahead of every
+middleware — the JWKS document exactly where the reference registers it, the
+other four at the core's own paths, which is where `(*auth.IDP).RegisterHandlers`
+puts them too. None of the five is a route this product invented, and this
+binary registers none of them itself.
+
+The one path that arrangement costs a deployment is `<prefix>/jwks`, the core's
+deprecated alias of the JWKS document: `RegisterHandlers` serves it, no adapter
+does, and so it is not served here. `idpMountedEndpoints` in `cmd/auth/idp.go`
+records why, and a test pins it.
 
 ## 2. The signing key
 

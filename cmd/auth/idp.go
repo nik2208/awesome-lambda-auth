@@ -388,44 +388,43 @@ func idpIssuer(cfg *config.Config) string {
 	return base + httpConfig(cfg).Prefix()
 }
 
-// idpMountedEndpoints are the OIDC endpoints this binary mounts from the core's
-// RegisterHandlers, and the canonical JWKS route is deliberately not among them.
+// idpMountedEndpoints is the OIDC surface a deployment with an identity
+// provider answers on. Nothing in this binary registers it: the adapter does,
+// for every Auth built WithIDP, and this list exists so a test can drive the
+// whole surface and catch an endpoint that stops being served.
 //
-// RegisterHandlers mounts six patterns: the discovery document, the JWKS
-// document at <prefix><jwksPath>, a deprecated <prefix>/jwks alias of it,
-// authorize, token and userinfo. The adapter ALSO mounts the canonical JWKS
-// route, for every Auth built WithIDP, public and ahead of any middleware
-// (nethttp.Mount) — and registering one pattern twice panics inside
-// http.ServeMux, at mount time, far from the configuration that caused it.
+// It used to be a mount list. Until awesome-go-auth v0.7.0 the adapter mounted
+// only the canonical JWKS route and left discovery, authorize, token and
+// userinfo to (*IDP).RegisterHandlers on a mux the host owned, so this binary
+// registered them itself. v0.7.0 moved all four onto the adapters, which is
+// what finally put them under the upstream conformance suite, and a host that
+// kept registering them saw the second registration refuse the cold start.
+// That refusal is the intended tripwire and it fired here; the answer is to
+// stop mounting, not to keep two owners of one pattern.
 //
-// So the core's handlers are registered on a mux of their own and reached
-// through the five exact paths below, which leaves the canonical JWKS route to
-// the adapter that already owns it. Nothing here invents a path: the sub-mux
-// matches the same absolute URL the outer one just matched, and every one of
-// these strings is a path RegisterHandlers registers.
+// The one path that change costs this deployment is <prefix>/jwks, the core's
+// deprecated alias of the JWKS document: RegisterHandlers serves it and the
+// adapters do not, so it stopped being served here and is gone from this list.
+// It is the alias the core itself removes in v1.0.0, the reference has no such
+// path, no client in the family requests it, and the canonical route answers
+// the identical document — while keeping it would mean keeping a mux of this
+// binary's own beside the adapter's, which is the arrangement that just broke.
+// Dropping it now also means this product does not have to drop it later, when
+// the core does. Not a deviation from the reference, so not in that register:
+// it is a path neither the reference nor the adapters ever served.
 //
-// "/jwks" is included even though it is the alias the core itself calls
-// deprecated. It costs one delegation, it is what every other host of this core
-// serves, and leaving it out would make the deployment's surface depend on which
-// binary mounted the IdP — which is exactly the kind of divergence the product
-// rules exist to prevent. It collides with nothing: an outer "/auth/jwks" and
-// the adapter's "GET /auth/jwks" are distinct ServeMux patterns, and the
-// method-bearing one wins for GET, so a jwksPath of "/jwks" degrades to the
-// adapter serving it directly.
-//
-// The one thing this list cannot do is grow by itself, so
 // TestIDPEndpointsAreMounted drives every endpoint the discovery document
 // advertises; an endpoint added upstream shows up there as a 404.
 var idpMountedEndpoints = []string{
 	"/.well-known/openid-configuration",
-	"/jwks",
 	"/authorize",
 	"/token",
 	"/userinfo",
 }
 
-// mountAuthSurface mounts the imported adapter and, in identity-provider mode,
-// the OIDC endpoints the adapter does not own.
+// mountAuthSurface mounts the imported adapter, which since awesome-go-auth
+// v0.7.0 is the whole HTTP surface of this deployment, OIDC included — see
+// idpMountedEndpoints.
 //
 // The recover is for one failure mode with one cause. http.ServeMux panics when
 // the same pattern is registered twice, and idProvider.jwksPath is the only knob
@@ -463,7 +462,6 @@ func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config) (
 			jwksPathOf(cfg), r)
 	}()
 	nethttp.MountWithConfig(mux, core, httpConfig(cfg))
-	mountIDPEndpoints(mux, core, cfg)
 	return nil
 }
 
@@ -491,21 +489,6 @@ func jwksPathOf(cfg *config.Config) string {
 		return path
 	}
 	return auth.DefaultJWKSPath
-}
-
-// mountIDPEndpoints attaches the OIDC endpoints to the binary's mux. It is a
-// no-op unless identity-provider mode built an IDP.
-func mountIDPEndpoints(mux *http.ServeMux, core *auth.Auth, cfg *config.Config) {
-	idp := core.IDP()
-	if idp == nil {
-		return
-	}
-	prefix := httpConfig(cfg).Prefix()
-	endpoints := http.NewServeMux()
-	idp.RegisterHandlers(endpoints, prefix+"/")
-	for _, path := range idpMountedEndpoints {
-		mux.Handle(prefix+path, endpoints)
-	}
 }
 
 // resourceServerConfig maps the resourceServer block onto the core's.

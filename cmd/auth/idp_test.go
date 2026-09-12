@@ -476,11 +476,13 @@ func TestIdpIssuerDerivation(t *testing.T) {
 // Mounting
 // ---------------------------------------------------------------------------
 
-// TestIDPEndpointsAreMounted drives all five OIDC endpoints, which is the only
-// check that covers the split between them: the JWKS document is mounted by the
-// imported adapter and the other four by this binary, and either half could
-// regress on its own. A 404 is the failure; anything else means the route
-// reached a handler.
+// TestIDPEndpointsAreMounted drives all five OIDC endpoints. Since
+// awesome-go-auth v0.7.0 the adapter mounts every one of them, so this is no
+// longer a check on a split between two mounts but on the one mount: it is what
+// tells a deployment of this binary that the surface the discovery document
+// advertises is the surface it serves, without trusting the adapter to have
+// kept mounting what it mounted at the tag before. A 404 is the failure;
+// anything else means the route reached a handler.
 func TestIDPEndpointsAreMounted(t *testing.T) {
 	t.Parallel()
 	f := newFakeKeyring(t, "current")
@@ -490,7 +492,6 @@ func TestIDPEndpointsAreMounted(t *testing.T) {
 		method, path string
 	}{
 		{http.MethodGet, "/auth/.well-known/jwks.json"},
-		{http.MethodGet, "/auth/jwks"}, // the core's deprecated alias, kept through 0.x
 		{http.MethodGet, "/auth/.well-known/openid-configuration"},
 		{http.MethodGet, "/auth/authorize"},
 		{http.MethodPost, "/auth/token"},
@@ -503,7 +504,30 @@ func TestIDPEndpointsAreMounted(t *testing.T) {
 	}
 }
 
-// TestIDPIsOffByDefault: none of the six routes exists in a deployment that did
+// TestTheDeprecatedJWKSAliasIsNotServed pins a path this deployment stopped
+// serving on purpose.
+//
+// <prefix>/jwks is the core's deprecated alias of the JWKS document. It is
+// served by (*auth.IDP).RegisterHandlers and by no adapter, so it was reachable
+// here only while this binary kept a mux of its own beside the adapter's — the
+// arrangement awesome-go-auth v0.7.0 turned into a cold-start refusal by moving
+// the four OIDC endpoints onto the adapters. The reasoning for letting the
+// alias go with it is on idpMountedEndpoints.
+//
+// Asserted rather than left to happen so that the day something reintroduces a
+// second mount — the alias or anything else — it is this test that says so,
+// and not a pattern collision at cold start in a deployment.
+func TestTheDeprecatedJWKSAliasIsNotServed(t *testing.T) {
+	t.Parallel()
+	f := newFakeKeyring(t, "current")
+	app := newIDPApp(t, f, idpEnv())
+
+	if resp := invoke(t, app, http.MethodGet, "/auth/jwks", jsonHeaders(), nil, ""); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /auth/jwks = %d, want 404: the alias is the core's, mounted by no adapter, and this binary mounts nothing of its own", resp.StatusCode)
+	}
+}
+
+// TestIDPIsOffByDefault: none of the five routes exists in a deployment that did
 // not ask for identity-provider mode, so the surface cannot appear by accident.
 func TestIDPIsOffByDefault(t *testing.T) {
 	t.Parallel()
@@ -511,7 +535,6 @@ func TestIDPIsOffByDefault(t *testing.T) {
 
 	for _, path := range []string{
 		"/auth/.well-known/jwks.json",
-		"/auth/jwks",
 		"/auth/.well-known/openid-configuration",
 		"/auth/authorize",
 		"/auth/token",

@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Prodotto: P5 chiuso e mergiato (`a8a838e`), sei domini ancora gated (`ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`). Upstream: milestone v0.7.0 in CI, sette PR — #65 mappa dei tag (mergiata), #66 slot rate limiter, #67 password verifier, #68 register INVALID_INPUT piu la deviazione register-issues-a-session, #69 docs serviti, #70 ui/config, #71 endpoint OIDC sugli adapter. Dopo il tag: blocco D3 del prodotto (runtime settings, piu i due refactor abilitanti su harness_test.go e sulle slot di app.go).
+Upstream: `v0.7.0` tagliato, sette PR mergiate (#65 mappa dei tag, #66 slot rate limiter, #67 password verifier, #68 register INVALID_INPUT piu la deviazione register-issues-a-session, #69 docs serviti, #70 ui/config, #71 endpoint OIDC sugli adapter). Prodotto: pinnato a `v0.7.0` e riallineato alla superficie nuova (blocco B2); sei domini ancora gated (`ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`). Prossimo: D3 (runtime settings, piu i due refactor abilitanti su harness_test.go e sulle slot di app.go), poi D4 docs e D5 rate limiting, che v0.7.0 ha appena reso possibili.
 
 ## Blocks
 
@@ -57,3 +57,14 @@ Decisions: D-17 (templates from the artifact), D-18 (the delivery webhook requir
 Upstream dance: core pinned to v0.4.0 (`2e4bca8`)
 Stack: no new resources; new parameters EmailSiteUrls, EmailDeliveryWebhookUrl, EmailDeliveryWebhookSecretArn, ConfigFile, all empty by default. $0/month added.
 Next: P3-D (twoFactor, extraClaims, claimsWebhook) once v0.5.0 is pinned; upstream #61–#64 merge and tag
+
+### B2 — core v0.7.0 pin, and the OIDC mount moves to the adapter (product · main · 2026-09-12)
+Status: green
+Landed: this commit
+Gate: fmt ✓ vet ✓ race ✓ ddb-local ✓ build – deploy – contract – (no stack change yet; D3 carries the next deploy)
+Deviations: four core ids indexed (`register-issues-a-session`, `ui-config-verify-email-follows-the-effective-mode`, `register-route-is-always-mounted`, `docs-routes-are-opt-in`); no product or store entry added
+Decisions: D-3's mounting bullet amended — the five OIDC routes are the adapter's, and the core's deprecated `<prefix>/jwks` alias is no longer served here
+Upstream dance: core pinned to `v0.7.0`
+Stack: unchanged. $0/month added.
+Notes: the tripwire fired exactly as designed. Upstream #71 moved discovery, authorize, token and userinfo onto every adapter, so `cmd/auth`'s own `mountIDPEndpoints` became a second registration of four patterns and six `cmd/auth` tests refused the cold start with the pattern-collision message. The fix is subtraction: this binary now mounts nothing of its own, `mountAuthSurface` is `nethttp.MountWithConfig` plus the collision guard that `idProvider.jwksPath` still needs. `TestTheDeprecatedJWKSAliasIsNotServed` pins the one path that cost.
+Next: D3 runtime settings
