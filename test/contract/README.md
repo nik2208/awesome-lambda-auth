@@ -32,7 +32,7 @@ AWESOME_AUTH_CONTRACT_BASE_URL=http://localhost:3000 \
 |---|---|
 | `AWESOME_AUTH_CONTRACT_BASE_URL` | Origin of the stack under test — scheme and host, no path, no trailing slash. **Unset means skip**: `go test ./...` in a plain checkout stays green and CI needs no deployment. Under `-v` the skip prints a `[contract] SKIPPED:` banner; unset *while* `…_REQUIRE` is set is a failure, not a skip (see below). |
 | `AWESOME_AUTH_CONTRACT_API_PREFIX` | Router mount point. Default `/auth`, the same default the reference uses. |
-| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
+| `AWESOME_AUTH_CONTRACT_REQUIRE` | Capabilities this deployment claims to offer: comma-separated (`register,csrf,secure-cookies,sessions,totp,linked-accounts,oauth-google,idp,docs`) or `all`. A listed capability the probe cannot find is a **failure**, not a skip. |
 
 All three are passed through `scripts/toolchain.sh` into the container.
 
@@ -102,6 +102,7 @@ start and reports what this stack offers:
 deployment under test: https://… (router mounted at /auth)
   AWESOME_AUTH_CONTRACT_REQUIRE=register,csrf,secure-cookies,sessions,totp
   csrf             on      auto-init cookie "__Host-csrf-token" observed
+  docs             on      …/auth/openapi.json answered 200
   linked-accounts  absent  …/auth/linked-accounts answered 501 NOT_IMPLEMENTED — the store is switched off
   oauth-google     absent  …/auth/oauth/google answered the reference's 404 stub — no Google provider is configured
   register         on      POST /auth/register answered 201
@@ -232,6 +233,37 @@ account, the reference's `?? 'local'`), and the case that used to record its
 absence now fails on its absence. `role` stays presence-optional, as it is in
 the reference.
 
+**The documentation surface is `docs`, and one option mounts both of its
+routes.** `GET <prefix>/openapi.json` is the generated OpenAPI document and
+`GET <prefix>/docs` is the Swagger UI page that reads it; the reference
+registers them at the very end of its auth router under a single `swagger`
+option (`auth.router.ts:1651-1677`, pinned at `tests/swagger.test.ts:228-260`),
+and this port mounts them from `docs.swagger` — `true`, `false`, or `auto`,
+which is on outside production and off in it. `auto` is the default here and
+`production` is the default environment, so an unconfigured stack answers 404 on
+both and the three cases skip.
+
+The probe is `GET <prefix>/openapi.json`, fetched **anonymously**. Neither route
+carries a guard of its own — no auth middleware, no session, nothing to present
+a credential to — so probing with a session would hide a deployment that had put
+them behind one. It is the document and not the page because the document is the
+machine-readable half, and because one option mounts both: a deployment serving
+one and 404ing the other is a fault, so the page's own case fails on it rather
+than skipping.
+
+| Case | Pins | Needs |
+|---|---|---|
+| `docs/openapi-document-is-served-anonymously` | `200 application/json`, `openapi: "3.0.3"`, a non-empty `paths`; every path item under the one base the `/login` item sits under (read off the document, because `docs.basePath` may legitimately move it behind a proxy); and the only cookie the response may set is the CSRF auto-init one | `docs` |
+| `docs/swagger-page-points-at-the-document-beside-it` | `200 text/html; charset=utf-8` carrying a Swagger UI shell, and the spec `url:` it hands `SwaggerUIBundle` is fetched from this same deployment and really serves an OpenAPI document — the half of the route that can be wrong while the status code is right | `docs` |
+| `docs/documentation-routes-carry-no-guard` | both routes answer `200` identically to a bare caller and to one presenting a bogus bearer token and a bogus `X-CSRF-Token`: they have no auth gate, and the CSRF middleware in front of them passes every non-mutating method through | `docs` |
+
+The product's own `Content-Security-Policy` on those two responses is
+deliberately **not** here. It is a registered deviation
+(`docs-page-carries-a-content-security-policy`, [deviations.md](../../docs/deviations.md)),
+the reference sets no such header, and the identical assertions have to run
+against both — so it is pinned in `cmd/auth/docs_test.go`, where the middleware
+that sends it lives.
+
 ## Adding a case
 
 Adding a route to the covered surface is adding a `Case`, never editing the
@@ -314,6 +346,10 @@ half of OAuth: the authorization redirect and its query, the unknown-provider
 The OIDC surface joins that list as far as it can be seen without a registered
 client: the JWKS document's shape and caching, the discovery document, and the
 two refusals that must not leak a token or a redirect.
+
+The documentation surface joins it too: the served OpenAPI document, the Swagger
+page and the url it points at, and the fact that neither route asks for a
+credential.
 
 Not covered: the OAuth round trip itself — the suite cannot consent at a real
 provider — so the exchange, the provisioning policy and the account-conflict
