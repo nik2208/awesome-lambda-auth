@@ -39,6 +39,15 @@ const (
 	RuleOAuthIncomplete    = "RS-11"
 	RuleMemoryStore        = "RS-12"
 
+	// RuleMigrationIncomplete is not in the §2 table: the spec was extracted
+	// from a reference that has no migration block, so there was nothing to
+	// number. It takes the next free identifier rather than a name of its own
+	// because it is the same kind of rule as the twelve above — a combination of
+	// individually valid values that would deploy and then be wrong — and an
+	// operator who searches for "RS-13" should land on it exactly as they land
+	// on RS-5.
+	RuleMigrationIncomplete = "RS-13"
+
 	// RuleSchemaVersion is not in the §2 table because §4 states it separately:
 	// a document whose major version this build does not know refuses to start
 	// with the same posture as any §2 rule.

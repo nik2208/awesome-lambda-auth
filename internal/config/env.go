@@ -283,6 +283,19 @@ func envBindings() []envBinding {
 		envString("AWESOME_AUTH_STORES_CONNECTION_ENDPOINT", "stores.connection.endpoint", func(c *Config, v string) { c.Stores.Connection.Endpoint = v }),
 		envString("AWESOME_AUTH_STORES_CONNECTION_USERNAME", "stores.connection.username", func(c *Config, v string) { c.Stores.Connection.Username = v }),
 
+		// stores.migration.*: the block has no section in the extracted schema —
+		// it has no counterpart in the reference at all — so the variable names
+		// are invented to the same AWESOME_AUTH_ + upper-snaked-path convention
+		// the §1.19 seeds use. Every knob of the block has one: a migration is
+		// operated by changing a stack parameter and redeploying, and a block
+		// that could only be configured from a baked-in document would mean
+		// rebuilding the artifact to turn dual-read off.
+		envString("AWESOME_AUTH_STORES_MIGRATION_SOURCE", "stores.migration.source", func(c *Config, v string) { c.Stores.Migration.Source = v }),
+		envString("AWESOME_AUTH_STORES_MIGRATION_USER_POOL_ID", "stores.migration.userPoolId", func(c *Config, v string) { c.Stores.Migration.UserPoolID = v }),
+		envString("AWESOME_AUTH_STORES_MIGRATION_CLIENT_ID", "stores.migration.clientId", func(c *Config, v string) { c.Stores.Migration.ClientID = v }),
+		envString("AWESOME_AUTH_STORES_MIGRATION_REGION", "stores.migration.region", func(c *Config, v string) { c.Stores.Migration.Region = v }),
+		envString("AWESOME_AUTH_STORES_MIGRATION_MODE", "stores.migration.mode", func(c *Config, v string) { c.Stores.Migration.Mode = v }),
+
 		// §1.18 HTTP surface and docs
 		envString("AWESOME_AUTH_HTTP_API_PREFIX", "http.apiPrefix", func(c *Config, v string) { c.HTTP.APIPrefix = v }),
 		envList("AWESOME_AUTH_CORS_ORIGINS", "http.cors.origins", func(c *Config, v []string) { c.HTTP.CORS.Origins = v }),

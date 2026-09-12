@@ -66,6 +66,8 @@ Metadata:
         Parameters: [EnableIdp, IdpIssuer, IdpKmsKeyId, IdpPreviousKmsKeyArns, IdpJwksPath]
       - Label: {default: Resource server}
         Parameters: [EnableResourceServer, ResourceServerJwksUrl, ResourceServerIssuer]
+      - Label: {default: Migration from Amazon Cognito}
+        Parameters: [CognitoUserPoolId, CognitoRegion, CognitoAppClientId, CognitoMigrationMode]
       - Label: {default: Configuration document}
         Parameters: [ConfigFile]
       - Label: {default: Storage}
@@ -596,6 +598,72 @@ Parameters:
       document would then be accepted.
 
   # -----------------------------------------------------------------------
+  # Migration off Amazon Cognito (stores.migration.*).
+  #
+  # Two halves that switch on separately, because a migration has two phases and
+  # a stack spends most of its life in the second:
+  #
+  #   * The records cross in bulk, through `migrate cognito`, which is an
+  #     operator command run from a workstation and NOT part of this stack. It
+  #     needs cognito-idp:ListUsers, which is granted below so the same role can
+  #     be assumed for it, and it writes rows carrying an empty passwordHash and
+  #     a migration marker.
+  #   * The passwords cross one at a time, on each person's next login, through
+  #     the password-verifier seam. That is what CognitoAppClientId turns on, and
+  #     it is the half to turn OFF once the migration has finished: with it
+  #     empty, this function never calls the pool on its login path.
+  #
+  # An empty CognitoUserPoolId adds NO policy statement and NO cost. Every
+  # statement below is inside a condition on it.
+  #
+  # The pool is addressed by a parameter and not discovered: it commonly lives in
+  # another account, and CognitoRegion is required with it because a pool
+  # addressed in the wrong region answers "no such user" for every person, which
+  # is indistinguishable from an empty pool. RS-13 refuses the combination at
+  # startup rather than leaving it to be discovered from a failed login.
+  # -----------------------------------------------------------------------
+
+  CognitoUserPoolId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9-]+_[A-Za-z0-9]+$'
+    Description: >-
+      AWESOME_AUTH_STORES_MIGRATION_USER_POOL_ID — the Cognito user pool being
+      migrated away from, e.g. <region>_XXXXXXXXX. Empty (the default) disables
+      the whole migration block: no IAM statement is added and nothing about the
+      running function changes.
+
+  CognitoRegion:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_STORES_MIGRATION_REGION — the region the pool lives in.
+      Required with CognitoUserPoolId (RS-13) and deliberately not inherited from
+      this stack's region: the commonest migration is out of a pool in another
+      region or another account.
+
+  CognitoAppClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      AWESOME_AUTH_STORES_MIGRATION_CLIENT_ID — an app client in that pool, with
+      ALLOW_ADMIN_USER_PASSWORD_AUTH among its explicit auth flows and NO client
+      secret. It turns just-in-time password migration on. Empty keeps the import
+      and the dual read without any login ever calling the pool; clear it once
+      the migration has finished.
+
+  CognitoMigrationMode:
+    Type: String
+    Default: import-only
+    AllowedValues: [import-only, dual-read]
+    Description: >-
+      AWESOME_AUTH_STORES_MIGRATION_MODE. "dual-read" additionally falls a user
+      lookup that misses through to the pool and creates the local row, which is
+      the safety net while the bulk import is incomplete — and one call to
+      Cognito per miss on unauthenticated routes. Turn it back to import-only
+      once the import has been verified. docs/cognito-migration.md §4.
+
+  # -----------------------------------------------------------------------
   # Configuration document. File-only knobs (templates directory, extra claims,
   # OAuth profile maps, OIDC clients, rate-limit scopes) have no environment
   # variable by design; they arrive as a JSON document baked into the artifact by
@@ -714,6 +782,13 @@ Conditions:
   # would leave two keys and no rule for which signs (RS-4 refuses that shape in
   # the configuration; this keeps the stack from producing it).
   CreateIdpSigningKey: !And [!Condition IdpEnabled, !Not [!Condition HasIdpKmsKeyId]]
+  # The pool id is the switch for the whole block, matching stores.migration's
+  # own shape: with no pool there is nothing to import from, nothing to fall
+  # through to and nothing to ask about a password.
+  MigratingFromCognito: !Not [!Equals [!Ref CognitoUserPoolId, '']]
+  HasCognitoAppClient: !And
+    - !Condition MigratingFromCognito
+    - !Not [!Equals [!Ref CognitoAppClientId, '']]
   ResourceServerEnabled: !Equals [!Ref EnableResourceServer, 'true']
   HasResourceServerIssuer: !Not [!Equals [!Ref ResourceServerIssuer, '']]
   # A named stage on the raw execute-api URL puts /<stage> in front of every
@@ -819,6 +894,32 @@ Rules:
           OAuthGoogleClientSecretArn is set but OAuthGoogleClientId is empty, so no
           Google provider is configured and the secret would be read by nothing.
           Set the client id, or clear the ARN.
+
+  # RS-13's region clause, moved forward to the changeset. Both halves are
+  # parameter-only: the IAM statement's Resource is built here by !Sub from the
+  # pool id and CognitoRegion, so a document that supplied the region would still
+  # leave this template unable to write the ARN. That is why neither of these
+  # steps aside for a ConfigFile, unlike the OAuth rules above.
+  CognitoMigrationNeedsARegion:
+    RuleCondition: !Not [!Equals [!Ref CognitoUserPoolId, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CognitoRegion, '']]
+        AssertDescription: >-
+          CognitoUserPoolId is set, so CognitoRegion must name the region the pool
+          lives in (refuse-to-start rule RS-13). It is not inherited from this
+          stack's region on purpose: the commonest migration is out of a pool in
+          another region or another account, and a pool addressed in the wrong
+          region answers "no such user" for every person -- indistinguishable from
+          an empty pool. The IAM statement's Resource ARN is built from it too.
+
+  CognitoAppClientNeedsItsPool:
+    RuleCondition: !Not [!Equals [!Ref CognitoAppClientId, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CognitoUserPoolId, '']]
+        AssertDescription: >-
+          CognitoAppClientId is set but CognitoUserPoolId is empty, so the whole
+          migration block is off and the app client would be read by nothing. Set
+          the pool id, or clear the app client id.
 
   GithubOAuthNeedsItsClientSecret:
     RuleCondition: !And
@@ -1307,6 +1408,19 @@ Resources:
           AWESOME_AUTH_RS_JWKS_URL: !If [ResourceServerEnabled, !Ref ResourceServerJwksUrl, !Ref 'AWS::NoValue']
           AWESOME_AUTH_RS_ISSUER: !If [HasResourceServerIssuer, !Ref ResourceServerIssuer, !Ref 'AWS::NoValue']
 
+          # --- migration from Amazon Cognito -----------------------------
+          # The source is derived from the pool id rather than being a parameter
+          # of its own: "cognito" is the only value this build knows, and an
+          # operator who had to set two knobs to mean one thing would eventually
+          # set one of them. Every variable here is absent while the pool id is
+          # empty, so an unconfigured stack loads the same configuration it
+          # loaded before this block existed.
+          AWESOME_AUTH_STORES_MIGRATION_SOURCE: !If [MigratingFromCognito, 'cognito', !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_MIGRATION_USER_POOL_ID: !If [MigratingFromCognito, !Ref CognitoUserPoolId, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_MIGRATION_REGION: !If [MigratingFromCognito, !Ref CognitoRegion, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_MIGRATION_CLIENT_ID: !If [HasCognitoAppClient, !Ref CognitoAppClientId, !Ref 'AWS::NoValue']
+          AWESOME_AUTH_STORES_MIGRATION_MODE: !If [MigratingFromCognito, !Ref CognitoMigrationMode, !Ref 'AWS::NoValue']
+
           # --- configuration document ------------------------------------
           # A path inside the artifact, never a value: the document is part of
           # the reproducible zip, so what the function reads is what was built.
@@ -1616,6 +1730,56 @@ Resources:
                 Action:
                   - kms:GetPublicKey
                 Resource: !Ref IdpPreviousKmsKeyArns
+          - !Ref 'AWS::NoValue'
+
+        # -----------------------------------------------------------------
+        # The migration source: three actions on ONE user pool, and nothing
+        # else anywhere in Cognito.
+        #
+        # The Resource is built from the pool id rather than taken as an ARN
+        # parameter, so the statement cannot be widened by pasting a wildcard
+        # into it — and the account and region come from the parameters, because
+        # the pool being migrated away from is commonly in neither this stack's
+        # account nor its region.
+        #
+        # What is NOT granted, and why each absence is deliberate:
+        #
+        #   * No AdminCreateUser, AdminSetUserPassword, AdminUpdateUserAttributes,
+        #     AdminDeleteUser. The migration is one-way and read-only at the
+        #     source. An auth router that can rewrite the directory it is leaving
+        #     can undo the migration it just performed, and a role that could
+        #     delete users in the old system is a role nobody will grant.
+        #   * No AdminRespondToAuthChallenge. AdminInitiateAuth can come back with
+        #     a challenge — SMS_MFA, NEW_PASSWORD_REQUIRED — and this product
+        #     deliberately treats one as "not the password" rather than answering
+        #     it (internal/integration/aws/cognito.go, VerifyPassword). Without
+        #     the permission, that decision cannot be quietly reversed by a code
+        #     change alone.
+        #   * No cognito-idp:* on the pool's app clients, resource servers or
+        #     identity providers. Nothing here administers the pool.
+        #   * No cognito-identity:* at all. Identity pools are a different service
+        #     and this product does not use them.
+        #
+        # ListUsers is granted to the FUNCTION even though only `migrate cognito`
+        # calls it. That is a deliberate, small widening, and the alternative is
+        # worse: a second role, or a human's own credentials, holding admin read
+        # over a directory of users. One role, three actions, one pool, and the
+        # operator command assumes it.
+        #
+        # The whole statement is absent while CognitoUserPoolId is empty, which
+        # is the default. An empty parameter adds no policy and no cost.
+        # -----------------------------------------------------------------
+        - !If
+          - MigratingFromCognito
+          - Version: '2012-10-17'
+            Statement:
+              - Sid: ReadTheMigrationSourceUserPool
+                Effect: Allow
+                Action:
+                  - cognito-idp:ListUsers
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminInitiateAuth
+                Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${CognitoRegion}:${AWS::AccountId}:userpool/${CognitoUserPoolId}'
           - !Ref 'AWS::NoValue'
 
       Events:

@@ -633,6 +633,93 @@ type Stores struct {
 	Driver     string          `json:"driver"`
 	Connection StoreConnection `json:"connection"`
 	Enable     StoreEnable     `json:"enable"`
+	Migration  Migration       `json:"migration"`
+}
+
+// Migration covers stores.migration.*: where this deployment's users are coming
+// from, while they are still coming.
+//
+// It has no counterpart anywhere in the reference and no section in the
+// extracted schema, because the reference is a library an integrator mounts in
+// front of a store they already populated. A deployable product is the other
+// shape: somebody already has users, in somebody else's system, and the only
+// interesting question about the first month of a deployment is how they get
+// across without being asked to choose a new password. Nothing here is parity
+// and nothing here is a wire deviation — with the whole block unset, which is
+// the default, every route answers exactly what it answered before the block
+// existed.
+//
+// The block is deliberately a sub-block of `stores` rather than a domain of its
+// own. What it configures is where a user record comes from when the store does
+// not have one, and what a stored record's migration marker means; both are
+// statements about the store, and putting them anywhere else would have made
+// `stores.driver` and the marker's home into two unrelated knobs that have to
+// agree.
+type Migration struct {
+	// Source names the system being migrated away from. Empty — the default —
+	// is the whole off switch: no verifier is wired, no fall-through happens,
+	// and the binary is byte-for-byte the one that shipped before X1.
+	//
+	// "cognito" is the only value this build knows. It is an enum rather than a
+	// boolean because the second source (Auth0, Firebase) is a different set of
+	// three API calls and a different marker payload, and a boolean would have
+	// to be replaced rather than extended.
+	Source string `json:"source"`
+
+	// UserPoolID is the Cognito user pool. Required with a source, refused
+	// without one (RS-13). It is not a secret and is not secret-tagged: a pool
+	// id is in every Cognito-hosted login URL, and treating it as a secret would
+	// only mean an operator could not read it back out of the diagnostics that
+	// name it.
+	UserPoolID string `json:"userPoolId"`
+
+	// ClientID is an app client in that pool, and it is what makes just-in-time
+	// password migration possible at all: AdminInitiateAuth is a client-scoped
+	// call. The app client must allow ADMIN_USER_PASSWORD_AUTH and must have no
+	// client secret (internal/integration/aws/cognito.go,
+	// ErrCognitoClientHasSecret).
+	//
+	// Optional, and the distinction is the useful one: with a pool id and no
+	// client id the deployment reads the pool but signs nobody in through it,
+	// which is exactly a stack that has finished its bulk import and wants the
+	// dual-read safety net without the login-path dependency.
+	ClientID string `json:"clientId"`
+
+	// Region is where the pool lives. Required with a pool id (RS-13) rather
+	// than inherited from stores.connection.region, because the commonest
+	// migration is out of a pool in another region or another account entirely,
+	// and silently addressing the wrong region would surface as "the pool holds
+	// no such user" for every single person.
+	Region string `json:"region"`
+
+	// Mode is import-only (the default) or dual-read.
+	//
+	// import-only means the local store is the only place a user is looked for:
+	// a miss is a miss. Every user reaches this deployment through cmd/migrate,
+	// and the only thing the source is still consulted for is a password.
+	//
+	// dual-read additionally falls a GetUserByEmail miss through to the source
+	// and lazily creates the local row. It is the safety net for the window in
+	// which the bulk import is incomplete, and it is not free: see
+	// internal/store/migrating for what a miss costs on an unauthenticated route
+	// and what bounds it.
+	Mode string `json:"mode"`
+}
+
+// Active reports whether the migration block is switched on. The source is the
+// switch, so that every other knob can be present and inert on a deployment
+// that has finished migrating and has not yet deleted its configuration.
+func (m Migration) Active() bool { return strings.TrimSpace(m.Source) != "" }
+
+// DualRead reports whether a lookup miss falls through to the source. False for
+// an inactive block, so the mode cannot act on its own.
+func (m Migration) DualRead() bool { return m.Active() && m.Mode == MigrationModeDualRead }
+
+// VerifierConfigured reports whether the deployment can ask the source about a
+// password. Without an app client id the block still imports and still
+// dual-reads; it just never reaches the login path.
+func (m Migration) VerifierConfigured() bool {
+	return m.Active() && strings.TrimSpace(m.ClientID) != ""
 }
 
 // StoreConnection covers stores.connection.*; which fields matter depends on
@@ -846,6 +933,13 @@ func Defaults() *Config {
 				Sessions: true,
 				Tokens:   true,
 			},
+			// The mode has a default and the source does not, which is the whole
+			// shape of the block: with no source nothing here runs, and an
+			// operator who switches a source on without saying which mode they
+			// want gets the one that reads nobody else's directory on the login
+			// path. Defaulting to dual-read would mean a typo'd address in a
+			// login request became a call to Cognito.
+			Migration: Migration{Mode: MigrationModeImportOnly},
 		},
 		HTTP: HTTP{APIPrefix: "/auth"},
 		Docs: Docs{Swagger: SwaggerAuto},
@@ -900,6 +994,14 @@ const (
 	StoreDriverDynamoDB = "dynamodb"
 	StoreDriverPostgres = "postgres"
 	StoreDriverMemory   = "memory"
+
+	// The stores.migration.source vocabulary. One entry, and an enum rather than
+	// a boolean so the second source can be added rather than swapped in.
+	MigrationSourceCognito = "cognito"
+
+	// The stores.migration.mode vocabulary. See Migration.Mode.
+	MigrationModeImportOnly = "import-only"
+	MigrationModeDualRead   = "dual-read"
 
 	SwaggerTrue  = "true"
 	SwaggerFalse = "false"

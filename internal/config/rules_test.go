@@ -261,6 +261,71 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantPath:    "stores.driver",
 			wantMessage: "own disconnected copy",
 		},
+		// RS-13, one case per clause. Each one is a combination of individually
+		// valid values that would deploy and then be wrong.
+		{
+			name: "RS-13 a migration knob with no source",
+			mutate: func(doc Document) {
+				set(doc, "stores.migration.userPoolId", "eu-west-1_EXAMPLE00")
+			},
+			wantRule:    RuleMigrationIncomplete,
+			wantPath:    "stores.migration.source",
+			wantMessage: "names no source",
+		},
+		{
+			name: "RS-13 dual-read with no source",
+			mutate: func(doc Document) {
+				set(doc, "stores.migration.mode", MigrationModeDualRead)
+			},
+			wantRule:    RuleMigrationIncomplete,
+			wantPath:    "stores.migration.source",
+			wantMessage: "stores.migration.mode",
+		},
+		{
+			name: "RS-13 a source with no user pool",
+			mutate: func(doc Document) {
+				set(doc, "stores.migration.source", MigrationSourceCognito)
+			},
+			wantRule:    RuleMigrationIncomplete,
+			wantPath:    "stores.migration.userPoolId",
+			wantMessage: "no directory to migrate from",
+		},
+		{
+			name: "RS-13 a user pool with no region",
+			mutate: func(doc Document) {
+				set(doc, "stores.migration.source", MigrationSourceCognito)
+				set(doc, "stores.migration.userPoolId", "eu-west-1_EXAMPLE00")
+			},
+			wantRule:    RuleMigrationIncomplete,
+			wantPath:    "stores.migration.region",
+			wantMessage: "addressed at this stack's own region",
+		},
+		{
+			name: "RS-13 dual-read on a driver that cannot hold the marker",
+			mutate: func(doc Document) {
+				set(doc, "stores.migration.source", MigrationSourceCognito)
+				set(doc, "stores.migration.userPoolId", "eu-west-1_EXAMPLE00")
+				set(doc, "stores.migration.region", "eu-west-1")
+				set(doc, "stores.migration.mode", MigrationModeDualRead)
+			},
+			capabilities: func(string) StoreCapabilities { return StoreCapabilities{ListUsers: true} },
+			wantRule:     RuleMigrationIncomplete,
+			wantPath:     "stores.migration.mode",
+			wantMessage:  "re-provision the same person from the source",
+		},
+		{
+			name: "RS-13 a verifier on a driver that cannot adopt the password",
+			mutate: func(doc Document) {
+				set(doc, "stores.migration.source", MigrationSourceCognito)
+				set(doc, "stores.migration.userPoolId", "eu-west-1_EXAMPLE00")
+				set(doc, "stores.migration.region", "eu-west-1")
+				set(doc, "stores.migration.clientId", "exampleappclientid00000000")
+			},
+			capabilities: func(string) StoreCapabilities { return StoreCapabilities{ListUsers: true} },
+			wantRule:     RuleMigrationIncomplete,
+			wantPath:     "stores.migration.clientId",
+			wantMessage:  "cannot hold the marker",
+		},
 		{
 			name: "schemaVersion of an unknown major",
 			mutate: func(doc Document) {

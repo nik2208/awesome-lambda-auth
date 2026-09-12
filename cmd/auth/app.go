@@ -86,6 +86,19 @@ type Options struct {
 	// than SESAPI and SNSAPI, and why this one is IDPKeySource.
 	IDPKeySource IDPKeySourceFactory
 
+	// Cognito injects the directory the migration block reads, for the same
+	// reason Mail, SMS and IDPKeySource are injectable: a composition that talks
+	// to somebody else's user pool has to be provable without an account in it.
+	// Nil builds the real one, lazily. Injecting it switches nothing on — whether
+	// a migration is wired at all is a question about stores.migration.source
+	// (migration.go).
+	//
+	// It is awsintegration.CognitoDirectory and not CognitoAPI for the reason
+	// IDPKeySource is not KMSAPI: the SDK belongs under internal/integration/aws
+	// and internal/store/dynamodb, and a seam spelled in SDK types would export
+	// that dependency to this package's tests.
+	Cognito awsintegration.CognitoDirectory
+
 	// HTTPClient issues every outbound HTTP request this binary makes on a
 	// route's behalf: the delivery webhook, the claims webhook, and the JWKS
 	// fetch of resource-server mode. Nil, the zero value, is http.DefaultClient.
@@ -214,6 +227,19 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
+	// Migration off another identity provider (migration.go). It sits here
+	// rather than only in coreOptionSets because it does something no option set
+	// does: it WRAPS the user store, which has to happen before coreOptions hands
+	// that store to auth.WithUserStore and before every later set is handed the
+	// same value. The option half — the password verifier — is an ordinary entry
+	// in coreOptionSets, which derives it from the wrapper this line installed.
+	// With stores.migration unset it constructs nothing and returns the store it
+	// was given.
+	users, err = migrationWiring(cfg, users, opts.Cognito, log)
+	if err != nil {
+		return nil, err
+	}
+
 	// Credential delivery. Built before the core because every sender option is
 	// derived from it, and it performs no I/O: both AWS clients are deferred to
 	// the first message actually sent (delivery.go).
@@ -275,6 +301,16 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// wrap is gated on the driver to avoid a pointless allocation per request.
 	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
 		handler = rotationScopeMiddleware(handler)
+	}
+	// The migration marker travels from the store's profile read to the password
+	// verifier through a second per-request carrier, of exactly the same shape and
+	// for a closely related reason: a ctx cannot be mutated by the callee, so the
+	// HTTP layer installs an empty scope and the two ends fill and consume it.
+	// What is different is the motive — here it is so that the marker never has to
+	// live on auth.User, which auth.NewPublicUser serialises. See
+	// migrationScopeMiddleware.
+	if cfg.Stores.Migration.Active() {
+		handler = migrationScopeMiddleware(handler)
 	}
 	handler = corsMiddleware(cfg.HTTP.CORS.Origins)(handler)
 	handler = accessLog(log, handler)
@@ -499,6 +535,24 @@ func coreOptionSets(
 			// refuses for one with no template store.
 			name:  "idp",
 			build: func() ([]auth.Option, error) { return idpOptions(ctx, cfg, users, opts.IDPKeySource, log) },
+		},
+		{
+			// Migration off another identity provider: the password-verifier seam.
+			//
+			// Last of the wired sets, and deliberately not earlier. It is the only
+			// one whose subject is the store every other set was handed rather than
+			// a route's behaviour, and it cannot refuse for anything a document
+			// says, because RS-13 has already refused every unusable combination —
+			// so it has no business competing for refusal precedence with the sets
+			// that can, and appending it here moves none of theirs. The reserved
+			// tail below keeps its declared order; only its starting index shifts,
+			// which is invisible to a block that finds its slot by name.
+			//
+			// It takes no argument of its own: `users` is already the wrapper New
+			// installed before the delivery transports, and the verifier is a
+			// method on it.
+			name:  "migration",
+			build: func() ([]auth.Option, error) { return migrationOptions(cfg, users) },
 		},
 
 		// ── The reserved slots ───────────────────────────────────────────────
