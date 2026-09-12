@@ -27,9 +27,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 			set(doc, "rateLimit.enabled", true)
 			set(doc, "rateLimit.scope", []any{"login"})
 		}},
-		{"docs", func(doc Document) {
-			set(doc, "docs.swagger", "false")
-		}},
 	}
 
 	for _, tc := range cases {
@@ -134,6 +131,59 @@ func TestRuntimeSettingsIsWired(t *testing.T) {
 		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
 		requireRule(t, err, RuleStoreRequired, "stores.enable.settings")
 	})
+}
+
+// TestDocsIsWired is the other side of the refusal table for the domain this
+// block opened: a document that configures the documentation surface loads
+// instead of tripping the phase gate.
+//
+// Both spellings of the switch are here, and `false` matters as much as `true`.
+// It is the value an operator writes to turn the surface off — the one thing the
+// gate made impossible to say, since saying it was itself a configured domain —
+// and it is the value the old refusal case in the table above used.
+//
+// Neither knob needs a store, which is what makes this block unlike
+// runtimeSettings: the whole surface is two routes the imported adapter mounts,
+// so there is nothing to persist and nothing to refuse for a driver that lacks
+// it. What cmd/auth then does with the block is its own tests' business.
+func TestDocsIsWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+	}{
+		{"the surface switched off", func(doc Document) {
+			set(doc, "docs.swagger", "false")
+		}},
+		{"the surface switched on", func(doc Document) {
+			set(doc, "docs.swagger", "true")
+		}},
+		{"auto stated explicitly", func(doc Document) {
+			set(doc, "docs.swagger", "auto")
+		}},
+		{"a base path of its own", func(doc Document) {
+			set(doc, "docs.basePath", "/public/api/auth")
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			tc.mutate(doc)
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+			if err != nil {
+				t.Fatalf("docs is wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if w.Path == "docs" && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("docs is still reported as an unwired domain: %s", w.Problem)
+				}
+			}
+			if _, gated := UnwiredDomains()["docs"]; gated {
+				t.Error("docs is still listed by UnwiredDomains")
+			}
+		})
+	}
 }
 
 // TestAllowUnimplementedDowngradesToWarning: the gap stays visible in the

@@ -133,11 +133,17 @@ now a deployment that behaves differently rather than one that refuses: the firs
 mounts the OIDC surface and publishes a JWKS document, the second unmounts the
 credential surface and verifies another issuer's tokens.
 
-`runtimeSettings` is the latest to leave the list (§11). Configuring it now seeds
-the runtime-mutable layer instead of refusing the deployment, and
+`runtimeSettings` left the list before it (§11). Configuring it now seeds the
+runtime-mutable layer instead of refusing the deployment, and
 `runtimeSettings.require2fa` reaches a route: `POST <prefix>/2fa/disable` answers
-`403` `2FA_REQUIRED` on it. The five left on the list are `ui`, `admin`, `docs`,
-`tools` and `rateLimit`.
+`403` `2FA_REQUIRED` on it.
+
+`docs` is the latest to go (§12). `docs.swagger` now decides whether the
+imported adapter mounts `GET <prefix>/openapi.json` and `GET <prefix>/docs`, and
+`auto` — the default — is resolved against `deployment.environment`, so an
+unconfigured deployment answers 404 on both. `docs.basePath` reaches the core
+unchanged and moves what the document describes, never where it is served. The
+four left on the list are `ui`, `admin`, `tools` and `rateLimit`.
 
 `email.templatesDir` needs a template store and `runtimeSettings` needs a
 settings store, and both drivers now back both: the DynamoDB store keeps mail
