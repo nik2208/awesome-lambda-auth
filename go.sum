@@ -46,6 +46,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/nik2208/awesome-go-auth v0.7.0 h1:npiPE8cFzVACQ4v1OnaYpLlUz1c5LuIOU5O6kb421Q4=
 github.com/nik2208/awesome-go-auth v0.7.0/go.mod h1:33cV8r5NLMTr2BT+dhGF87tpUBvaQ5BMvdHJGQ+PJ8c=
+github.com/nik2208/awesome-go-auth v0.8.0 h1:ckGYyBDdht1nEpj/RLplgKkb23GNvnISu2odZwM2puE=
+github.com/nik2208/awesome-go-auth v0.8.0/go.mod h1:33cV8r5NLMTr2BT+dhGF87tpUBvaQ5BMvdHJGQ+PJ8c=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.7.2 h1:4jaiDzPyXQvSd7D0EjG45355tLlV3VOECpq10pLC+8s=
