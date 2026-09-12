@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -907,6 +908,7 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 		if len(posted) == 0 {
 			t.Fatal("no delivery was captured, so this test proves nothing")
 		}
+		signatures := 0
 		for _, delivery := range posted {
 			if strings.Contains(out, string(delivery.body)) {
 				t.Errorf("a posted delivery body appears in the log:\n%s", out)
@@ -917,6 +919,22 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 					t.Errorf("the %s credential appears in the log:\n%s", delivery.request.Kind, out)
 				}
 			}
+			// The signature is a credential that does not look like one, and
+			// it is on the redaction list for that reason. It is not the thing
+			// being delivered — it is the proof of authorship over the exact
+			// bytes that were (awesome-go-auth webhook_sender.go:376) — so
+			// anyone holding a logged signature and the body it signed can
+			// replay that delivery against the receiver for as long as the
+			// secret lives.
+			if sig := delivery.headers.Get("X-Webhook-Signature"); sig != "" {
+				signatures++
+				if strings.Contains(out, sig) {
+					t.Errorf("the %s delivery's X-Webhook-Signature appears in the log:\n%s", delivery.request.Kind, out)
+				}
+			}
+		}
+		if signatures == 0 {
+			t.Fatal("no delivery was signed, so the signature half of this test proves nothing")
 		}
 		// The signing secret is the credential this branch adds. It arrives
 		// through a plain environment variable here, is never sent to the
@@ -994,7 +1012,131 @@ func TestNoCredentialReachesTheLog(t *testing.T) {
 		}
 		assertReceiverPathNotLogged(t, out, rec.srv.URL)
 	})
+
+	// The OIDC authorization code is the fourth transport, and the one whose
+	// credential is easiest to argue away. It is single-use — but "single" means
+	// "until the first use", and the window between the 302 that mints it and
+	// the POST /token that spends it is exactly the window in which a log reader
+	// holds a live credential. Spending it yields an id_token, an access token
+	// and a refresh token for the account it names.
+	//
+	// The failing half is the one that matters again: a code that is rejected is
+	// where the IdP has the most to say, and the client secret presented with it
+	// is in the same form body.
+	t.Run("oidc authorization code", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		f := newFakeKeyring(t, "current")
+		app := newIDPAppLogging(t, f, &buf, idpEnv(
+			ConfigJSONEnv, clientDocument("console", "https://console.example.test/callback"),
+			"AWESOME_AUTH_IDP_CLIENT_CONSOLE_SECRET", testIDPClientSecret,
+		))
+
+		const (
+			owner    = "quiet-oidc@example.test"
+			redirect = "https://console.example.test/callback"
+		)
+		if reg := invoke(t, app, http.MethodPost, "/auth/register", jsonHeaders(), nil, registerBody(owner)); reg.StatusCode != http.StatusCreated {
+			t.Fatalf("register = %d (%s)", reg.StatusCode, reg.Body)
+		}
+
+		form := url.Values{"email": {owner}, "password": {testPassword}}
+		authorize := invoke(t, app, http.MethodPost,
+			"/auth/authorize?client_id=console&redirect_uri="+url.QueryEscape(redirect)+"&state=xyz&nonce=n-1",
+			map[string]string{"content-type": "application/x-www-form-urlencoded"}, nil, form.Encode())
+		if authorize.StatusCode != http.StatusFound {
+			t.Fatalf("authorize = %d, want 302 (body %s)", authorize.StatusCode, authorize.Body)
+		}
+		location, err := url.Parse(authorize.Headers["Location"])
+		if err != nil {
+			t.Fatalf("Location is not a URL: %v", err)
+		}
+		code := location.Query().Get("code")
+		if code == "" {
+			t.Fatalf("no code in %q, so this test proves nothing", location)
+		}
+
+		exchange := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {code},
+			"client_id":     {"console"},
+			"client_secret": {testIDPClientSecret},
+		}
+		if tok := invoke(t, app, http.MethodPost, "/auth/token",
+			map[string]string{"content-type": "application/x-www-form-urlencoded"}, nil, exchange.Encode()); tok.StatusCode != http.StatusOK {
+			t.Fatalf("token = %d, want 200 (body %s)", tok.StatusCode, tok.Body)
+		}
+		// The replay: spent code, same secret, and the branch that has an error
+		// to report.
+		invoke(t, app, http.MethodPost, "/auth/token",
+			map[string]string{"content-type": "application/x-www-form-urlencoded"}, nil, exchange.Encode())
+
+		out := buf.String()
+		if out == "" {
+			t.Fatal("nothing was logged at all, so this test proves nothing")
+		}
+		for name, secret := range map[string]string{
+			"authorization code": code,
+			"client secret":      testIDPClientSecret,
+		} {
+			if strings.Contains(out, secret) {
+				t.Errorf("the %s appears in the log:\n%s", name, out)
+			}
+		}
+	})
+
+	// The 2FA step-up token is the fifth, and it is a session in everything but
+	// name: wire-contract.md §3 and serverless-gap-analysis.md §1.2 record the
+	// inherited caveat that a tempToken is a *full* access token — same secret,
+	// same verifier — so for its five minutes it passes authMiddleware. A
+	// tempToken in a log is therefore not a hint about a login, it is the login.
+	t.Run("two-factor step-up token", func(t *testing.T) {
+		t.Parallel()
+		users := newMemoryStoreBundle()
+		d := newDeliveryAppWith(t, baseEnv(), func(o *Options) {
+			o.Stores = storeFactory(users, auth.NewMemorySessionStore())
+		})
+
+		const owner = "quiet-2fa@example.test"
+		userID := registerAccount(t, d.app, owner)
+		// Enrolment through the store rather than through /2fa/setup: this test
+		// is about what a step-up logs, not about TOTP, and a real code would
+		// have to be computed from a clock.
+		if err := users.UpdateTOTPSecret(context.Background(), userID, "", "JBSWY3DPEHPK3PXP", true); err != nil {
+			t.Fatalf("enable TOTP on the account: %v", err)
+		}
+
+		login := invoke(t, d.app, http.MethodPost, "/auth/login", jsonHeaders(), nil, registerBody(owner))
+		if login.StatusCode != http.StatusOK {
+			t.Fatalf("login = %d, want 200 with the challenge (body %s)", login.StatusCode, login.Body)
+		}
+		body := decodeBody(t, login)
+		if body["requiresTwoFactor"] != true {
+			t.Fatalf("the account is not second-factor gated, so this test proves nothing: %s", login.Body)
+		}
+		tempToken, _ := body["tempToken"].(string)
+		if tempToken == "" {
+			t.Fatalf("the challenge carries no tempToken, so this test proves nothing: %s", login.Body)
+		}
+
+		// And the failing half: a wrong code against a real tempToken is the
+		// branch with something to say.
+		invoke(t, d.app, http.MethodPost, "/auth/2fa/verify", jsonHeaders(), nil,
+			fmt.Sprintf(`{"tempToken":%q,"totpCode":"000000"}`, tempToken))
+
+		out := d.log.String()
+		if out == "" {
+			t.Fatal("nothing was logged at all, so this test proves nothing")
+		}
+		if strings.Contains(out, tempToken) {
+			t.Errorf("the 2FA step-up token appears in the log:\n%s", out)
+		}
+	})
 }
+
+// testIDPClientSecret is the OIDC client's password, spelled distinctively so a
+// leak of it cannot be confused with any other value in a log line.
+const testIDPClientSecret = "console-client-secret-Bd3Qk1vN"
 
 // capabilityPath is the path both test receivers are addressed at, and it
 // stands for the thing an operator actually puts there: a receiver behind a
