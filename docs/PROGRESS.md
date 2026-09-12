@@ -33,7 +33,7 @@ The single ledger for the 2026-09 build-out of `awesome-go-auth` (upstream, U) a
 
 ## In flight
 
-Upstream: `v0.7.0` tagliato, sette PR mergiate (#65 mappa dei tag, #66 slot rate limiter, #67 password verifier, #68 register INVALID_INPUT piu la deviazione register-issues-a-session, #69 docs serviti, #70 ui/config, #71 endpoint OIDC sugli adapter). Prodotto: pinnato a `v0.7.0` e riallineato alla superficie nuova (blocco B2); sei domini ancora gated (`ui`, `admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`). Prossimo: D3 (runtime settings, piu i due refactor abilitanti su harness_test.go e sulle slot di app.go), poi D4 docs e D5 rate limiting, che v0.7.0 ha appena reso possibili.
+Upstream: `v0.8.0` tagliato — tre PR di seam di store, nessuna rotta (#72 WebhookStore, #73 admin/session/role lister piu `User.IsAdmin`, #74 APIKeyStore completo). In corso: U17 (vocabolario `identity.*` e contesto di richiesta, testa del percorso critico M9) e U10 (i 14 asset UI vendorizzati con il controllo di drift, M7). Prodotto: pinnato a `v0.7.0`, sei domini ancora gated; in corso D3 (runtime settings piu i due refactor abilitanti) e X1 (migrazione Cognito, che il seam `WithPasswordVerifier` di v0.7.0 ha sbloccato). Il pin a `v0.8.0` aspetta D3, e apre D6.
 
 ## Blocks
 
@@ -68,3 +68,14 @@ Upstream dance: core pinned to `v0.7.0`
 Stack: unchanged. $0/month added.
 Notes: the tripwire fired exactly as designed. Upstream #71 moved discovery, authorize, token and userinfo onto every adapter, so `cmd/auth`'s own `mountIDPEndpoints` became a second registration of four patterns and six `cmd/auth` tests refused the cold start with the pattern-collision message. The fix is subtraction: this binary now mounts nothing of its own, `mountAuthSurface` is `nethttp.MountWithConfig` plus the collision guard that `idProvider.jwksPath` still needs. `TestTheDeprecatedJWKSAliasIsNotServed` pins the one path that cost.
 Next: D3 runtime settings
+
+### B3 — upstream v0.8.0, i seam di store per l'admin (upstream · main · 2026-09-12)
+Status: green (nessuna modifica al prodotto)
+Landed: `71d4b39` (#72), `8663986` (#73), `1ff3fa3` (#74), tag `v0.8.0` su `6378054`
+Gate: fmt ✓ vet ✓ build ✓ race ✓ su root e cinque adapter, per ogni PR, prima e dopo il rebase · CI GitHub verde su tutte e tre
+Deviations: nessuna nuova, e per una ragione dichiarata in ognuna delle tre PR — nessuna rotta è montata, quindi niente è ancora visibile a un client. Due voci sono *dovute* da PR successive: U13 deve registrare l'ordinamento per id delle liste admin (la reference non impone alcun `ORDER BY`), e U14 quello delle chiavi API.
+Decisions: `User.IsAdmin` è un campo persistito, non derivato da `Role` — la reference lo memorizza (`user.model.ts:90`) e `buildPolicyGuard` lo legge direttamente (`admin.router.ts:370`); derivarlo avrebbe inventato una regola che la reference non ha, nel punto in cui sbagliare consegna la console admin alla persona sbagliata. `AdminUserStore.ListUsers` porta un `tenantID` che filtra la *colonna* `User.TenantID` e mai l'appartenenza al tenant, con stringa vuota come jolly: è la firma che una Query DynamoDB può servire senza Scan, che era il vero collo di bottiglia dell'admin.
+Upstream dance: `v0.8.0` = M6 completo
+Stack: nessuna modifica. $0/mese.
+Notes: una rottura deliberata, e solo di interfaccia: `APIKeyStore` ora richiede `FindByID`, che la reference dichiara obbligatorio. Nessun implementatore esiste fuori dai test. Segnalato e **non** corretto: la reference paga sempre il costo bcrypt confrontando con un hash fittizio quando il prefisso non risolve, per non lasciare un oracolo temporale su "questo prefisso esiste" (`api-key.strategy.ts:36-42`); il port va in corto circuito e l'oracolo c'è. È preesistente, chiuderlo cambia il percorso di verifica, e vive ora come attività a sé.
+Next: pin del prodotto a `v0.8.0` insieme a D3, poi D6
