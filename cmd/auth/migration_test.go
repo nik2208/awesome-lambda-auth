@@ -169,6 +169,22 @@ func newMigrationFixture(t *testing.T, withMigration bool, extra ...string) migr
 		"AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME", table,
 		"AWESOME_AUTH_STORES_CONNECTION_REGION", "us-east-1",
 		"AWESOME_AUTH_STORES_CONNECTION_ENDPOINT", endpoint,
+		// The product's own rate limiter is off here, and only here. It is on by
+		// default and these tests deliberately drive one address past ten
+		// attempts in a minute — TestLoginIsByteIdenticalWithAVerifierConfigured
+		// spends the *migration* limiter's budget on purpose, to prove that its
+		// refusal is indistinguishable from a wrong password. With both limiters
+		// running, the two deployments answer differently for a reason that has
+		// nothing to do with the verifier: the migrating one has made twelve more
+		// requests against that address than the plain one and is refused 429
+		// where the plain one is still answering 401. That is the product limiter
+		// working, not the seam leaking, and leaving it on would make this file
+		// assert the opposite of what it says.
+		//
+		// What the product limiter does on the wire is rate-limited-routes-answer-429
+		// in the register, and it is exercised by cmd/auth/ratelimit_test.go and by
+		// the opt-in contract case. Nothing about it is untested by being off here.
+		"AWESOME_AUTH_RATE_LIMIT_ENABLED", "false",
 	)
 	if withMigration {
 		env = migrationEnv(env, extra...)
