@@ -254,13 +254,25 @@ func keyString(pk, sk string) string { return pk + "\x00" + sk }
 // unprocessed. The whole fan-out is idempotent: a delete of an absent item
 // succeeds, so a partial failure is safe to retry from the top.
 func (s *Store) deleteKeys(ctx context.Context, keys []map[string]types.AttributeValue) error {
-	for start := 0; start < len(keys); start += maxBatchWriteItems {
-		end := min(start+maxBatchWriteItems, len(keys))
-		reqs := make([]types.WriteRequest, 0, end-start)
-		for _, k := range keys[start:end] {
-			reqs = append(reqs, types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: k}})
-		}
-		pending := map[string][]types.WriteRequest{s.table: reqs}
+	reqs := make([]types.WriteRequest, 0, len(keys))
+	for _, k := range keys {
+		reqs = append(reqs, types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: k}})
+	}
+	return s.batchWrite(ctx, reqs)
+}
+
+// batchWrite applies write requests in batches of maxBatchWriteItems, retrying
+// whatever DynamoDB reports as unprocessed.
+//
+// It is **not** a transaction and must not be mistaken for one: a batch that
+// fails halfway leaves the earlier requests applied. Every caller here is
+// idempotent on retry — a delete of an absent item succeeds, and a Put of the
+// same metadata entry writes the same bytes — which is what makes retrying from
+// the top safe, and it is the only thing that does.
+func (s *Store) batchWrite(ctx context.Context, reqs []types.WriteRequest) error {
+	for start := 0; start < len(reqs); start += maxBatchWriteItems {
+		end := min(start+maxBatchWriteItems, len(reqs))
+		pending := map[string][]types.WriteRequest{s.table: reqs[start:end]}
 		for attempt := 0; len(pending) > 0; attempt++ {
 			if attempt == unprocessedAttempts {
 				return errors.New("dynamodb: batch delete still unprocessed after retries")

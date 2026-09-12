@@ -395,7 +395,6 @@ func (s *Store) createUser(ctx context.Context, user auth.User, marker Migration
 
 	notExists := "attribute_not_exists(#PK)"
 	names := exprNames(attrPK)
-	now := s.nowUTC()
 
 	emailIt := item{}.
 		sAlways(attrPK, emailPK(user.TenantID, user.Email)).
@@ -407,15 +406,12 @@ func (s *Store) createUser(ctx context.Context, user auth.User, marker Migration
 	// The membership item is what makes GetTenantsForUser and GetUsersForTenant
 	// possible without a scan. It is written here, in the same transaction, so a
 	// user can never exist without one.
-	memberIt := item{}.
-		sAlways(attrPK, tenantPK(user.TenantID)).
-		sAlways(attrSK, memberSK(user.ID)).
-		stamp(typeMember).
-		sAlways(attrUserID, user.ID).
-		sAlways(attrTenantID, user.TenantID).
-		sAlways(attrGSI1PK, gsi1UserID(user.ID)).
-		sAlways(attrGSI1SK, tenantPK(user.TenantID)).
-		t(attrCreatedAt, now)
+	//
+	// Built by tenants.go's membershipItem rather than inline, now that
+	// AssociateUserWithTenant writes the same item: two builders for one item
+	// shape is how a codec and a condition drift apart, and here they would drift
+	// into a membership that one of the two readers cannot see.
+	memberIt := s.membershipItem(user.ID, user.TenantID)
 
 	profile := profileItem(user)
 	if mv := markerItem(marker); mv != nil {
@@ -652,6 +648,19 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 		return err
 	}
 	keys = append(keys, linkKeys...)
+
+	// The user's metadata, which lives in its own partition rather than in this
+	// collection because UserMetadataStore carries no tenant (metadata.go). It is
+	// swept whether or not the deployment wired the store, for the reason the
+	// OAuth sweep is: the items outlive the interface that wrote them, and a
+	// user id is reused by nothing, so what is left behind is unreachable garbage
+	// rather than a hazard. Strongly consistent, unlike the two GSI1 sweeps
+	// above, because it is a Query on the user's own partition.
+	metaKeys, err := s.metadataKeys(ctx, userID)
+	if err != nil {
+		return err
+	}
+	keys = append(keys, metaKeys...)
 
 	if err := s.deleteKeys(ctx, keys); err != nil {
 		return wrap("delete user", err)

@@ -277,8 +277,8 @@ const (
 	// partition would grow without bound.
 	pkTelemetryPrefix = "TEL" + keySep
 
-	skProfile      = "PROFILE"
-	skEmail        = "EMAIL"
+	skProfile = "PROFILE"
+	skEmail   = "EMAIL"
 
 	// skSessionIndex is the sort key of the session's directory entry, in the
 	// session's own partition. Chosen to sort *after* skSession ("SIDX" >
@@ -286,8 +286,8 @@ const (
 	// returns the session first.
 	skSessionIndex = "SIDX"
 
-	skAPIKey = "APIKEY"
-	skKeyID  = "KEYID"
+	skAPIKey       = "APIKEY"
+	skKeyID        = "KEYID"
 	skSession      = "SESSION"
 	skRefresh      = "REFRESH"
 	skToken        = "TOKEN"
