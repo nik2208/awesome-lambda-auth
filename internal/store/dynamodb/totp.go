@@ -32,6 +32,17 @@ import (
 //     write is last-one-wins exactly as MemoryUserStore's is
 //     (memory_store.go:259-270).
 
+// The two plain profile-writing capabilities. UserPhoneStore is declared in the
+// core's account.go rather than in store.go, beside the POST /add-phone route
+// that needs it, which is why a derivation that read store.go, oauth.go,
+// api_keys.go and telemetry.go missed it entirely; it was found by driving the
+// routes (cmd/auth's store sweep), not by reading, and it is pinned so it cannot
+// be lost again. See interfaces.go for the convention.
+var (
+	_ auth.TOTPStore      = (*Store)(nil)
+	_ auth.UserPhoneStore = (*Store)(nil)
+)
+
 // UpdateTOTPSecret is part of auth.TOTPStore. It is called with
 // (secret, true) by VerifyTOTPSetup and with ("", false) by DisableTOTP.
 //

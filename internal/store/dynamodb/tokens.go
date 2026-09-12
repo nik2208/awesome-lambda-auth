@@ -15,6 +15,14 @@ import (
 
 const attrFamily = "family"
 
+// UserPasswordStore (store.go:31-36): the password lifecycle plus the "reset"
+// token family, which is the one family whose four methods are declared on a
+// mandatory-looking interface rather than an optional one. It is still
+// discovered by type assertion, so a drifted signature silently turns
+// POST /forgot-password and POST /reset-password into 501s rather than failing
+// the build. See interfaces.go for the convention.
+var _ auth.UserPasswordStore = (*Store)(nil)
+
 // UpdatePassword is part of UserPasswordStore.
 //
 // It also removes the migration marker, in the same write, and that is the

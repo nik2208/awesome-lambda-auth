@@ -112,6 +112,17 @@ func (s *Store) checkSession(sess auth.Session) error {
 	return checkHash("refresh token hash", sess.RefreshTokenHash)
 }
 
+// The session interfaces. SessionStore is handed to the core by name
+// (auth.WithSessionStore); the other two are discovered by type assertion, so a
+// drifted signature there is a GET /sessions or a POST /sessions/cleanup that
+// answers 501 from a binary that built cleanly. See interfaces.go for the
+// convention.
+var (
+	_ auth.SessionStore       = (*Store)(nil)
+	_ auth.SessionLookupStore = (*Store)(nil)
+	_ auth.SessionAdminStore  = (*Store)(nil)
+)
+
 // CreateSession writes the session and its first refresh pointer in one
 // transaction (data-model.md #10), so a session can never exist without a way to
 // resolve it from the token that was already handed to the client.

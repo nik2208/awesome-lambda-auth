@@ -294,6 +294,20 @@ func userFromItem(m map[string]types.AttributeValue) (auth.User, error) {
 	return u, nil
 }
 
+// The two mandatory user interfaces (store.go:9-20). Unlike almost everything
+// else this package pins, UserStore is not discovered by type assertion — it is
+// the one store auth.WithUserStore takes by name — so a drift in *its* three
+// signatures does fail the composition root's build. UserAccountStore is
+// asserted, and is the pair that would go quiet: DELETE /account and
+// PUT /profile would answer ErrFeatureNotSupported from a binary that built.
+//
+// See interfaces.go for why every interface in this package carries one of
+// these, and for the convention this follows.
+var (
+	_ auth.UserStore        = (*Store)(nil)
+	_ auth.UserAccountStore = (*Store)(nil)
+)
+
 // CreateUser writes the profile, the email-uniqueness item and the tenant
 // membership in one transaction (data-model.md #1).
 //

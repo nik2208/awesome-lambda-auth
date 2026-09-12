@@ -26,6 +26,14 @@ import (
 // auth.WithOAuth (oauth_wire.go:226-233).
 type LinkedAccounts struct{ store *Store }
 
+// Pinned on the view rather than on *Store, for the reason the type comment
+// gives. This is one of the two assertions in the package whose failure mode is
+// not a silent 501 but a composition root that stops compiling — the core takes
+// both OAuth stores by name through auth.WithOAuth — which is a better failure
+// and still not one to rely on: a host that passes them as interface values
+// built elsewhere would get neither. See interfaces.go for the convention.
+var _ auth.LinkedAccountStore = (*LinkedAccounts)(nil)
+
 // LinkedAccounts returns the auth.LinkedAccountStore view of this store. The
 // return type is the interface rather than the concrete type so that the
 // composition root can find it structurally without importing this package's

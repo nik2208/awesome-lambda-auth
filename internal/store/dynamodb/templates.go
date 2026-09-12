@@ -87,9 +87,18 @@ var (
 	ErrInvalidTranslation = errors.New("dynamodb: invalid translation")
 )
 
+// TemplateStore is the second of the three capabilities the core does not
+// discover by type assertion — it is handed over through auth.WithTemplateStore
+// — so a drifted signature would not fail a build that names only the accessor,
+// and the consequence would not be a 501 but a deployment whose stored templates
+// silently stop overriding the built-in ones. See interfaces.go for the
+// convention.
+var _ auth.TemplateStore = (*Store)(nil)
+
 // Templates returns this store as the auth.TemplateStore the composition root
-// hands to auth.WithTemplateStore. The methods are on *Store itself
-// (interfaces.go); the accessor exists so cmd/auth can find the capability
+// hands to auth.WithTemplateStore. The methods are on *Store itself; the
+// assertion above is what pins their shape, and the accessor exists so cmd/auth
+// can find the capability
 // structurally, the way it finds LinkedAccounts() and PendingLinks(), without
 // importing this package's types into its own vocabulary.
 func (s *Store) Templates() auth.TemplateStore { return s }
