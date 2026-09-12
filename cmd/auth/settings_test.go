@@ -31,7 +31,40 @@ func settingsCfg(mutate func(*config.Config)) *config.Config {
 	return cfg
 }
 
-// With no seed, the route answers as it always has. The
+// TestRuntimeSettingsSeedReachesTheCore drives the knob all the way to the only
+// place it is observable today: POST <prefix>/2fa/disable, which the core
+// answers 403 2FA_REQUIRED on when the settings store holds require2FA
+// (auth.router.ts:890-896).
+//
+// It is the whole chain in one assertion — the document loads at all, which it
+// could not while the phase gate refused it; the declared seed is written into
+// the store; the store is handed to the core through auth.WithSettingsStore; and
+// the core consults it on the route. It is also what fails if the settings slot
+// of coreOptionSets is ever emptied, which nothing else would catch:
+// Config.Settings is an ordinary field, and a nil one makes the core skip the
+// check rather than complain.
+func TestRuntimeSettingsSeedReachesTheCore(t *testing.T) {
+	t.Parallel()
+	app := newTestApp(t, settingsEnv("AWESOME_AUTH_RUNTIME_SETTINGS_REQUIRE_2FA", "true"))
+
+	reg := invoke(t, app, http.MethodPost, "/auth/register",
+		jsonHeaders(auth.AuthStrategyHeader, auth.AuthStrategyBearer), nil, registerBody("settings@example.test"))
+	if reg.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d (body %s)", reg.StatusCode, reg.Body)
+	}
+	token, _ := decodeBody(t, reg)["accessToken"].(string)
+
+	resp := invoke(t, app, http.MethodPost, "/auth/2fa/disable", bearer(token), nil, "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("2fa/disable status = %d, want 403 — the seeded require2FA never reached the core (body %s)",
+			resp.StatusCode, resp.Body)
+	}
+	if code, _ := decodeBody(t, resp)["code"].(string); code != "2FA_REQUIRED" {
+		t.Errorf("2fa/disable code = %q, want %q (body %s)", code, "2FA_REQUIRED", resp.Body)
+	}
+}
+
+// The mirror image: with no seed, the route answers as it always has. The
 // settings store is wired and empty, so this also pins that an empty document
 // reads as "not required" rather than as a fault.
 func TestNoRuntimeSettingsSeedLeavesTheRouteAlone(t *testing.T) {

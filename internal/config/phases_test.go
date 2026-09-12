@@ -30,9 +30,6 @@ func TestConfiguringAnUnwiredDomainIsRefused(t *testing.T) {
 		{"docs", func(doc Document) {
 			set(doc, "docs.swagger", "false")
 		}},
-		{"runtimeSettings", func(doc Document) {
-			set(doc, "runtimeSettings.lazyEmailVerificationGracePeriodDays", 14)
-		}},
 	}
 
 	for _, tc := range cases {
@@ -76,6 +73,67 @@ func TestUnwiredDomainViaSecretIsAlsoRefused(t *testing.T) {
 
 	_, err := Load(t.Context(), Options{Document: baseDoc(), Getenv: getenvFrom(env)})
 	requireRule(t, err, RuleUnimplemented, "admin")
+}
+
+// TestRuntimeSettingsIsWired is the other side of the refusal table for the
+// domain this block opened: a document that seeds the runtime-mutable layer
+// loads instead of tripping the phase gap.
+//
+// Each case declares the store alongside the seed, because the schema requires
+// them together (checkStoreRequirements) — so this also pins that un-gating
+// relaxed nothing, and in particular that the widened requirement still fires
+// for the two shapes the old one missed. What cmd/auth then does with the seed
+// is its own tests' business.
+func TestRuntimeSettingsIsWired(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(Document)
+	}{
+		{"require2fa", func(doc Document) {
+			set(doc, "runtimeSettings.require2fa", true)
+		}},
+		{"a webhook allowlist", func(doc Document) {
+			set(doc, "runtimeSettings.enabledWebhookActions", []any{"user.created"})
+		}},
+		{"an explicitly cleared webhook allowlist", func(doc Document) {
+			set(doc, "runtimeSettings.enabledWebhookActions", []any{})
+		}},
+		{"the grace period alone", func(doc Document) {
+			set(doc, "runtimeSettings.lazyEmailVerificationGracePeriodDays", 14)
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := baseDoc()
+			set(doc, "stores.enable.settings", true)
+			tc.mutate(doc)
+
+			cfg, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+			if err != nil {
+				t.Fatalf("runtimeSettings is wired, so this must load:\n%v", err)
+			}
+			for _, w := range cfg.Warnings() {
+				if w.Path == "runtimeSettings" && strings.Contains(w.Problem, "not yet wired") {
+					t.Errorf("runtimeSettings is still reported as an unwired domain: %s", w.Problem)
+				}
+			}
+			if _, gated := UnwiredDomains()["runtimeSettings"]; gated {
+				t.Error("runtimeSettings is still listed by UnwiredDomains")
+			}
+		})
+	}
+
+	// The seed still needs somewhere to go: without the store every one of those
+	// documents is refused by name, including the two the narrower rule used to
+	// miss (rules_test.go has those two directly).
+	t.Run("without the store", func(t *testing.T) {
+		doc := baseDoc()
+		set(doc, "runtimeSettings.require2fa", true)
+
+		_, err := Load(t.Context(), Options{Document: doc, Getenv: getenvFrom(baseEnv())})
+		requireRule(t, err, RuleStoreRequired, "stores.enable.settings")
+	})
 }
 
 // TestAllowUnimplementedDowngradesToWarning: the gap stays visible in the

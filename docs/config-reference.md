@@ -133,11 +133,18 @@ now a deployment that behaves differently rather than one that refuses: the firs
 mounts the OIDC surface and publishes a JWKS document, the second unmounts the
 credential surface and verifies another issuer's tokens.
 
-`email.templatesDir` needs a template store, and both drivers now back one: the
-DynamoDB store keeps mail templates and UI translations on its `TEMPLATES`
-partition, the memory driver holds them per execution environment (§5.3). A
-driver that backs none is still refused by `checkStoreSupport` at cold start,
-by name — a store gap rather than a phase gap.
+`runtimeSettings` is the latest to leave the list (§11). Configuring it now seeds
+the runtime-mutable layer instead of refusing the deployment, and
+`runtimeSettings.require2fa` reaches a route: `POST <prefix>/2fa/disable` answers
+`403` `2FA_REQUIRED` on it. The five left on the list are `ui`, `admin`, `docs`,
+`tools` and `rateLimit`.
+
+`email.templatesDir` needs a template store and `runtimeSettings` needs a
+settings store, and both drivers now back both: the DynamoDB store keeps mail
+templates and UI translations on its `TEMPLATES` partition and the settings on
+its `SETTINGS` one, the memory driver holds both per execution environment (§5.3,
+§11). A driver that backs neither is still refused by `checkStoreSupport` at cold
+start, by name — a store gap rather than a phase gap.
 
 ## 5. `email.*`, knob by knob
 

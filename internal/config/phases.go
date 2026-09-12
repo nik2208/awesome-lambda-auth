@@ -81,6 +81,20 @@ type domain struct {
 // Neither is refused any more, and `idProvider.`'s secretPrefix goes with them:
 // the private key and every client secret belong to a wired domain now.
 //
+// Runtime settings (P6's first block) closed `runtimeSettings`. The block is the
+// boot-time seed of the one runtime-mutable layer this product has: with
+// `stores.enable.settings` on, the composition root hands the core a
+// SettingsStore — the DynamoDB SETTINGS singleton or the development driver's
+// in-memory one — and applies the declared seeds to the keys that store does not
+// already hold (cmd/auth settings.go, internal/store/dynamodb settings.go).
+// `runtimeSettings.require2fa` therefore reaches a route: POST <prefix>/2fa/disable
+// answers 403 2FA_REQUIRED on it, which is what a phase gap here used to
+// prevent an operator from ever getting. The other two keys are seeded, stored,
+// and reported by cmd/auth's unwiredKnobs as read by nothing this build mounts
+// — which is the distinction this gate exists to preserve: a domain is refused
+// while it does nothing at all, and a knob inside a wired domain is reported
+// while the core cannot act on it.
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
@@ -119,11 +133,6 @@ func unwiredDomains() []domain {
 			path:  "docs",
 			phase: "P6 (OpenAPI surface)",
 			get:   func(c *Config) any { return c.Docs },
-		},
-		{
-			path:  "runtimeSettings",
-			phase: "P6 (runtime settings store)",
-			get:   func(c *Config) any { return c.RuntimeSettings },
 		},
 	}
 }
