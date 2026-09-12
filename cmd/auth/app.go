@@ -272,12 +272,12 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// The auth surface comes entirely from the imported adapter. Nothing in this
 	// binary may add a route under the api prefix: a route that exists here and
 	// not in the other family ports is a wire divergence by construction.
-	// In identity-provider mode this also mounts the OIDC endpoints the adapter
-	// does not own — discovery, authorize, token and userinfo, all of them the
-	// core's own handlers at the core's own paths, while the JWKS document stays
-	// the adapter's. It returns an error rather than panicking on the one
-	// configuration that can register a pattern twice (idp.go,
-	// mountAuthSurface).
+	// In identity-provider mode the adapter mounts the OIDC surface too, all
+	// five endpoints of it, as of awesome-go-auth v0.7.0; this binary used to
+	// mount four of them itself and no longer does. What is left here is the
+	// guard: mountAuthSurface returns an error rather than panicking on the one
+	// configuration that can still register a pattern twice, an
+	// idProvider.jwksPath pointed at a route the adapter already serves (idp.go).
 	if err := mountAuthSurface(mux, core, cfg); err != nil {
 		return nil, err
 	}
