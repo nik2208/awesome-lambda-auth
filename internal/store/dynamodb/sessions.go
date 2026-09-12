@@ -61,6 +61,60 @@ func (s *Store) sessionItem(sess auth.Session, gen int64) item {
 	return it
 }
 
+// sessionIndexItem is the session's directory entry: a second, tiny item in the
+// session's own partition, carrying a constant GSI1 partition key so that
+// SessionLister.GetAllSessions can be a Query.
+//
+// # Why a second item at all
+//
+// The session item's own GSI1 key pair is already spent: GSI1PK is
+// USER#<t>#<u>, which is what makes ListSessionsForUser a fan-out rather than a
+// scan of the user's history (§2.3). One item has one key pair per index, and
+// this table has one index, so a cross-user listing needs either a second index
+// — a template.yaml change and a table update on a live stack — or a second
+// item. A second item is the cheaper of the two and the one that does not need
+// infrastructure to move: it costs one write in the transaction that already
+// creates the session, and nothing thereafter.
+//
+// **Nothing thereafter** is the load-bearing half. Rotation is an UpdateItem on
+// the session item with an explicit attribute list, revocation likewise, and
+// neither touches this item — it carries nothing that changes. So the highest
+// -churn entity in the table pays for this once per session, not once per
+// refresh.
+//
+// # What it costs, honestly
+//
+// One extra item of roughly eighty bytes per session, one extra GSI entry, and
+// one extra operation inside CreateSession's transaction (which is billed at 2×
+// WCU, §6.3). The GSI partition it writes to is a single constant one, so the
+// ceiling on logins per second is a single GSI partition's write throughput —
+// the hot-key cost the upstream author refused to paper over, here in its
+// sharpest form because sessions are created more often than anything else this
+// table indexes. §6.2 carries the number and the escape hatch, which is
+// sharding SESSION#0..SESSION#n at the price of an n-way merge on every read.
+//
+// # TTL
+//
+// It carries the session's own TTL, so the two expire together and a directory
+// that outlived its sessions is not a state this store can reach. TTL deletion
+// is best-effort within roughly 48 hours and the two items are reaped
+// independently, so a directory entry can briefly outlive its session; that is
+// exactly the case pagedIndexQuery fills past rather than truncating on.
+func (s *Store) sessionIndexItem(sess auth.Session) item {
+	return item{}.
+		sAlways(attrPK, sessionPK(sess.ID)).
+		sAlways(attrSK, skSessionIndex).
+		stamp(typeSessionIndex).
+		sAlways(attrGSI1PK, gsi1AllSessionsPK).
+		// The session id alone, so the directory's order is Session.ID
+		// ascending — which is the core's normative order for SessionLister
+		// exactly, and therefore needs no deviation. A creation timestamp here
+		// would have been more useful to look at and would have had to be
+		// registered.
+		sAlways(attrGSI1SK, sess.ID).
+		ttl(sess.ExpiresAt.Add(s.ttlGrace))
+}
+
 func sessionFromItem(m map[string]types.AttributeValue) (auth.Session, error) {
 	if err := checkVersion(m, typeSession); err != nil {
 		return auth.Session{}, err
@@ -136,6 +190,11 @@ func (s *Store) CreateSession(ctx context.Context, sess auth.Session) (auth.Sess
 			// (memory_store.go:414-420). Session ids are 128 bits of randomness,
 			// so an overwrite is not a case that arises.
 			{Put: &types.Put{TableName: aws.String(s.table), Item: s.sessionItem(sess, firstGen)}},
+			// The directory entry, in the same transaction and unconditional for
+			// the same reason: a session that existed without one would be
+			// invisible to GetAllSessions for its whole life, and there is no
+			// later moment at which this store would notice and repair it.
+			{Put: &types.Put{TableName: aws.String(s.table), Item: s.sessionIndexItem(sess)}},
 			{Put: &types.Put{
 				TableName: aws.String(s.table),
 				Item:      s.refreshPointer(sess, firstGen),
@@ -150,7 +209,11 @@ func (s *Store) CreateSession(ctx context.Context, sess auth.Session) (auth.Sess
 	})
 	if err != nil {
 		if reasons, ok := txConditionFailures(err); ok {
-			if _, failed := txFailedAt(reasons, 1); failed {
+			// Index 2: the refresh pointer is the third operation, after the
+			// session item and its directory entry. It is also the only one of
+			// the three that carries a condition, so it is the only index worth
+			// asking about.
+			if _, failed := txFailedAt(reasons, 2); failed {
 				return auth.Session{}, errors.New("dynamodb: refresh token hash already bound to another session")
 			}
 		}
@@ -513,6 +576,72 @@ func (s *Store) ListSessionsForUser(ctx context.Context, userID, tenantID string
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
+	return out, nil
+}
+
+// SessionLister is discovered by type assertion on the session store
+// (Service.ListAllSessions), so a drift here is M8's GET /admin/api/sessions
+// answering the reference's 501 from a binary that built. See interfaces.go for
+// the convention.
+var _ auth.SessionLister = (*Store)(nil)
+
+// GetAllSessions implements auth.SessionLister: one page of every session in the
+// deployment, across all users and all tenants.
+//
+// It reads the session directory — one entry per session at
+// GSI1PK = "SESSION", GSI1SK = <sessionID> — and resolves each entry to its
+// session item. See sessionIndexItem for why that directory is a second item
+// rather than a second index, and what it costs.
+//
+// # Ordering
+//
+// Session.ID ascending, which is the core's normative order exactly: the
+// directory's sort key *is* the session id. No deviation, and nothing to
+// restore after the BatchGetItem — pagedIndexQuery puts the items back in index
+// order, which is the whole reason it does that work.
+//
+// # What is not filtered
+//
+// Nothing. Revoked and expired sessions both come back, matching
+// ListSessionsForUser and for the same reason: this port tombstones a revoked
+// session rather than deleting it, because /refresh needs the tombstone to
+// answer SESSION_REVOKED instead of "not found". Dropping the dead ones is the
+// presentation layer's job. The core's interface doc says "all active sessions"
+// and gets that for free only because its own revokeSession deletes the row.
+//
+// # Tenancy
+//
+// There is none, deliberately, and the asymmetry with ListUsers is the core's:
+// a tenant parameter on the user lister buys reachability, where here every
+// session is already listable and Session.TenantID rides on each record
+// returned, so a tenant parameter would buy a predicate the caller can apply
+// itself at the price of a signature the reference does not have.
+func (s *Store) GetAllSessions(ctx context.Context, limit, offset int) ([]auth.Session, error) {
+	items, err := s.pagedIndexQuery(ctx, &awsddb.QueryInput{
+		TableName:                aws.String(s.table),
+		IndexName:                aws.String(s.index),
+		KeyConditionExpression:   aws.String("#GSI1PK = :pk"),
+		ExpressionAttributeNames: exprNames(attrGSI1PK),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": avS(gsi1AllSessionsPK),
+		},
+		// The directory entry shares the session's partition, so the session
+		// itself is one sort key away and needs no lookup to address.
+	}, limit, offset, canonicalKeyInSamePartition(skSession))
+	if err != nil {
+		if errors.Is(err, ErrPageWindowTooLarge) {
+			return nil, err
+		}
+		return nil, wrap("list all sessions", err)
+	}
+	out := make([]auth.Session, 0, len(items))
+	for _, m := range items {
+		sess, err := sessionFromItem(m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
 	return out, nil
 }
 

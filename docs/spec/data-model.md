@@ -108,7 +108,22 @@ Four pointer-backed families share one shape, and SMS (#23-#25) is the same shap
 | 44 | Drop membership | `DisassociateUserFromTenant` | DeleteItem | main | 1 w |
 | 45 | Tenants of user | `GetTenantsForUser` ← `/me`, `DELETE /account` | Query GSI1 `GSI1PK=USERID#<u>` AND `begins_with(GSI1SK,'TENANT#')` → BatchGet directory | GSI1 | T' |
 | 46 | Users of tenant | `GetUsersForTenant` ← `GET /admin/api/tenants/:id/users` | Query `PK=TENANT#<t>` AND `begins_with(SK,'MEMBER#')`, paged | main | M |
-| 47 | Admin user list | `GET /admin/api/users?limit&offset&filter` | #46 page (≤500 when `filter` set, matching `admin.router.ts:760-780`) + BatchGet profiles + in-process filter | main | ≤500 |
+| 47 | Admin user list | `AdminUserStore.ListUsers` ← `GET /admin/api/users`, the `first-user` access policy | Query GSI1 `GSI1PK='USER'`, optionally `begins_with(GSI1SK, '<t>#')`, skipping `offset` index entries → BatchGet profiles | GSI1+main | limit+offset |
+| 47b | Admin session list | `SessionLister.GetAllSessions` ← `GET /admin/api/sessions` | Query GSI1 `GSI1PK='SESSION'` over the session directory entries → BatchGet sessions in the same partitions | GSI1+main | limit+offset |
+| 47c | Role list | `RoleLister.GetAllRoles` ← `GET /admin/api/roles` | Query `PK=ROLES` | main | R |
+
+
+*Corrected during implementation, three groups of rows.*
+
+- **#47 was answered out of the membership table, and that is the dead end the interface exists to route around.** The row read "#46 page + BatchGet profiles + in-process filter", which cannot answer the form both of the reference's consumers actually use — `GET /admin/api/users` takes no tenant parameter at all (`admin.router.ts:748`) and the `first-user` access policy asks for `listUsers(1, 0)` (`:373`) — and for the scoped form it answers out of `TENANT#<t>`/`MEMBER#<u>`, so a single-tenant deployment whose tenant has no membership rows had nothing to page through. `AdminUserStore` (core v0.8.0) exists precisely because of that, and the upstream author specified the index it was designed for: a **constant** GSI1 partition key with sort key `<tenantID>#<id>`, answering the unscoped form with no sort-key condition and the scoped one with `begins_with`. Deliberately not partitioned by tenant, which would serve the scoped form and force a cross-partition Scan for the unscoped one. The profile item therefore gains `GSI1PK`/`GSI1SK`, written by `CreateUser` and by nothing else — no profile update touches an indexed or projected attribute, so the busiest item in the table pays one index write in its life. Two costs are carried rather than discovered: the constant partition key is a hot key (§6.2), and `offset` is positional, so offset N costs reading and discarding N **index entries** (never N profiles — the skip never resolves). The resulting order for the unscoped listing is `(TenantID, ID)` rather than `ID`, which is wire-visible and is in `CompatibilityNotes()`.
+
+  **This is a migration for an existing table.** GSI1 is sparse, so a profile written before this release carries neither attribute and is invisible to `ListUsers` until it is rewritten. Nothing here backfills it: a backfill is a `Scan`, which is a job rather than a store method, and §7 rule 4's shape applies — a paged, resumable sweep driven off `_t = "user"` that writes the two attributes and nothing else. The sweep is idempotent and can run while the store serves traffic; until it finishes, `ListUsers` under-reports and every other user method is unaffected.
+
+- **#47b has no index to reuse, and the answer is a second item rather than a second GSI.** `SessionLister.GetAllSessions` enumerates every session across users and tenants. The session item's own GSI1 key pair is already spent on `USER#<t>#<u>`, which is what makes #15 a fan-out instead of a scan of the user's history, and one item has one key pair per index. So each session gains a **directory entry** — `PK=SESSION#<sid>`, `SK=SIDX`, `GSI1PK='SESSION'`, `GSI1SK=<sid>`, same TTL — written inside `CreateSession`'s existing transaction and touched by nothing afterwards: rotation and revocation are `UpdateItem`s on the session item and the entry carries nothing that changes. The alternative was a second GSI, which is a `template.yaml` change and an index build on a live table; this is one extra ~80-byte item and one extra transactional write on the login path. `GSI1SK` is the bare session id, so the order is `Session.ID` ascending — the core's normative order exactly, and therefore nothing to register.
+
+- **#26-#28 could not live under `USER#<t>#<u>`, and §8.1 is closed rather than deferred.** `UserMetadataStore`'s three methods take `(ctx, userID)` and no tenant, so no implementation can name the tenant segment of that key; §8.1 recorded the interim as "read the tenant off the request-scoped principal" and the fix as an upstream signature widening. Neither is needed, because the table already solves this problem once: the linked-account item is keyed globally and carries no `tenantId`, "deliberately absent" (§5), for exactly the reason that `FindByProvider`, `ListForUser` and `Delete` carry no tenant either. Metadata follows it to `PK=USERMETA#<u>`, `SK=META#<key>`. A user id is unique across tenants by construction, so a partition keyed on it alone is exactly as isolating as one keyed on both, and §3's rule is satisfied by the key rather than by a filter. The consequence to keep in view is that metadata leaves the user's item collection, so `DeleteUser` sweeps a second partition — which it does, driven off the same Query `ClearMetadata` uses.
+
+- **#29, #32, #33 and #36 had role definitions one partition each, which `RoleLister` cannot enumerate.** `PK=ROLE#<role>` is correct for every method that names a role and impossible for `GetAllRoles`, which names none: a per-role partition can only be enumerated by a table Scan. Definitions move into a directory partition, `PK=ROLES`, `SK=ROLE#<role>` — the arrangement §2.3 already argues for tenants, for the same reasons, against a set that is likewise bounded, administrator-authored and rarely written. `GetAllRoles` is then a Query on one partition and its order is the role name ascending, matching `GetPermissionsForRole` and `GetRolesForUser` and therefore the core's normative order exactly. The assignment item is unchanged: it stays `PK=USER#<t>#<u>`, `SK=ROLE#<role>` with `GSI1PK=ROLE#<role>` for the `DeleteRole` sweep, and #29's `ConditionCheck` simply moves to the directory key.
 
 ### 1.5 API keys, OAuth, telemetry, rate limiting
 
@@ -207,35 +222,37 @@ One table. Partition key `PK` (S), sort key `SK` (S). TTL attribute `ttl` (N, ep
 
 **One GSI, not three.** `GSI1PK` (S) / `GSI1SK` (S), sparse (only items that set both attributes are indexed).
 
-The sketch proposed GSI1 for email/phone, GSI2 for tenant scan, GSI3 for `provider#providerUserId`. All three are rejected; §2.3 gives the reasons. The general principle that collapses them: **a lookup by an opaque, high-entropy, single-valued key belongs in the main table's key space, not in an index.** Indexes are eventually consistent, cannot enforce uniqueness, and cost a full write amplification on every mutation of every projected item. A GSI is warranted only for a genuine one-to-many fan-out whose parent key the caller does not hold — which, after this design, is exactly four patterns (#15, #33, #45, #54), all served by GSI1.
+The sketch proposed GSI1 for email/phone, GSI2 for tenant scan, GSI3 for `provider#providerUserId`. All three are rejected; §2.3 gives the reasons. The general principle that collapses them: **a lookup by an opaque, high-entropy, single-valued key belongs in the main table's key space, not in an index.** Indexes are eventually consistent, cannot enforce uniqueness, and cost a full write amplification on every mutation of every projected item. A GSI is warranted only for a genuine one-to-many fan-out whose parent key the caller does not hold — which, after this design, is six patterns (#15, #33, #45, #54, #47 and #47b), all served by GSI1. The last two are served through a *constant* partition key rather than a per-owner one, because they enumerate a whole entity type rather than one owner's children — that is what turns an enumeration into a Query instead of a Scan, and §6.2 carries what it costs.
 
 ### 2.2 Item catalogue
 
 | Entity | PK | SK | GSI1PK | GSI1SK | TTL |
 |---|---|---|---|---|---|
-| User profile | `USER#<t>#<u>` | `PROFILE` | — | — | no |
+| User profile | `USER#<t>#<u>` | `PROFILE` | `USER` | `<t>#<u>` | no |
 | Email uniqueness | `EMAIL#<t>#<normalizedEmail>` | `EMAIL` | — | — | no |
-| Metadata entry | `USER#<t>#<u>` | `META#<key>` | — | — | no |
+| Metadata entry | `USERMETA#<u>` | `META#<key>` | — | — | no |
 | Role assignment | `USER#<t>#<u>` | `ROLE#<role>` | `ROLE#<role>` | `USER#<t>#<u>` | no |
-| Role definition | `ROLE#<role>` | `ROLE` | — | — | no |
+| Role definition | `ROLES` | `ROLE#<role>` | — | — | no |
 | Session | `SESSION#<sid>` | `SESSION` | `USER#<t>#<u>` | `SESSION#<createdAtRFC3339>#<sid>` | yes |
+| Session directory entry | `SESSION#<sid>` | `SIDX` | `SESSION` | `<sid>` | yes |
 | Refresh pointer | `REFRESH#<h>` | `REFRESH` | — | — | yes |
 | Single-use pointer | `{RESET\|MAGIC\|VERIFY\|ECHG}#<h>` | `TOKEN` | — | — | yes |
 | Pending OAuth link | `PLINK#<state>` | `PLINK` | — | — | yes |
 | OIDC authorization code | `OIDC#<sha256(code)>` | `CODE` | — | — | yes |
 | Linked account | `OAUTH#<provider>#<providerId>` | `OAUTH` | `USERID#<u>` | `OAUTH#<provider>#<providerId>` | no |
 | Link id pointer | `LINKID#<linkId>` | `LINKID` | — | — | no |
-| API key | `APIKEY#<prefix>` | `APIKEY` | — | — | optional |
-| API key id pointer | `KEYID#<keyId>` | `KEYID` | — | — | optional |
+| API key | `APIKEY#<prefix>` | `APIKEY` | `APIKEY` | `<descCreatedAt>#<keyId>` | no |
+| API key id pointer | `KEYID#<keyId>` | `KEYID` | `APIKEYSVC#<serviceId>` | `<descCreatedAt>#<keyId>` | no |
 | Tenant | `TENANTS` | `TENANT#<t>` | — | — | no |
 | Tenant membership | `TENANT#<t>` | `MEMBER#<u>` | `USERID#<u>` | `TENANT#<t>` | no |
 | Mail template | `TEMPLATES` | `MAIL#<id>` | — | — | no |
 | UI translations | `TEMPLATES` | `UI#<page>` | — | — | no |
+| Webhook subscription | `WEBHOOKS` | `WHK#<id>` | — | — | no |
 | Runtime settings | `SETTINGS` | `SETTINGS` | — | — | no |
 | Telemetry event | `TEL#<t>#<yyyy-mm-dd>` | `<rfc3339Nano>#<eventId>` | — | — | yes |
 | Rate-limit counter | `RL#<scope>#<subject>#<window>` | `RL` | — | — | yes |
 
-**Item-collection discipline.** Only three child types live under `USER#<t>#<u>`: `META#*`, `PROFILE`, `ROLE#*`. Their ASCII order is `META# < PROFILE < ROLE#`, and all three have bounded cardinality, so an unconditioned `Query` on the user partition is always safe and always returns exactly the `/me` bundle (#4) in one round trip. Sessions, API keys and linked accounts are deliberately **not** in this collection: they are unbounded, and putting them there would turn the hottest read in the system into a paginated scan of the user's history. Any future child type must be named so it sorts inside `[META#, ROLE~]` if it belongs to the bundle, and outside if it does not.
+**Item-collection discipline.** Only two child types live under `USER#<t>#<u>`: `PROFILE` and `ROLE#*`. Their ASCII order is `PROFILE < ROLE#`, both have bounded cardinality, and an unconditioned `Query` on the user partition is therefore always safe. Metadata used to be the third and could not stay — `UserMetadataStore` carries no tenant id, so nothing can address `META#` under a tenant-scoped partition (§1.4, corrected) — so the `/me` bundle (#4) is now that Query plus one on `USERMETA#<u>`, two round trips rather than one. Sessions, API keys and linked accounts are deliberately **not** in this collection: they are unbounded, and putting them there would turn the hottest read in the system into a paginated scan of the user's history. Any future child type must be named so it sorts inside `[META#, ROLE~]` if it belongs to the bundle, and outside if it does not.
 
 ### 2.3 Where the sketch is changed or rejected
 
@@ -495,6 +512,15 @@ DynamoDB's hard per-partition limits are 1 000 WCU and 3 000 RCU; adaptive capac
 - **`PK=SETTINGS`.** One item, and adaptive capacity cannot split one item, so this is the only partition in the table whose ceiling is a hard 3 000 RCU with no mitigation. It is nowhere near binding today: the settings are read on `POST /2fa/disable` and once per cold start, not on the login path. Two future readers are the ones to watch — `GET /ui/config`, which every hosted-UI page load hits, and the inbound-webhook sandbox, which reads the allowlist per delivery. Neither is mounted yet; when one is, the answer is a per-execution-environment cache with a short TTL in the composition root and not a change of key, because a settings document that is seconds stale is exactly what the reference serves from its own process memory.
 - **`PK=TENANT#<t>` in a single-tenant deployment.** All memberships in one partition. Membership writes happen once per user (at `CreateUser` and `AssociateUserWithTenant`), so the write rate equals the registration rate; 1 000 registrations/s is not a realistic auth workload. Reads are the admin user list, paginated. If a deployment ever approaches it, the fix is sharding `MEMBER#<shard>#<u>` with an 8-way fan-out on read — designed for, not built now.
 - **`PK=RL#<scope>#<subject>#<window>` for a per-IP counter.** A single abusive source is a single partition, capped at 1 000 WCU. That is mostly a feature — the attacker throttles themselves — but a large NAT or corporate egress shares one key with all its legitimate users. Per-IP windows must therefore be short and the account-scoped limiter must be the primary control.
+- **The four directory partitions of GSI1: `GSI1PK=USER`, `SESSION`, `APIKEY` and `APIKEYSVC#<serviceId>`.** These are the constant partition keys the v0.8.0 listing interfaces need — `AdminUserStore.ListUsers`, `SessionLister.GetAllSessions` and `APIKeyAdminStore.ListAll` each enumerate a whole entity type, and a key-value store can only enumerate what shares a partition. The cost is that every write to an indexed item lands in one GSI partition, capped at 1 000 WCU like any other, with **no** adaptive mitigation available: split-for-heat works on key ranges, and a constant key is one range.
+
+  The ceilings are not equal, and it is worth being exact about which rate binds which:
+
+  - `USER` is written once per **registration** and never again. `profileItem` is only ever used by `CreateUser` — every other profile write is an `UpdateItem` with an explicit attribute list — and DynamoDB writes to a GSI only when an indexed or projected attribute changes, none of which a profile update touches. So the ceiling here is a registration rate, and 1 000 registrations/s is not an auth workload.
+  - `SESSION` is written once per **login**, which is the highest write rate in this table, and this is the one to watch. Rotation and revocation are `UpdateItem`s on the session item and never touch the directory entry, so the ceiling is logins/s and not requests/s — but 1 000 logins/s is a rate a large deployment can reach.
+  - `APIKEY` is written once per key minted, which is an operator-scale event.
+
+  **The escape hatch, priced.** Sharding a constant key across `USER#0`..`USER#n` (the shard picked by a hash of the id) multiplies the write ceiling by `n` and costs an `n`-way merge on every read to keep the order — which is affordable precisely because these listings are ordered by a key the shard function does not disturb, so the merge is a heap over `n` already-sorted streams rather than a sort. It is not built, because it is a schema change that is additive under §7 rule 3 (a new GSI, or a dual-written attribute) and because a deployment that needs it has a shape this store should be told about rather than guess at. The shard count would be `Options`-level.
 - **Everything else** (`USER#`, `SESSION#`, `REFRESH#`, `EMAIL#`, `OAUTH#`) is keyed on random ids or hashes and distributes uniformly.
 
 ### 6.3 Item size and write amplification

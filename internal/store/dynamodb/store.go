@@ -57,6 +57,52 @@ const (
 	// an incident, not a page to render, so the store refuses rather than
 	// silently truncating.
 	DefaultMaxSessionsPerUser = 1000
+
+	// DefaultMaxTenants caps TenantStore.GetAllTenants, the first of the two
+	// interfaces §8.6 left open.
+	//
+	// A thousand, and the number is chosen against the partition rather than
+	// against the screen: every tenant is one item in the single TENANTS
+	// partition (§2.3), so a deployment with six figures of tenants has a hot
+	// partition long before it has a slow listing, and the cap is where this
+	// store says so. The route above it renders a table; nobody reads four
+	// digits of rows.
+	DefaultMaxTenants = 1000
+
+	// DefaultMaxUsersPerTenant caps TenantStore.GetUsersForTenant, the second.
+	//
+	// Ten thousand rather than a thousand, because this one is genuinely a
+	// membership list and a tenant with ten thousand members is a customer, not
+	// an incident — where a tenant with ten thousand *tenants* is neither. It is
+	// still a refusal and not a truncation: a membership list that silently ends
+	// early is one the caller cannot tell from a complete one, and the caller
+	// here is an admin screen and, in the reference, a user-listing fallback.
+	DefaultMaxUsersPerTenant = 10000
+
+	// DefaultMaxMetadataKeysPerUser caps GetMetadata and ClearMetadata, whose
+	// interface likewise has no cursor.
+	//
+	// §6.3 asked for an aggregate byte cap per user instead. That is not what
+	// this is, and the change is deliberate: metadata is one item per key, so an
+	// aggregate cap could only be enforced by reading the whole set on every
+	// UpdateMetadata — turning the one write that has no read into a
+	// read-modify-write, to defend a limit that DynamoDB does not impose (the
+	// 400 KB item limit binds per item, and a Query result is not an item). What
+	// actually needs bounding is the aggregate GetMetadata returns, and a key
+	// count plus the per-value cap below bounds it.
+	DefaultMaxMetadataKeysPerUser = 1000
+
+	// DefaultTelemetryRetention is how long a recorded event lives before TTL
+	// reaps it, and — because a store cannot query what it has deleted — also
+	// the default lower bound of TelemetryStore.Query when the filter names no
+	// Since.
+	//
+	// Ninety days is the reference's own nothing: it ships no retention and no
+	// implementation, so the number is this port's. It is chosen so that the two
+	// meanings agree, which is the property that matters: a query with no time
+	// range returns everything the store still holds, exactly as
+	// MemoryTelemetryStore's does.
+	DefaultTelemetryRetention = 90 * 24 * time.Hour
 )
 
 // Options configures a Store. TableName is the only required field.
@@ -95,6 +141,26 @@ type Options struct {
 	// cursor. Defaults to DefaultMaxLinkedAccountsPerUser.
 	MaxLinkedAccountsPerUser int
 
+	// MaxPageWindow caps limit+offset on every offset-paged listing — the three
+	// v0.8.0 admin listers, APIKeyAdminStore.ListAll and
+	// WebhookAdminStore.ListWebhooks. Defaults to DefaultMaxPageWindow; see
+	// paging.go for why an offset needs a ceiling at all.
+	MaxPageWindow int
+
+	// MaxTenants caps GetAllTenants and MaxUsersPerTenant GetUsersForTenant.
+	// Default to DefaultMaxTenants and DefaultMaxUsersPerTenant.
+	MaxTenants        int
+	MaxUsersPerTenant int
+
+	// MaxMetadataKeysPerUser caps GetMetadata and ClearMetadata. Defaults to
+	// DefaultMaxMetadataKeysPerUser.
+	MaxMetadataKeysPerUser int
+
+	// TelemetryRetention is the TTL every recorded telemetry event is written
+	// with, and the default lower bound of a Query whose filter names no Since.
+	// Defaults to DefaultTelemetryRetention.
+	TelemetryRetention time.Duration
+
 	// Logger receives the once-per-process warnings this store emits. Defaults
 	// to slog.Default().
 	Logger *slog.Logger
@@ -125,6 +191,11 @@ type Store struct {
 	ttlGrace          time.Duration
 	maxSessions       int
 	maxLinkedAccounts int
+	maxPageWindow     int
+	maxTenants        int
+	maxUsersPerTenant int
+	maxMetadataKeys   int
+	telemetryTTL      time.Duration
 
 	log                  *slog.Logger
 	degradedOnce         sync.Once
@@ -152,6 +223,11 @@ func New(api API, opts Options) (*Store, error) {
 		ttlGrace:          opts.SessionTTLGrace,
 		maxSessions:       opts.MaxSessionsPerUser,
 		maxLinkedAccounts: opts.MaxLinkedAccountsPerUser,
+		maxPageWindow:     opts.MaxPageWindow,
+		maxTenants:        opts.MaxTenants,
+		maxUsersPerTenant: opts.MaxUsersPerTenant,
+		maxMetadataKeys:   opts.MaxMetadataKeysPerUser,
+		telemetryTTL:      opts.TelemetryRetention,
 		log:               opts.Logger,
 	}
 	if s.index == "" {
@@ -168,6 +244,21 @@ func New(api API, opts Options) (*Store, error) {
 	}
 	if s.maxLinkedAccounts == 0 {
 		s.maxLinkedAccounts = DefaultMaxLinkedAccountsPerUser
+	}
+	if s.maxPageWindow == 0 {
+		s.maxPageWindow = DefaultMaxPageWindow
+	}
+	if s.maxTenants == 0 {
+		s.maxTenants = DefaultMaxTenants
+	}
+	if s.maxUsersPerTenant == 0 {
+		s.maxUsersPerTenant = DefaultMaxUsersPerTenant
+	}
+	if s.maxMetadataKeys == 0 {
+		s.maxMetadataKeys = DefaultMaxMetadataKeysPerUser
+	}
+	if s.telemetryTTL == 0 {
+		s.telemetryTTL = DefaultTelemetryRetention
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -189,6 +280,7 @@ func (s *Store) CompatibilityNotes() []string {
 		"Re-linking a provider account that is already linked moves the binding and deletes the previous link id; the reference leaves the old id resolvable and still listed under its old owner (upstream nik2208/awesome-go-auth#37).",
 		"POST /link-verify answers INVALID_LINK_TOKEN for an expired account-link token, where the reference answers LINK_TOKEN_EXPIRED: the store refuses to return an entry past its deadline, so the route's own expiry branch is never reached (data-model.md §4.5).",
 		"Mail templates list sorted by id and UI translations sorted by page, which GET /admin/api/templates/mail and /ui will expose once the admin surface is mounted; the reference lists both in first-insertion order (data-model.md §1.6).",
+		"Listing users without naming a tenant orders them by tenant then id, which GET /admin/api/users and the first-user access policy will expose once the admin surface is mounted; the reference's normative order is id alone (data-model.md §1.4 #47).",
 	}
 	if s.consumeOnRead {
 		notes = append(notes,

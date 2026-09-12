@@ -2,6 +2,8 @@ package dynamodb
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -140,9 +142,10 @@ var reservedMetadataKeys = []struct{ key, attr string }{
 }
 
 // maxUserCollectionItems caps the unconditioned Query over USER#<t>#<u>. The
-// collection is bounded by design — only META#, PROFILE and ROLE# live there —
-// so this is a tripwire for a future child type that broke that rule, not a
-// paging limit anyone should hit.
+// collection is bounded by design — only PROFILE and ROLE# live there, metadata
+// having moved to its own partition because UserMetadataStore carries no tenant
+// (§1.4, corrected) — so this is a tripwire for a future child type that broke
+// that rule, not a paging limit anyone should hit.
 const maxUserCollectionItems = 2000
 
 // profileItem encodes a whole auth.User. Optional values are omitted rather than
@@ -156,6 +159,22 @@ func profileItem(u auth.User) item {
 		sAlways(attrUserID, u.ID).
 		sAlways(attrTenantID, u.TenantID).
 		sAlways(attrEmail, u.Email).
+		// The admin user directory (data-model.md §1.4 #47). A constant GSI1
+		// partition key and a <tenantID>#<id> sort key are what make
+		// AdminUserStore.ListUsers a Query in both of its forms; see ListUsers
+		// and userGSI1SK.
+		//
+		// Written here and nowhere else, which is the whole reason this costs
+		// nothing after registration: profileItem is only ever used by
+		// CreateUser — every other write to a profile is an UpdateItem with an
+		// explicit attribute list — and DynamoDB writes to a GSI only when an
+		// indexed or projected attribute changes. Neither of these two ever
+		// changes for a given user (a user's tenant and id are its main-table
+		// partition key and no method moves either), and nothing else on the
+		// profile is projected, so the busiest item in the table pays one index
+		// write in its life.
+		sAlways(attrGSI1PK, gsi1AllUsersPK).
+		sAlways(attrGSI1SK, userGSI1SK(u.TenantID, u.ID)).
 		s(attrPasswordHash, u.PasswordHash).
 		s(attrPhoneNumber, u.PhoneNumber).
 		s(attrFirstName, u.FirstName).
@@ -609,6 +628,15 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 		return err
 	}
 	keys = append(keys, sessionKeys...)
+	// Each session's directory entry (sessionIndexItem) lives beside it in the
+	// same partition, so it needs no query of its own — but it does need
+	// deleting, or GetAllSessions would go on offering an entry that resolves to
+	// nothing for as long as its TTL takes to fire. pagedIndexQuery is written to
+	// survive exactly that, which is why this is tidiness rather than
+	// correctness; it is still not garbage worth leaving behind.
+	for _, k := range sessionKeys {
+		keys = append(keys, key(getS(k, attrPK), skSessionIndex))
+	}
 
 	// The OAuth bindings and their by-id pointers (data-model.md #6, "links").
 	// Swept whether or not this deployment wired the LinkedAccountStore: the items
@@ -629,6 +657,107 @@ func (s *Store) DeleteUser(ctx context.Context, userID, tenantID string) error {
 		return wrap("delete user", err)
 	}
 	return nil
+}
+
+// AdminUserStore is discovered by type assertion on the user store
+// (Service.ListUsers), so a drifted signature here does not fail a build: M8's
+// GET /admin/api/users simply starts answering the reference's 501, and the
+// 'first-user' access policy — which is `listUsers(1, 0)[0]` — starts answering
+// that nobody is an administrator. See interfaces.go for the convention.
+var _ auth.AdminUserStore = (*Store)(nil)
+
+// ListUsers implements auth.AdminUserStore: one page of users, ID-ordered
+// within a tenant, optionally scoped to one (data-model.md §1.4 #47).
+//
+// # The index, and why it is not partitioned by tenant
+//
+// Every profile carries GSI1PK = "USER" — a constant — and
+// GSI1SK = "<tenantID>#<id>". The unscoped form is then a Query with no
+// sort-key condition and the scoped form the same Query with
+// begins_with(GSI1SK, tenantID+"#"). A tenant-partitioned index would serve the
+// scoped form better and force a cross-partition Scan for the unscoped one,
+// which is the form both of the reference's consumers use: GET /admin/api/users
+// takes no tenant parameter at all (admin.router.ts:748), and the 'first-user'
+// policy asks for `listUsers(1, 0)`.
+//
+// This replaces what §1.4 #47 originally specified — a page of
+// GetUsersForTenant plus a BatchGet of profiles. That design cannot answer the
+// unscoped form, and for the scoped one it answers out of the membership table,
+// which is precisely the reachability dead end this interface exists to route
+// around: a single-tenant deployment whose tenant has no membership rows had
+// nothing to page through at all. §1.4 is corrected to this.
+//
+// Two costs, neither of them papered over:
+//
+//   - The constant partition key is a hot key under write load. Here that means
+//     one GSI write per *registration* and none per login, token issue or
+//     profile edit (see profileItem), so the ceiling is a registration rate, not
+//     a request rate. Sharding it across USER#0..USER#n is the usual answer and
+//     costs an n-way merge on every read to keep the order; §6.2 carries the
+//     numbers and the escape hatch.
+//   - offset is positional, and no key-value store can seek to the Nth item:
+//     offset N costs reading and discarding N index entries (not N users —
+//     pagedIndexQuery never resolves what it skips). Bounded, since the route
+//     clamps limit to 100 and Options.MaxPageWindow clamps limit+offset, but
+//     real. The only signature that removes it is a cursor, which cannot express
+//     the reference's `total` arithmetic and would change the wire.
+//
+// # Ordering
+//
+// The core's normative order is ID ascending. A <tenantID>#<id> sort key gives
+// (TenantID, ID) for the unscoped listing, which the upstream author predicted
+// and left to "the downstream store's register"; CompatibilityNotes carries it.
+// The **scoped** form is unaffected — inside one tenant the order is exactly ID
+// ascending — and so is every single-tenant deployment, where all users share
+// one tenant value and the two orders are the same order.
+//
+// # The empty tenant
+//
+// An empty tenantID means *no filter*: every user, in every tenant, including
+// users whose own tenant is empty. That is the one place in this package where
+// an empty tenant is a wildcard rather than a literal, and it is the core's
+// reading rather than this store's invention — the reference's signature carries
+// no tenant at all, so "every user" has to be expressible. It is also why this
+// method does not go through checkTenant: refusing an empty tenant in
+// multi-tenant mode, which is what that helper does everywhere else, would make
+// the admin user list unusable in exactly the deployment that has more than one
+// tenant. A non-empty tenant is still validated, so it cannot forge a key.
+func (s *Store) ListUsers(ctx context.Context, tenantID string, limit, offset int) ([]auth.User, error) {
+	in := &awsddb.QueryInput{
+		TableName:                aws.String(s.table),
+		IndexName:                aws.String(s.index),
+		KeyConditionExpression:   aws.String("#GSI1PK = :pk"),
+		ExpressionAttributeNames: exprNames(attrGSI1PK),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": avS(gsi1AllUsersPK),
+		},
+	}
+	if tenantID != "" {
+		if !idPattern.MatchString(tenantID) {
+			return nil, fmt.Errorf("%w: tenant %q", ErrInvalidIdentifier, tenantID)
+		}
+		in.KeyConditionExpression = aws.String("#GSI1PK = :pk AND begins_with(#GSI1SK, :prefix)")
+		in.ExpressionAttributeNames = exprNames(attrGSI1PK, attrGSI1SK)
+		in.ExpressionAttributeValues[":prefix"] = avS(tenantID + keySep)
+	}
+
+	// The profile indexes itself, so an index entry names its own item.
+	items, err := s.pagedIndexQuery(ctx, in, limit, offset, canonicalKeyOfEntry)
+	if err != nil {
+		if errors.Is(err, ErrPageWindowTooLarge) {
+			return nil, err
+		}
+		return nil, wrap("list users", err)
+	}
+	out := make([]auth.User, 0, len(items))
+	for _, m := range items {
+		u, err := userFromItem(m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, nil
 }
 
 // updateExpression joins the SET and REMOVE clauses, omitting an empty one:
