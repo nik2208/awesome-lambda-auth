@@ -149,7 +149,15 @@ list whose behaviour has no counterpart upstream at all: the reference ships no
 limiter, so there was nothing to inherit and every default is this product's.
 Configuring the block now changes what a deployment does instead of refusing it —
 and, because `rateLimit.enabled` defaults to `true`, so does configuring nothing.
-**The three left on the list are `ui`, `admin` and `tools`.**
+
+`ui` is the latest to go (§15), and it is the first domain to leave this list
+that adds a *surface* rather than changing one: with `ui.enabled` set, the
+imported adapter mounts the reference's whole UI router at `<prefix>/ui` — the
+config document, the server-rendered pages and the vendored assets — and the
+same flag re-points every emailed link at a hosted page. It is also the first
+whose surface reads the settings store on every request rather than once at cold
+start; §15.1 says what that costs and what a store failure looks like from
+outside. **The two left on the list are `admin` and `tools`.**
 
 `stores.migration` (§13) never appeared on that list and never will: it is new in
 this release and is wired by the same change that declared it, so there was never
@@ -1351,7 +1359,196 @@ costs the budget it protects, and a suite that exhausted a live one would flake
 and would leave the deployment throttled for whoever called next. See
 [test/contract/README.md](../test/contract/README.md).
 
-## 15. Two worked postures
+## 15. `ui.*`, knob by knob
+
+The hosted UI: everything under `GET <prefix>/ui` — the config document the
+pages boot from, the server-rendered pages themselves, and the static assets
+under them. It is the whole of the reference's `ui` router
+(`src/router/ui.router.ts`), mounted where the reference mounts it
+(`src/router/auth.router.ts:1640`), and it comes from the imported adapter:
+nothing in this binary mounts a route under the api prefix.
+
+The pages are the reference's own fourteen browser assets, vendored byte for
+byte by `awesome-go-auth` and compiled into the binary. There is no bucket to
+deploy them to, no second origin and no build step — which is the point of §15.3
+below.
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `ui.enabled` | boolean | `false` | `AWESOME_AUTH_UI_ENABLED` |
+| `ui.headless` | boolean | `false` | `AWESOME_AUTH_UI_HEADLESS` |
+| `ui.customCss` | string | none | — (file-only) |
+| `ui.assetsDir` | string (directory) | none; the vendored assets | — (file-only) |
+| `ui.uploadDir` | string (directory) | none; **accepted and not honoured**, see §15.4 | `AWESOME_AUTH_UI_UPLOAD_DIR` |
+| `ui.branding.siteName` | string | `Awesome Node Auth` | `AWESOME_AUTH_UI_SITE_NAME` |
+| `ui.branding.primaryColor` | string | `#4a90d9` | `AWESOME_AUTH_UI_PRIMARY_COLOR` |
+| `ui.branding.secondaryColor` | string | `#6c757d` | `AWESOME_AUTH_UI_SECONDARY_COLOR` |
+| `ui.branding.logoUrl` | string | none | `AWESOME_AUTH_UI_LOGO_URL` |
+| `ui.branding.bgColor` / `.bgImage` / `.cardBg` | string | none | `AWESOME_AUTH_UI_BG_COLOR`, `…_BG_IMAGE`, `…_CARD_BG` |
+
+`ui.enabled` is one switch for two things, and the second is easy to miss: it
+also changes the shape of **every emailed link**. With it on, a password-reset
+mail points at `<siteUrl><prefix>/ui/reset-password?token=…`, the hosted page for
+it; with it off, at `<siteUrl><prefix>/reset-password?token=…`, the API route
+itself (`HTTPConfig.UILink`, the reference's `buildUiLink`,
+`auth.router.ts:261-271`). Turning the UI off on a deployment whose users have
+unspent reset links in their inbox invalidates the *destination* of those links,
+not the tokens.
+
+There is no `features` knob and there will not be one. The eight flags in the
+config document — `register`, `magicLink`, `sms`, `google`, `github`,
+`forgotPassword`, `verifyEmail`, `twoFactor` — are derived from what this
+deployment is actually wired to do, so they cannot claim a flow it cannot
+perform. `config-schema.md` §1.12 records that as a rule rather than an omission.
+
+### 15.1 What the cold start tells you, and what the settings store now costs
+
+`hosted UI mounted` names the mount, the asset source, the language, the site
+name and whether the settings store is behind the branding. `hosted UI not
+mounted` — the default — says that the whole subtree answers 404 and that
+emailed links therefore point at the API routes.
+
+The line worth reading twice is `the settings store is on the UI render path`.
+**This is the first block whose surface reads the settings store per request.**
+The core builds the config document by reading that store first (the reference's
+own order, `ui.router.ts:99`) and then the template store for the `config` page's
+translations — so with the UI on and both stores enabled, **every SSR page render
+and every `GET <prefix>/ui/config` is two DynamoDB reads**. Before this, the
+settings store was read once at cold start by the seed (§11) and once per
+`POST <prefix>/2fa/disable`.
+
+And a settings store that fails does not fail the request. The core catches it
+and serves the reference's fallback document — default branding, English, no
+translations, and a **shorter** `features` object carrying three of the eight
+flags, which is upstream's bug reproduced rather than fixed. A client cannot tell
+that from success. So an unreachable store degrades every page of the hosted UI
+to the reference's default look, silently; the cold-start line is the notice you
+get in advance.
+
+One thing that interaction does *not* change: what §11's seed writes.
+`runtimeSettings` has no `ui` member, so the stored branding an administrator
+will eventually save is written by the admin surface and by nothing in this
+build. Until then the store's `ui` block is absent on every read and the branding
+falls straight through to `ui.branding.*`.
+
+### 15.2 `ui.headless` serves no HTML at all
+
+Headless is a different product, not a degraded one. With it on, the router
+serves the config document and the static assets and **no page** — every page
+path 404s (`ui.router.ts:172-183`; the return is the behaviour, and the uploaded
+asset mounts are on the far side of it, so they are not mounted either).
+
+That is the posture for a hosting SPA: your application provides its own login
+UI, loads `<prefix>/ui/auth.js` from this origin, and reads `headless: true` out
+of the config document to stop redirecting to a login page that is not there. It
+is the right answer when you already have a design system and the wrong one if
+you wanted the built-in pages, and the two are indistinguishable from a status
+code — which is why the cold start says which it is.
+
+### 15.3 What a hosting page has to allow, and what the pages load
+
+There is no `Content-Security-Policy` on these responses, and that is not an
+oversight — the reference sets none, and a header this port invented would be a
+deviation on a surface whose whole purpose is to be the family's page. What
+matters instead is what the pages *do*, because that is what a hosting
+application's own policy has to permit:
+
+- **An inline `<script>`, always.** The SSR injection writes
+  `window.__AUTH_CONFIG__ = {…}` into the document (`ui.router.ts:273`) so the
+  page boots without waiting for a fetch. A policy with no `script-src
+  'unsafe-inline'`, and no nonce, breaks every page.
+- **An inline `<style>`, always, twice.** The branding variables go into a
+  `:root` block ahead of any stylesheet, which is what prevents a flash of
+  unstyled content, and the readiness splash brings its own.
+- **`ui.customCss` is injected unescaped**, in a `<style>` of its own
+  (`ui.router.ts:216`). It is stylesheet source and there is nothing to escape it
+  into; a `</style>` inside it closes the block, here exactly as there. It is
+  readable only from the static configuration — no settings store can reach it —
+  so the string is always your own code.
+- **`ui.branding.logoUrl` is written into `src="…"` unescaped**, which is the
+  reference's sink reproduced. A value containing a double quote escapes the
+  attribute. Today that value can only come from this document or from a settings
+  store nothing in this build writes; the core names it explicitly so that the
+  admin surface has to decide about it rather than inherit it.
+- **Everything else is same-origin.** The assets are served from
+  `<prefix>/ui/…` by this deployment. No CDN, no external font, nothing to
+  allowlist — which is the opposite of the documentation surface (§12.3) and
+  worth the contrast.
+
+The injected object itself is serialised with Go's default escaping, so `<`, `>`
+and `&` leave as `<`, `>` and `&`. The bytes differ from
+`JSON.stringify`'s and the parsed value does not; it is the upstream deviation
+`ui-ssr-config-json-is-html-escaped` ([deviations.md](deviations.md)), and it is
+the one place the port is *stricter* than the reference — a `</script>` inside a
+branding string cannot end the block.
+
+**Headless and a hosting SPA.** If your application serves its own pages, none of
+the above applies to it: it loads `auth.js` from this origin and writes its own
+markup, so its CSP is its own. What it does need from this origin is the config
+document, which is a plain `GET` with no credential, and the cookies the auth
+routes set — which means the SPA and this deployment want to be the same origin,
+or the cookies want a shared parent domain and `cookies.sameSite` set
+accordingly. `infra/sam/template.yaml`'s `EnableCloudFront` exists for exactly
+that: one hostname in front of both.
+
+### 15.4 `ui.assetsDir`, and `ui.uploadDir` which is not honoured
+
+**`ui.assetsDir`** replaces the built-in pages with your own. It is file-only —
+a path inside the deployment artifact, the same position `email.templatesDir` is
+in — because a Lambda's only readable filesystem is the package it was deployed
+with.
+
+It is all-or-nothing. The core takes a supplied asset set at its word and never
+falls back to the vendored one, on the grounds that a half-replaced UI is worse
+than a missing one, so a page your directory lacks is a 404 rather than the
+built-in page. A directory that is not there, or that holds none of the three
+pages the handler falls back to — `login.html`, `index.html`, `index.csr.html`,
+tried in that order — **refuses the deployment at cold start**, naming the three.
+That refusal exists because the alternative is a stack that 404s every page while
+every health check passes.
+
+**`ui.uploadDir` is accepted by the schema and honoured by nothing.**
+`GET <prefix>/ui/assets/logo/*` and `GET <prefix>/ui/assets/uploads/*` answer 404
+in every configuration, which is the core's own unconfigured behaviour — the two
+mounts do not exist, rather than failing on a store that is not there. Setting
+the knob is reported at cold start as a knob this build does not act on.
+
+Three reasons, and the first is decisive on its own. **There is no writer:** the
+upload route is an admin route, this build mounts none, so a read path would read
+an empty location on every deployment. **A directory is the wrong noun here:**
+`/var/task` is read-only and `/tmp` is per execution environment, so a logo
+uploaded during one cold start would be invisible to the next request and gone by
+the one after — the serverless shape is an S3 location, which `config-schema.md`
+§1.12 already records, and that is a different thing behind the same knob.
+**And an `fs.FS` over S3 costs a `GetObject` per `Open`,** misses included, on a
+path every page of the hosted UI requests whether or not anyone ever uploaded
+anything. Registered as `ui-uploaded-assets-are-not-served`
+([deviations.md](deviations.md)).
+
+Until the upload store lands, set `ui.branding.logoUrl` to a URL you host
+elsewhere. This build honours it and writes it into every rendered page.
+
+### 15.5 The caveat that matters right now
+
+**Leave `ui.enabled` off on a deployed stack until the admin surface lands, and
+know why.**
+
+The vendored assets are the reference's, complete — which means they include
+`admin.js` and `admin.css`, and the pages reference `/admin/*` and `/tools/*`
+routes that **this build does not mount**. The `admin` and `tools` domains are
+still refused by the phase gate. So a deployment that turns the UI on today gets
+working login, registration, password-reset, magic-link, verification and 2FA
+pages, and an admin dashboard that loads and then fails against routes that
+answer 404.
+
+Nothing about that is a bug in this block: the UI is servable, configurable and
+tested, and the login half genuinely works. It is a gap between a complete asset
+set and an incomplete route surface, and it closes when the admin and tools
+surfaces land. Until then the stack template's own configuration leaves the UI
+off, deliberately, and this paragraph is here so that turning it on is a decision
+rather than a discovery.
+
+## 16. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that
