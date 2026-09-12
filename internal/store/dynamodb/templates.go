@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsddb "github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -184,7 +183,7 @@ func (s *Store) UpdateMailTemplate(ctx context.Context, id string, patch auth.Ma
 			return auth.MailTemplate{}, fmt.Errorf("%w: %q would be %d bytes, limit %d", ErrTemplateTooLarge, id, n, MaxTemplateBytes)
 		}
 
-		err = s.putTemplateItem(ctx, it, observed)
+		err = s.putIfUnchanged(ctx, it, observed)
 		if err == nil {
 			return tpl, nil
 		}
@@ -309,47 +308,6 @@ func (s *Store) listTemplateItems(ctx context.Context, prefix, op string) ([]map
 		return nil, wrap(op, err)
 	}
 	return items, nil
-}
-
-// putTemplateItem is the conditional write behind UpdateMailTemplate. With no
-// token observed the condition is that none exists — which is also true of an
-// absent item, so create and "an item somebody wrote by hand without a token"
-// are one case; with one observed, it must still be the one. ALL_OLD on failure
-// is what lets the caller retry from the current item without a second read.
-func (s *Store) putTemplateItem(ctx context.Context, it item, observed string) error {
-	in := &awsddb.PutItemInput{
-		TableName:                           aws.String(s.table),
-		Item:                                it,
-		ConditionExpression:                 aws.String("attribute_not_exists(#updatedAt)"),
-		ExpressionAttributeNames:            exprNames(attrUpdatedAt),
-		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
-	}
-	if observed != "" {
-		in.ConditionExpression = aws.String("#updatedAt = :observed")
-		in.ExpressionAttributeValues = map[string]types.AttributeValue{":observed": avS(observed)}
-	}
-	_, err := s.api.PutItem(ctx, in)
-	return err
-}
-
-// nextStamp is the lock token a successful patch writes. It is the clock,
-// unless the clock has not moved past the token observed — a pinned test clock,
-// a coarse one, or a wall clock lagging the previous writer's — in which case it
-// is one nanosecond past that token. The condition compares tokens for equality,
-// so a token that failed to change would let the next stale patch through, and
-// that is the one thing the token exists to prevent.
-func (s *Store) nextStamp(observed string) string {
-	stamp := formatTime(s.nowUTC())
-	if stamp > observed {
-		return stamp
-	}
-	last, err := parseTime(observed)
-	if err != nil {
-		// Not a timestamp at all, so it cannot equal one; the clock's value is
-		// already distinct from it.
-		return stamp
-	}
-	return formatTime(last.Add(time.Nanosecond))
 }
 
 // mailTemplateBase is what a patch is applied to: the stored template, or the
