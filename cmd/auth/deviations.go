@@ -129,7 +129,7 @@ func WireDeviations() []WireDeviation {
 				"nil-means-absent gives the right granularity for free. Seeding only declared keys follows from the " +
 				"same argument: writing a schema default into a runtime-mutable store is not starting from a declared " +
 				"state but inventing one, and it would make a seed added to the document later inert on arrival.",
-			Spec: "docs/spec/config-schema.md §1.19; docs/config-reference.md §12; docs/spec/decisions.md D-17 (the templates sibling)",
+			Spec: "docs/spec/config-schema.md §1.19; docs/config-reference.md §11; docs/spec/decisions.md D-17 (the templates sibling)",
 		},
 		{
 			ID:      "oauth-callback-skips-the-second-factor",

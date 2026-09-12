@@ -792,7 +792,94 @@ it here: the auth core needs one to build, and the verifier's cookie path reads
 it. The cold start refuses by name rather than letting the core complain about a
 knob you were told to leave out.
 
-## 11. Two worked postures
+## 11. `runtimeSettings.*`, knob by knob
+
+The one block of this document that an administrator changes without a
+deployment. Everything else here is fixed at cold start; these three keys are
+seeds for a store the admin surface patches at run time.
+
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `runtimeSettings.require2fa` | boolean | `false` | `AWESOME_AUTH_RUNTIME_SETTINGS_REQUIRE_2FA` |
+| `runtimeSettings.enabledWebhookActions` | string[] | none (absent, which is not the same as `[]`) | `AWESOME_AUTH_RUNTIME_SETTINGS_ENABLED_WEBHOOK_ACTIONS` |
+| `runtimeSettings.lazyEmailVerificationGracePeriodDays` | integer | `7` | `AWESOME_AUTH_RUNTIME_SETTINGS_LAZY_EMAIL_VERIFICATION_GRACE_PERIOD_DAYS` |
+
+Any of them needs `stores.enable.settings`, and a document that declares one
+without it is refused by name (rule `STORE_REQUIRED`). Both drivers back the
+store: the DynamoDB one keeps it as a single item on its own `SETTINGS`
+partition ([data-model.md](spec/data-model.md) §1.8), the memory driver holds it
+per execution environment — which for this block is worse than for the others,
+since an administrator's toggle is then invisible to every other environment and
+gone on the next cold start. RS-12 already refuses the memory driver in
+production.
+
+The store may also be switched on with no `runtimeSettings` block at all. That
+is a normal deployment: the settings start empty and the admin surface fills
+them.
+
+### 11.1 The seed is a seed, and the store wins forever after
+
+The document is applied **once per key, and only to keys the store does not
+already hold**. A value an administrator saves through the admin surface is
+never overwritten by a redeploy — not on the next cold start, and not on any
+later one. Registered as the deviation
+`runtime-settings-seed-only-fills-absent-keys` ([deviations.md](deviations.md)),
+the sibling of `templates-dir-only-seeds-absent-ids`.
+
+Two consequences worth knowing before you write the block.
+
+**Changing a seeded value in the document does nothing.** Once the key is in the
+store, the document has no further say. Change it through the admin surface, or
+delete the key from the store.
+
+**A key left at its default is not seeded**, and that is what keeps the block
+usable over time: adding `require2fa: true` to a document months from now is
+applied on the next cold start, because nothing ever wrote that key. Had the
+schema's own `false` been seeded on day one, the later declaration would have
+arrived inert. "Declared" therefore means *moved off the default*, which is the
+same test that decides whether the block requires the store.
+
+A corollary for `enabledWebhookActions`: **absent and `[]` are different
+declarations.** Absent says nothing and seeds nothing; `[]` is the administrator
+switching every inbound-webhook action off, and it is seeded, stored and served
+as an explicit empty list. The core carries a custom encoder to keep that
+difference alive, and so does the store.
+
+### 11.2 What this build actually reads
+
+One key, on one route. `require2fa` is consulted by
+`POST <prefix>/2fa/disable`, which answers `403` `2FA_REQUIRED` when it is true —
+the reference's behaviour at `auth.router.ts:890-896`. It is a *system policy*
+term, so it refuses the disable regardless of whether that account has a second
+factor enabled.
+
+The other two are stored and handed back, and nothing in this build acts on
+them. Both are named, with their paths, in the cold-start log:
+
+- `enabledWebhookActions` is the global allowlist the inbound-webhook sandbox
+  intersects with each webhook's own `allowedActions`. No tools router is
+  mounted here yet (P7), so the list is stored and read by nothing.
+- `lazyEmailVerificationGracePeriodDays` is read by nothing **here or in the
+  reference**: the reference's admin UI displays it and its server never computes
+  a verification deadline from it ([config-schema.md](spec/config-schema.md)
+  §1.19 `[MISMATCH]`), and the imported core stores it and hands it back
+  unchanged. Seed it if you want the admin surface to show a declared value; do
+  not expect a login to be refused on it.
+
+Leave both set if the same document is deployed to another port in the family —
+nothing in this build reads them, and both become live here without the document
+changing.
+
+**Two keys the reference's settings store has and this block does not.**
+`requireEmailVerification` and `emailVerificationMode` are storable through the
+admin surface and are §1.19's other `[MISMATCH]` row: no login path reads them,
+in the reference or here. The knob that does decide a login on this deployment is
+`email.verification.mode` (§5), and it is deliberately not copied into the
+settings store — a second place for the same non-effect to be discovered from is
+worse than none. The branding keys under `ui.*` belong to the settings store too
+and arrive with the hosted UI.
+
+## 12. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that
