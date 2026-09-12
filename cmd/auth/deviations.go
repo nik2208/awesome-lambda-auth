@@ -132,6 +132,31 @@ func WireDeviations() []WireDeviation {
 			Spec: "docs/spec/config-schema.md §1.19; docs/config-reference.md §11; docs/spec/decisions.md D-17 (the templates sibling)",
 		},
 		{
+			ID:      "docs-page-carries-a-content-security-policy",
+			Surface: "the response headers of GET <prefix>/docs and GET <prefix>/openapi.json",
+			Behaviour: "Both documentation responses carry a Content-Security-Policy, X-Content-Type-Options: nosniff " +
+				"and Referrer-Policy: no-referrer. The page's policy pins the one CDN origin the reference's HTML " +
+				"loads from and denies everything else -- no fetch or XHR off this origin, no image beacon, no form " +
+				"action, no nested frame, no framing of the page itself, no rewritten base URL. The document's policy " +
+				"is default-src 'none' with the same framing and base-URI denial. The routes, their bodies and their " +
+				"status codes are untouched.",
+			Reference: "Neither route sets any header beyond Content-Type (auth.router.ts:1658-1677), so the Swagger " +
+				"page runs swagger-ui-dist@5 from the unpkg CDN, unpinned and without subresource integrity, with " +
+				"no policy of any kind (openapi.ts:1646-1669).",
+			Why: "That script runs same-origin with this deployment's auth cookies, and the CSRF cookie is readable " +
+				"from JavaScript by design, because the double-submit pattern requires the client to read it -- so a " +
+				"bad day at the CDN is a credential-reading script on the auth origin. The honest fix is not ours to " +
+				"make: the core mounts the page and the machine-readable document under one bool, this binary may add " +
+				"no route under the api prefix, and the core is not forked, so the product can neither serve the " +
+				"document without the page nor replace the page's HTML. A header middleware adds no route and is what " +
+				"is left. It is narrowing, not closure, and the entry says so: a compromised bundle can still read a " +
+				"cookie and still leak it through a top-level navigation, which no CSP directive in any shipping " +
+				"browser prevents. What it removes are the silent channels. cmd/auth/docs_test.go " +
+				"TestDocsPolicyCoversEveryOriginTheCorePageLoads fails the day the core's page loads from anywhere " +
+				"else, which is when this policy would otherwise break the page instead of protecting it.",
+			Spec: "docs/spec/config-schema.md §1.18; docs/config-reference.md §12; upstream deviation docs-routes-are-opt-in",
+		},
+		{
 			ID:      "oauth-callback-skips-the-second-factor",
 			Surface: "GET <prefix>/oauth/{provider}/callback, for an account with a second factor enabled",
 			Behaviour: "The callback issues a session and redirects, for every account it resolves. " +

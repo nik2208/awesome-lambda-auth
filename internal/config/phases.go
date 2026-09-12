@@ -95,6 +95,19 @@ type domain struct {
 // while it does nothing at all, and a knob inside a wired domain is reported
 // while the core cannot act on it.
 //
+// The documentation surface (P6's second block) closed `docs`. `docs.swagger`
+// — true, false or auto — decides whether the imported adapter mounts
+// GET <prefix>/openapi.json and GET <prefix>/docs, and `auto`, which is the
+// schema default, is resolved against `deployment.environment`: on outside
+// production, off in it (cmd/auth docs.go, which argues why the resolution
+// belongs to the host and not to the core). `docs.basePath` reaches the core's
+// DocsOptions.BasePath unchanged and moves what the served document describes,
+// never where the two routes are mounted. Neither knob is refused any more and
+// neither is reported as unwired: the whole block is honoured. What survives of
+// the old refusal is a warning, on the one configuration that is a hazard rather
+// than a mistake — the Swagger page served in production, which puts an unpinned
+// CDN bundle on the auth origin (collectWarnings, load.go).
+//
 // A knob inside a wired domain that the imported core cannot honour is a
 // different thing again, and is reported by cmd/auth's unwiredKnobs at cold
 // start rather than refused here — which is where the mailer's endpoint and API
@@ -129,11 +142,6 @@ func unwiredDomains() []domain {
 			phase: "P7 (rate limiting)",
 			get:   func(c *Config) any { return c.RateLimit },
 		},
-		{
-			path:  "docs",
-			phase: "P6 (OpenAPI surface)",
-			get:   func(c *Config) any { return c.Docs },
-		},
 	}
 }
 
@@ -156,9 +164,13 @@ func checkPhaseGaps(c *Config, allow bool, d *diagnostics) {
 	defaults := Defaults()
 	// derive() has already run on the real Config, so the baseline has to go
 	// through it too or every derived value would read as operator intent. It
-	// also inherits the wired http block, because docs.basePath derives from
-	// http.apiPrefix: without this, customising the api prefix — which P1 does
-	// wire — would report the docs domain as configured.
+	// also inherits the wired http block, because derived values are computed
+	// from it: docs.basePath derives from http.apiPrefix, and without this line
+	// customising the api prefix — which P1 does wire — reported the docs domain
+	// as configured. That domain is wired now, and nothing left on the list
+	// derives from the http block, so today the line changes no answer. It stays
+	// because the next gated domain that gains a derived value would be a silent
+	// false positive, and this is the line that prevents it.
 	defaults.HTTP = c.HTTP
 	derive(defaults)
 

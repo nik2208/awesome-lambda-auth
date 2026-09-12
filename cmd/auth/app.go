@@ -254,8 +254,16 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err := mountAuthSurface(mux, core, cfg); err != nil {
 		return nil, err
 	}
+	logDocsSurface(cfg, log)
 
 	var handler http.Handler = mux
+	// The documentation responses carry a Content-Security-Policy. It is a
+	// middleware and not a route — it registers no pattern, so the adapter still
+	// owns every path under the api prefix — and it is the only thing this
+	// binary can do about the reference's Swagger page loading an unpinned
+	// third-party bundle onto the auth origin. docs.go argues what that buys and
+	// what it does not; with the routes unmounted it is the identity wrapper.
+	handler = docsSecurityHeaders(cfg)(handler)
 	// Refresh-token rotation replay detection needs a per-request precondition
 	// carrier installed on the request context: the DynamoDB store fills it in
 	// GetSessionByRefreshTokenHash and consumes it in UpdateSession so that two
@@ -432,6 +440,12 @@ type coreOptionSet struct {
 // and touches nothing else, which is what makes them mergeable in any order —
 // before this, every one of them appended to the same place and therefore
 // conflicted with every other.
+//
+// A reserved slot may also turn out to have nothing to hold, and `docs` is the
+// first: its block reaches the core entirely through HTTPConfig.Docs, so it
+// stays empty on purpose rather than being filled with an option invented to
+// fill it. That is a decision and not an omission, which is why the entry below
+// says so and why TestCoreOptionSetsAreOrderedAndReserved still lists it.
 func coreOptionSets(
 	ctx context.Context,
 	cfg *config.Config,
@@ -500,7 +514,14 @@ func coreOptionSets(
 			name:  "settings",
 			build: func() ([]auth.Option, error) { return settingsOptions(ctx, cfg, users, log) },
 		},
-		// docs.* — the OpenAPI document and the docs route.
+		// docs.* — the OpenAPI document and the Swagger page. Wired, and
+		// deliberately empty: there is no auth.Option for either route.
+		// awesome-go-auth puts the whole surface on HTTPConfig.Docs, which the
+		// adapter reads at mount time (docs.go, httpConfig), so the block is
+		// fully honoured without contributing anything to auth.New. Filling
+		// this slot would mean inventing an option for the sake of the slot.
+		// The slot itself stays, because it is the landing site the roadmap
+		// promised and moving it would move every later block's.
 		{name: "docs"},
 		// ui.* — the hosted UI and its config route.
 		{name: "ui"},
@@ -526,6 +547,12 @@ func coreOptionSets(
 // as a P6 domain, so today it is always false and every link points at the API
 // route; wiring it now means the link shape and the UI switch cannot drift
 // apart when the UI lands.
+//
+// Docs is where the whole documentation surface lives: the two routes the
+// adapter mounts under it are the entirety of what the `docs` block does, which
+// is why that block fills no core option slot. docs.go builds the value — it is
+// the one field here that is not a straight copy, because `docs.swagger` is
+// three-valued and DocsOptions.Enabled is a bool.
 func httpConfig(cfg *config.Config) auth.HTTPConfig {
 	return auth.HTTPConfig{
 		APIPrefix: cfg.HTTP.APIPrefix,
@@ -544,6 +571,11 @@ func httpConfig(cfg *config.Config) auth.HTTPConfig {
 		// it (auth.ResourceServerGatedRoutes). This is the half of the knob that
 		// changes the mounted surface; the verifier is App.ResourceServerGuard.
 		ResourceServer: cfg.ResourceServer.Enabled,
+		// The documentation surface: GET <prefix>/openapi.json and
+		// GET <prefix>/docs, both unguarded and both behind the CSRF
+		// middleware, registered by the adapter and by nothing here. docs.go
+		// resolves the three-valued docs.swagger knob onto this bool.
+		Docs: docsOptions(cfg),
 	}
 }
 

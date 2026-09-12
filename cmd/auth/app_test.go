@@ -698,8 +698,15 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 		t.Errorf("core option sets are %v, want %v", names, wantOrder)
 	}
 
-	// The slots no block has filled yet. Filling one means deleting its name
+	// The slots that contribute no option. Filling one means deleting its name
 	// from here in the same commit.
+	//
+	// `docs` is on this list for a different reason from the other three, and
+	// the difference is deliberate rather than pending: that block is wired, and
+	// it reaches the core entirely through HTTPConfig.Docs (docs.go, httpConfig),
+	// so there is no auth.Option for it to contribute and none was invented.
+	// If it ever leaves this list it must be because upstream grew an option,
+	// not because somebody assumed an empty slot meant unfinished work.
 	wantEmpty := []string{"docs", "ui", "admin", "tools"}
 	if strings.Join(empty, ",") != strings.Join(wantEmpty, ",") {
 		t.Errorf("unfilled core option slots are %v, want %v", empty, wantEmpty)

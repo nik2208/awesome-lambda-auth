@@ -313,3 +313,36 @@ func init() {
 		},
 	})
 }
+
+// ── the documentation surface, probed without a session for the same reason ──
+
+// CapDocs is the pair of documentation routes: GET <prefix>/openapi.json, the
+// generated OpenAPI document, and GET <prefix>/docs, the Swagger UI page that
+// reads it. A deployment either mounts both or mounts neither
+// (auth.router.ts:1651-1677, registered under one option; docs.swagger here).
+const CapDocs Capability = "docs"
+
+func init() {
+	registerCapability(capabilityDecl{
+		Name:  CapDocs,
+		Stage: stageProbed,
+		Probe: func(t *testing.T, p *probeRun) {
+			// Anonymous, and on the document rather than the page.
+			//
+			// Anonymous because neither route carries a guard of its own where
+			// the reference registers them — no auth middleware, no session,
+			// nothing to present a credential to — so both answer with no
+			// credential of any kind. Probing with p.LoggedIn would hide a
+			// deployment that had put them behind a session, which is exactly
+			// the difference this pass exists to see.
+			//
+			// On the document because that is the machine-readable half, the
+			// one a client generator or a gateway actually reads, and because
+			// one option mounts both: a deployment answering one and not the
+			// other is a fault and not a configuration, so the page's own case
+			// fails on it rather than skipping. If upstream ever splits the
+			// switch, this becomes two declarations.
+			p.Set(CapDocs, classify(p.Anon.GET(t, "/openapi.json")))
+		},
+	})
+}
