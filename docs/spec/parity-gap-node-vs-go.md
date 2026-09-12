@@ -1,5 +1,59 @@
 # Parity gap — awesome-node-auth (reference) vs awesome-go-auth
 
+> **Status, 2026-09-12 — this is a historical document.** It was written to
+> decide, in Phase 0, whether to build the Lambda product in Go, and every
+> number below is pinned to `awesome-go-auth@4b2fc5c` (July 2026). The port has
+> moved a long way since: eight tags, `v0.1.0` through `v0.7.0`, and CI.
+> **Do not read the matrix below as the current gap.** The measurement that is
+> current is the next section, and the one that will be authoritative from
+> `v1.0.0` is the generated table in the upstream README (`cmd/docgen`, X3).
+> The document is kept, rather than rewritten, because it is the record of a
+> decision and rewriting it would destroy that record.
+
+## Where parity actually stands (measured 2026-09-12, core `v0.7.0`)
+
+Counted, not asserted. The reference's side is every `router.<verb>('<path>')`
+registration in `src/router/*.router.ts`, normalised over path parameters and
+de-duplicated; the port's side is the route table its own conformance suite
+replays against all four adapters, `documentedRoutes` plus the five
+`conditionalRouteSet`s in `adapter/internal/wiretest/`.
+
+| Reference router | Routes | Served by the core at `v0.7.0` |
+|---|---|---|
+| `auth.router.ts` | 36 | **36 — all of them** |
+| `admin.router.ts` | 50 | 0 |
+| `tools.router.ts` | 7 | 0 |
+| `ui.router.ts` | 1 route (`GET /config`) plus three static mounts and one catch-all SSR middleware | the route; none of the serving |
+
+The auth surface reached parity at `v0.7.0`, which is new: at `v0.6.0` it was
+short by `GET /openapi.json` and `GET /docs`, and those landed as
+`HTTPConfig.Docs` (registered as the `docs-routes-are-opt-in` deviation, since
+the reference serves them wherever `NODE_ENV` is not exactly `production`). Two
+route shapes differ and neither is a gap: the reference registers
+`GET /oauth/google`, `GET /oauth/github` and their two callbacks as four literal
+paths, one pair per built-in strategy, where the core mounts
+`GET /oauth/{provider}` and `GET /oauth/{provider}/callback` and serves any
+provider the configuration names — a superset, not a substitute.
+
+The core also mounts five routes the reference has no counterpart for: the four
+OIDC endpoints of identity-provider mode — discovery, authorize, token,
+userinfo — beside the JWKS document, which *is* the reference's. They are
+excluded from the parity count in both directions for that reason.
+
+So the whole remaining gap is three things, in this order of size: the admin
+surface (50 routes, milestone M8), the tools surface (7 routes, M9), and serving
+the UI (M7, vendoring the reference's own 14 assets byte for byte rather than
+re-authoring them).
+
+A deployment of this product reaches a subset of the core's surface, because
+`internal/config/phases.go` still refuses six configuration domains — `ui`,
+`admin`, `docs`, `runtimeSettings`, `tools`, `rateLimit`. The 32 unconditional
+auth routes are served today, plus the JWKS document and the four OIDC endpoints
+when `idProvider` is configured. `docs/PROGRESS.md` is the live ledger of which
+block closes which gate.
+
+---
+
 **Purpose.** This document quantifies how much a Go-based Lambda port would inherit for free from `awesome-go-auth` versus what it would have to build, against the family reference `awesome-node-auth` v1.9.0. It is one of the inputs to the **Phase 0 language decision**. Every claim is code-verified at the pinned commits listed in [Provenance](#provenance); file:line references resolve against those SHAs (Node paths relative to the awesome-node-auth root, Go paths relative to the awesome-go-auth root).
 
 The one-sentence architectural summary: the Go port is a **service-layer library** (`Service` methods on a struct) with thin optional HTTP adapters, whereas the Node reference is **router-first** (four Express routers exposing the full wire contract). Most capabilities therefore exist in Go as callable, tested functions but have **no HTTP surface**, and the five routes that do exist diverge from the family wire contract in cookie names, JSON casing, response envelopes, and error bodies.
