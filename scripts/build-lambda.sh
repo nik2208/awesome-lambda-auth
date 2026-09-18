@@ -4,6 +4,8 @@
 #   ./scripts/build-lambda.sh                 # dist/auth-arm64.zip
 #   ARCH=amd64 ./scripts/build-lambda.sh      # dist/auth-amd64.zip
 #   OUT_DIR=/tmp/x ./scripts/build-lambda.sh
+#   LAMBDAS="auth sse webhook-worker" ./scripts/build-lambda.sh
+#                                             # one dist/<name>-<arch>.zip per cmd/<name>
 #   CONFIG_FILE=./awesome-auth.json TEMPLATES_DIR=./templates ./scripts/build-lambda.sh
 #                                             # bake a config document and mail templates in
 #
@@ -51,6 +53,15 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/dist}"
 
 mkdir -p "${OUT_DIR}"
+# LAMBDAS names the cmd/<name> mains to build, one artifact each, so that the
+# functions D9b, D9c and D9d add ship from the same script and the same image.
+# The default builds the auth function alone, which is what every existing
+# caller — CI, deploy.sh, the README — expects; a name with no cmd/<name>
+# directory refuses the whole run rather than producing an empty archive.
+LAMBDAS="${LAMBDAS:-auth}"
+for name in ${LAMBDAS}; do
+  [ -d "${REPO_ROOT}/cmd/${name}" ] || { echo "LAMBDAS names ${name}, but there is no cmd/${name}" >&2; exit 2; }
+done
 
 # SOURCE_DATE_EPOCH is the reproducible-builds convention. 2020-01-01T00:00:00Z
 # is an arbitrary fixed point; the value only has to be stable, and zip cannot
@@ -68,6 +79,7 @@ docker run --rm \
   -e "ARCH=${ARCH}" \
   -e "DEFAULT_ARCH=${DEFAULT_ARCH}" \
   -e "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
+  -e "LAMBDAS=${LAMBDAS}" \
   ${CONFIG_FILE:+-v "${CONFIG_FILE}":/bake/awesome-auth.json:ro} \
   ${TEMPLATES_DIR:+-v "${TEMPLATES_DIR}":/bake/templates:ro} \
   "${GO_IMAGE}" \
@@ -81,54 +93,46 @@ docker run --rm \
       apt-get install -y -qq --no-install-recommends zip unzip >/dev/null 2>&1
     fi
 
-    workdir="$(mktemp -d)"
-    trap "rm -rf ${workdir}" EXIT
-
-    CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
-      go build -trimpath -buildvcs=false -ldflags "-s -w" \
-      -o "${workdir}/bootstrap" ./cmd/auth
-
-    # provided.al2023 execs the file directly, so it has to be executable, and
-    # the zip has to record that bit.
-    chmod 0755 "${workdir}/bootstrap"
-
-    # Optional bake-ins. A configuration document (CONFIG_FILE=) and a mail
-    # templates directory (TEMPLATES_DIR=) travel inside the artifact, so what
-    # the function reads at /var/task is exactly what was built and checksummed;
-    # the template names them through AWESOME_AUTH_CONFIG_FILE and
-    # email.templatesDir.
-    if [ -f /bake/awesome-auth.json ]; then
-      cp /bake/awesome-auth.json "${workdir}/awesome-auth.json"
-    fi
-    if [ -d /bake/templates ]; then
-      cp -r /bake/templates "${workdir}/templates"
-    fi
-    find "${workdir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
-
-    out="/out/auth-${ARCH}.zip"
-    rm -f "${out}"
-    # -X drops the extra field, which carries the high-resolution mtime and the
-    # uid/gid of the build user; without it the archive differs per host.
-    (cd "${workdir}" && zip -q -X -r "${out}" .)
-
-    # The name infra/sam/template.yaml points its CodeUri at. Only the default
-    # architecture claims it, so an amd64 build cannot quietly take the slot an
-    # arm64 function is deployed from.
-    if [ "${ARCH}" = "${DEFAULT_ARCH}" ]; then
-      cp -f "${out}" "/out/auth-lambda.zip"
-    fi
-
-    echo "--- artifact ---"
-    ls -l "${out}"
-    unzip -l "${out}"
-    echo "--- binary ---"
-    go version -m "${workdir}/bootstrap" | head -3
-    echo "--- checksum ---"
-    sha256sum "${out}" | sed "s#/out/#${ARCH}: #"
+    build="$(mktemp -d)"
+    trap "rm -rf ${build}" EXIT
+    for name in ${LAMBDAS}; do
+      workdir="${build}/${name}"
+      mkdir -p "${workdir}"
+      CGO_ENABLED=0 GOOS=linux GOARCH="${ARCH}" \
+        go build -trimpath -buildvcs=false -ldflags "-s -w" \
+        -o "${workdir}/bootstrap" "./cmd/${name}"
+      chmod 0755 "${workdir}/bootstrap"
+      # A baked configuration document and mail templates belong to the auth
+      # function alone: no other binary reads a document at cold start, and
+      # shipping one inside a worker would only widen what a compromised
+      # worker can read.
+      if [ "${name}" = auth ]; then
+        if [ -f /bake/awesome-auth.json ]; then
+          cp /bake/awesome-auth.json "${workdir}/awesome-auth.json"
+        fi
+        if [ -d /bake/templates ]; then
+          cp -r /bake/templates "${workdir}/templates"
+        fi
+      fi
+      find "${workdir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+      out="/out/${name}-${ARCH}.zip"
+      rm -f "${out}"
+      (cd "${workdir}" && zip -q -X -r "${out}" .)
+      if [ "${ARCH}" = "${DEFAULT_ARCH}" ]; then
+        cp -f "${out}" "/out/${name}-lambda.zip"
+      fi
+      echo "--- artifact: ${name} ---"
+      ls -l "${out}"
+      unzip -l "${out}"
+      echo "--- binary ---"
+      go version -m "${workdir}/bootstrap" | head -3
+      echo "--- checksum ---"
+      sha256sum "${out}" | sed "s#/out/#${ARCH}: #"
+    done
   '
 
 echo
-echo "Built ${OUT_DIR}/auth-${ARCH}.zip"
+for name in ${LAMBDAS}; do echo "Built ${OUT_DIR}/${name}-${ARCH}.zip"; done
 echo "Deploy it with:"
 echo "  ./scripts/deploy.sh --profile <profile> --region <region>"
 echo
