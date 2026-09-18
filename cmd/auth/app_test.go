@@ -303,7 +303,7 @@ func TestInvalidConfigAbortsInit(t *testing.T) {
 		},
 		{
 			name: "a configured but unwired domain",
-			env:  with(baseEnv(), "AWESOME_AUTH_ADMIN_ENABLED", "true"),
+			env:  with(baseEnv(), "AWESOME_AUTH_TOOLS_ENABLED", "true"),
 			rule: config.RuleUnimplemented,
 		},
 	}

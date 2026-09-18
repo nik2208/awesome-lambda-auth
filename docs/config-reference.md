@@ -157,7 +157,22 @@ config document, the server-rendered pages and the vendored assets — and the
 same flag re-points every emailed link at a hosted page. It is also the first
 whose surface reads the settings store on every request rather than once at cold
 start; §15.1 says what that costs and what a store failure looks like from
-outside. **The two left on the list are `admin` and `tools`.**
+outside.
+
+`admin` is the latest to go (§16), secret prefix included, and it is the first
+whose surface is mounted *beside* the api prefix rather than under it: with
+`admin.enabled` set, the imported adapter mounts the core's console at
+`admin.basePath`. `admin.bootstrapSecret` and `admin.rootUser.passwordHash`
+supplied through their documented variables no longer trip the gate, because
+they are read. What refuses an admin block now is the block's own rules, which
+the gate used to pre-empt: RS-6 for a console enabled with neither a policy nor
+a bootstrap secret, or with a bootstrap secret too short to be one; RS-17 for
+`first-user` on every driver, and RS-10 for it on a driver that cannot list
+users at all; RS-18 for a session console beside `cookies.sameSite: none`; and
+the `stores.enable.rbac` requirement behind `rbac:<role>` and
+`permission:<perm>`. Two of its knobs are reported rather than honoured (§16.8),
+which is the other mechanism and not this one. **The one left on the list is
+`tools`.**
 
 `stores.migration` (§13) never appeared on that list and never will: it is new in
 this release and is wired by the same change that declared it, so there was never
