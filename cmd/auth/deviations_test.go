@@ -19,12 +19,16 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"csrf-enabled-by-default",
 		"docs-page-carries-a-content-security-policy",
 		"idp-kid-derived-from-key-material",
+		"inbound-webhooks-are-refused-without-a-runner",
+		"library-events-are-bridged-into-the-tools-fan-out",
 		"oauth-callback-skips-the-second-factor",
+		"outgoing-webhook-delivery-races-the-response",
 		"production-by-default",
 		"rate-limited-routes-answer-429",
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",
+		"tools-stream-is-not-mounted-on-api-gateway",
 		"ui-uploaded-assets-are-not-served",
 	}
 	var got []string

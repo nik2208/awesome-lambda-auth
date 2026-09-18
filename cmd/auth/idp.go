@@ -448,9 +448,16 @@ var idpMountedEndpoints = []string{
 // pass-through. This is also the only place the value is needed — the adapter
 // calls it once per route from here — so passing it down one call is cheaper
 // than making every other caller of httpConfig say it has none.
-func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, rl func(http.Handler) http.Handler) (err error) {
+//
+// tools is the tools router's options, and it arrives the same way for the
+// same reason: two of its access postures are middleware built over the core
+// and the store, which only the composition root has (tools.go,
+// toolsHTTPOptions). The zero value is "no tools block", which the adapter
+// reads as nothing to mount under the tools path.
+func mountAuthSurface(mux *http.ServeMux, core *auth.Auth, cfg *config.Config, rl func(http.Handler) http.Handler, tools auth.ToolsOptions) (err error) {
 	hc := httpConfig(cfg)
 	hc.RateLimiter = rl
+	hc.Tools = tools
 	if core.IDP() == nil {
 		nethttp.MountWithConfig(mux, core, hc)
 		return nil
