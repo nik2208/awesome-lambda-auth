@@ -157,7 +157,18 @@ config document, the server-rendered pages and the vendored assets — and the
 same flag re-points every emailed link at a hosted page. It is also the first
 whose surface reads the settings store on every request rather than once at cold
 start; §15.1 says what that costs and what a store failure looks like from
-outside. **The two left on the list are `admin` and `tools`.**
+outside.
+
+`tools` is the latest to go (§17), and it is the second domain to leave this
+list that adds a surface: with `tools.enabled` set, the composition root builds
+the event bus the auth core publishes on and the `AuthTools` facade over the
+telemetry, webhook and API-key stores, and the imported adapter mounts track,
+notify, the telemetry query and the router's own documentation pair beside the
+api prefix, behind the posture `tools.auth` names. It leaves two of its knobs
+*refused by rule* rather than by phase — a distributor (RS-14) and inbound
+webhooks (RS-15) — and two *reported* rather than honoured — the stream and the
+SSE manager — because the transports that carry them are D9b, D9c and D9d's;
+§17 says which is which and why. **The one left on the list is `admin`.**
 
 `stores.migration` (§13) never appeared on that list and never will: it is new in
 this release and is wired by the same change that declared it, so there was never
