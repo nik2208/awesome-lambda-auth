@@ -25,7 +25,10 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",
-		"ui-uploaded-assets-are-not-served",
+		// ui-uploaded-assets-are-not-served was retired by the admin surface:
+		// the upload store is the writer D7 said was missing, and the read
+		// path now serves it. docs/deviations.md keeps the entry under
+		// "Retired" so the id stays resolvable.
 	}
 	var got []string
 	for _, d := range WireDeviations() {

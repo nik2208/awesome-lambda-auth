@@ -509,11 +509,7 @@ func newRateLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logg
 		return nil
 	}
 
-	local := newLocalRateLimiter(rl.max, rl.window, nil)
-	var (
-		degradedOnce  sync.Once
-		noAddressOnce sync.Once
-	)
+	tier := newRateLimitTier(rl.max, rl.window, counter, log)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -522,65 +518,173 @@ func newRateLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logg
 				next.ServeHTTP(w, r)
 				return
 			}
+			tier.serve(w, r, route.scope, rateLimitSubject(r, rl.keyBy, route.subjects), next)
+		})
+	}
+}
 
-			subject := rateLimitSubject(r, rl.keyBy, route.subjects)
-			if subject == "" {
-				// No client address and nothing in the body to key on. This is
-				// not something a client can arrange — the address comes from
-				// the Lambda event and not from a header (see clientAddress) —
-				// so it means an event shape that carries none. There is nothing
-				// to count, and refusing every request on a route because the
-				// runtime did not report a source is the wrong direction.
-				noAddressOnce.Do(func() {
-					log.Warn("rate limiter has no subject to key on and is passing requests through",
-						slog.String("path", "rateLimit.keyBy"),
-						slog.String("route", r.Method+" "+r.URL.Path),
-						slog.String("problem", "the event carries no source address and the request body names no subject, so there is nothing to count per"),
-						slog.String("remedy", "this is a property of the event source, not of the document; check that the function is behind API Gateway, an ALB or a Function URL"))
-				})
-				next.ServeHTTP(w, r)
-				return
-			}
+// rateLimitTier is one budget: the in-process pre-filter and the shared counter
+// it stands in front of, over one max and one window, with the two
+// once-per-cold-start warnings that belong to it.
+//
+// It is the body newRateLimiter's closure had before the admin console's
+// promote route needed the same body under a different match. Two tiers are
+// built from one block — one for the auth router, one for that route — and they
+// share the counter store, and therefore the table, and nothing else: separate
+// local tables, separate scopes, separate warnings. A single tier for both
+// would have let a flood on one route spend the pre-filter's table for the
+// other, which is small, and would have put the auth router's route table in
+// front of a route that is not under the api prefix, which is wrong.
+type rateLimitTier struct {
+	max     int
+	window  time.Duration
+	local   *localRateLimiter
+	counter rateLimitCounter
+	log     *slog.Logger
 
-			if !local.allow(route.scope, subject) {
-				// The shared counter is already at max for this subject and
-				// window — see the file header for why that follows — so the
-				// write is skipped. The window's remaining time is recomputed
-				// rather than remembered, which keeps Retry-After honest without
-				// storing an instant per subject.
-				writeRateLimited(w, rateLimitRemaining(time.Now(), rl.window))
-				return
-			}
+	degradedOnce  sync.Once
+	noAddressOnce sync.Once
+}
 
-			if counter == nil {
-				// No shared store: the local tier is the whole limiter. It is
-				// the development driver, announced at cold start, and never
-				// production — RS-12 refuses the memory driver there.
-				next.ServeHTTP(w, r)
-				return
-			}
+func newRateLimitTier(max int, window time.Duration, counter rateLimitCounter, log *slog.Logger) *rateLimitTier {
+	return &rateLimitTier{
+		max:     max,
+		window:  window,
+		local:   newLocalRateLimiter(max, window, nil),
+		counter: counter,
+		log:     log,
+	}
+}
 
-			allowed, retryAfter, err := counter.AllowRequest(r.Context(), route.scope, subject, rl.max, rl.window)
-			if err != nil {
-				// Fail open, deliberately; see the file header. Once per cold
-				// start, because a limiter that logged every failed write during
-				// a DynamoDB incident would add its own load to the incident.
-				degradedOnce.Do(func() {
-					log.Warn("rate limiter cannot reach its shared counter and is failing open",
-						slog.String("path", "rateLimit"),
-						slog.String("scope", route.scope),
-						slog.String("error", err.Error()),
-						slog.String("effect", "requests are allowed through; the remaining bound is the in-process pre-filter, which is per execution environment"),
-						slog.String("why", "the counter is in the same table as the user store, so a route refused here would have failed behind the limiter anyway"))
-				})
-				next.ServeHTTP(w, r)
-				return
-			}
-			if !allowed {
-				writeRateLimited(w, retryAfter)
-				return
-			}
-			next.ServeHTTP(w, r)
+// serve applies the budget for (scope, subject) and either hands the request on
+// or writes the refusal. Every branch below is argued in the file header; the
+// order is the one the design rests on — local pre-filter, then the shared
+// counter, failing open when the counter cannot be reached.
+func (t *rateLimitTier) serve(w http.ResponseWriter, r *http.Request, scope, subject string, next http.Handler) {
+	if subject == "" {
+		// No client address and nothing in the body to key on. This is not
+		// something a client can arrange — the address comes from the Lambda
+		// event and not from a header (see clientAddress) — so it means an
+		// event shape that carries none. There is nothing to count, and
+		// refusing every request on a route because the runtime did not report
+		// a source is the wrong direction.
+		t.noAddressOnce.Do(func() {
+			t.log.Warn("rate limiter has no subject to key on and is passing requests through",
+				slog.String("path", "rateLimit.keyBy"),
+				slog.String("route", r.Method+" "+r.URL.Path),
+				slog.String("problem", "the event carries no source address and the request body names no subject, so there is nothing to count per"),
+				slog.String("remedy", "this is a property of the event source, not of the document; check that the function is behind API Gateway, an ALB or a Function URL"))
+		})
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	if !t.local.allow(scope, subject) {
+		// The shared counter is already at max for this subject and window —
+		// see the file header for why that follows — so the write is skipped.
+		// The window's remaining time is recomputed rather than remembered,
+		// which keeps Retry-After honest without storing an instant per
+		// subject.
+		writeRateLimited(w, rateLimitRemaining(time.Now(), t.window))
+		return
+	}
+
+	if t.counter == nil {
+		// No shared store: the local tier is the whole limiter. It is the
+		// development driver, announced at cold start, and never production —
+		// RS-12 refuses the memory driver there.
+		next.ServeHTTP(w, r)
+		return
+	}
+
+	allowed, retryAfter, err := t.counter.AllowRequest(r.Context(), scope, subject, t.max, t.window)
+	if err != nil {
+		// Fail open, deliberately; see the file header. Once per cold start,
+		// because a limiter that logged every failed write during a DynamoDB
+		// incident would add its own load to the incident.
+		t.degradedOnce.Do(func() {
+			t.log.Warn("rate limiter cannot reach its shared counter and is failing open",
+				slog.String("path", "rateLimit"),
+				slog.String("scope", scope),
+				slog.String("error", err.Error()),
+				slog.String("effect", "requests are allowed through; the remaining bound is the in-process pre-filter, which is per execution environment"),
+				slog.String("why", "the counter is in the same table as the user store, so a route refused here would have failed behind the limiter anyway"))
+		})
+		next.ServeHTTP(w, r)
+		return
+	}
+	if !allowed {
+		writeRateLimited(w, retryAfter)
+		return
+	}
+	next.ServeHTTP(w, r)
+}
+
+// newAdminPromoteLimiter returns the value for auth.AdminOptions.RateLimiter:
+// the console's own limiter slot, which the core applies to exactly one route,
+// POST <admin>/users/{id}/promote, ahead of the guard — and to nothing else on
+// that surface, the admin login included, on either line (core admin.go,
+// AdminOptions.RateLimiter).
+//
+// ── why the slot is filled, and not left nil ─────────────────────────────────
+//
+// nil is the reference's own default — the dev line collapses an absent
+// rateLimiter to an empty middleware list (node-auth admin.router.ts:577) and
+// ships no algorithm — so leaving it nil would be reproducing the reference. It
+// is filled anyway, under the same house rule that fills HTTPConfig.RateLimiter:
+// a product has to be safe with an empty configuration, and this is the one
+// route on the console that changes *who is an administrator*. It runs before
+// the guard, so a caller over budget is refused before a token is verified, a
+// profile is read or a policy — possibly ListUsers, on 'first-user' — is
+// evaluated; that is what makes the slot worth anything against an
+// unauthenticated flood at the most privileged write in the deployment.
+//
+// ── why the auth router's limiter cannot serve it ────────────────────────────
+//
+// newRateLimiter matches "METHOD /prefix/path" against a table resolved under
+// http.apiPrefix, and its subjects are read out of the bodies of the flows
+// rateLimit.scope names. This route is under the admin mount, not the prefix,
+// carries a path parameter the exact-match table cannot express, and has no
+// account-shaped subject in its body — `{method}` names how to promote, not
+// whom to count. So it gets its own tier over the same block: rateLimit.max and
+// rateLimit.windowSeconds are the budget, rateLimit.enabled is the switch, and
+// the shared counter is the same store, under a scope name of its own
+// (adminPromoteScope) that no document can spell.
+//
+// ── the subject is the client address, under either keyBy ────────────────────
+//
+// rateLimit.keyBy chooses between an address and the account the request is
+// *about*, and on the credential flows that account is in the body. Here the
+// account the request is about is the path parameter — the person being
+// promoted — and keying on it would hand an attacker a fresh budget per victim
+// id, which is no limit. The caller's own identity is in a token the limiter
+// runs before verifying, and a limiter that trusted an unverified token as a
+// key would let the caller mint budgets. What remains is the address the event
+// reported, which is what every body-less route under keyBy: email already
+// falls back to (rateLimitSubject). The consequence is the one keyBy's own
+// argument names: an office behind one NAT shares one budget of ten promotions
+// a minute, which for this route is not a hardship.
+//
+// ── what is deliberately not limited ─────────────────────────────────────────
+//
+// The admin login. The slot does not cover it and this function does not
+// reach past the slot to add one: the dev line leaves POST <admin>/login
+// unlimited (node-auth admin.router.ts:614), the core reproduces that and says
+// so, and a limiter this binary bolted onto a route the core mounts would be
+// the product wrapping a route it does not own. The bound on that route is the
+// bcrypt cost of each guess. An operator who wants more puts the console behind
+// a network boundary, which is where the reference's own advice for it lives.
+//
+// Nil when the block is off, which is the reference's behaviour exactly and
+// the core's pass-through.
+func newAdminPromoteLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logger) func(http.Handler) http.Handler {
+	if !cfg.RateLimit.Enabled {
+		return nil
+	}
+	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, log)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tier.serve(w, r, adminPromoteScope, clientAddress(r), next)
 		})
 	}
 }
