@@ -1742,6 +1742,24 @@ on both — with the memory driver's usual caveat that every store is per
 execution environment, so a role assigned through one cold start is unknown to
 the next. RS-12 already refuses that driver in production.
 
+**One route of the users tab is single-tenant, and that is the pinned core's, not
+a decision made here.** `GET <admin>/api/users` lists every user in every tenant,
+because `AdminUserStore.ListUsers` reads `""` as a wildcard; the detail route
+beside it, `GET <admin>/api/users/{id}`, asks `GetUserByID(id, "")`, where `""` is
+the literal single tenant (`admin_read.go` `adminGetUser` at `v0.11.0`, whose
+comment says as much). On a table whose users all live in the empty tenant —
+every account this binary registers, since it never turns the store's
+multi-tenant mode on — the two agree. On a table that holds users under a
+tenant, which `migrate cognito --tenant` can produce, the listing links to rows
+whose detail answers `404 User not found`. The reference's `findById(id)` carries
+no tenant at all (`admin.router.ts:789-800`), so a by-id lookup that spans
+tenants is what closing it takes, and that is a store seam the core has to grow:
+the fix is written upstream (`UserLookupStore`) and **not tagged**, so this build
+stays on `v0.11.0` and serves what `v0.11.0` serves. Nothing here works around
+it — a product-side route would be a route under the admin path, and this binary
+adds none (§12.3 says why) — and the DynamoDB store's half, an item keyed on the
+id alone, lands with the pin that can call it.
+
 ### 16.5 Uploads: `ui.uploadDir` as an S3 location, and what a logo costs
 
 The console's file picker — `POST <admin>/api/upload/logo`, `/bg-image`,
