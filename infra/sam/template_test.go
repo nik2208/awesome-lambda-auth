@@ -412,6 +412,68 @@ func numericDefault(t *testing.T, tpl *template, name string) float64 {
 	return v
 }
 
+// ── the upload bucket ───────────────────────────────────────────────────────
+
+// TestTheUploadBucketIsPrivateEncryptedAndConditional is the enforcement half
+// of the comment above AdminUploadsBucket. Every bucket in this template must
+// be off unless asked for, block public access four ways, disable ACLs and
+// encrypt at rest — and the IAM statements that reach it must be conditioned
+// on the same switch and scoped to the bucket's prefix, never to a wildcard.
+// A later block that adds a bucket — access logs, an export — fails here
+// rather than in a public-bucket finding.
+func TestTheUploadBucketIsPrivateEncryptedAndConditional(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+
+	buckets := tpl.ofType("AWS::S3::Bucket")
+	if len(buckets) == 0 {
+		t.Fatal("the template declares no bucket, so this test proves nothing")
+	}
+	for _, b := range buckets {
+		if b.condition == "" {
+			t.Errorf("%s has no Condition: a bucket that always exists is a bill and a namespace collision on every deploy", b.name)
+		}
+		for _, want := range []string{
+			"BlockPublicAcls: true", "BlockPublicPolicy: true",
+			"IgnorePublicAcls: true", "RestrictPublicBuckets: true",
+			"ObjectOwnership: BucketOwnerEnforced",
+			"SSEAlgorithm:",
+		} {
+			if !strings.Contains(b.body, want) {
+				t.Errorf("%s lacks %q; the bucket must be private and encrypted in every configuration", b.name, want)
+			}
+		}
+		if strings.Contains(b.body, "BucketName:") {
+			t.Errorf("%s sets a BucketName; a fixed name collides with a bucket a previous stack left behind", b.name)
+		}
+		if strings.Contains(b.body, "WebsiteConfiguration") || strings.Contains(b.body, "PublicRead") {
+			t.Errorf("%s is configured for public serving; the function serves the objects, not S3", b.name)
+		}
+	}
+
+	fn, ok := tpl.resources["AuthFunction"]
+	if !ok {
+		t.Fatal("AuthFunction is gone")
+	}
+	for _, sid := range []string{"AdminUploadObjects", "AdminUploadListing"} {
+		i := strings.Index(fn.body, "Sid: "+sid)
+		if i < 0 {
+			t.Errorf("AuthFunction grants no statement with Sid %s", sid)
+			continue
+		}
+		// The statement must sit inside an !If on the upload switch: look back
+		// from the Sid to the nearest condition name.
+		before := fn.body[:i]
+		j := strings.LastIndex(before, "- !If")
+		if j < 0 || !strings.Contains(before[j:], "AdminUploadsEnabled") {
+			t.Errorf("Sid %s is not conditioned on AdminUploadsEnabled; a stack without the bucket would grant S3 access to nothing, or to everything", sid)
+		}
+	}
+	if strings.Contains(fn.body, "s3:*") || strings.Contains(fn.body, "arn:aws:s3:::*") {
+		t.Error("AuthFunction carries an S3 wildcard; every S3 grant is scoped to the upload bucket's prefix")
+	}
+}
+
 // ── what must never be committed ────────────────────────────────────────────
 
 var (
