@@ -171,33 +171,35 @@ its `SETTINGS` one, the memory driver holds both per execution environment (§5.
 start, by name — a store gap rather than a phase gap.
 
 
-### 4.1 Six `stores.enable.*` flags the DynamoDB driver can now back, and still refuses
+### 4.1 Five `stores.enable.*` flags are real switches now, and one still refuses
 
-`stores.enable.metadata`, `.rbac`, `.tenants`, `.apiKeys`, `.webhooks` and
-`.telemetry` are still refused by `checkStoreSupport` on both drivers, and that
-is deliberate rather than pending.
+`stores.enable.metadata`, `.rbac`, `.tenants`, `.apiKeys` and `.webhooks` are
+accepted on both drivers since the admin surface, and each one now changes what
+the deployment does: the `admin` slot of the composition root hands the flagged
+store to the core by name (`auth.WithMetadataProvider`, `WithRBACProvider`,
+`WithTenantProvider`, `WithAPIKeyStore`, `WithWebhookStore`), and the console's
+tab for it is drawn — `GET <admin>/api/ping` reports `roles`, `tenants`,
+`metadata`, `apiKeys` and `webhooks` true exactly when the flag is (§16.4). One
+of them reaches an auth route too: with `stores.enable.metadata` on, the profile
+`GET <prefix>/me` renders carries the user's metadata, which is the reference's
+own behaviour with a metadata store passed. The flags default to **off**, so a
+document that says nothing draws no extra tab and reads no extra store.
 
-The DynamoDB store *implements* all six as of the admin-store block — metadata
-entries, role definitions and assignments, the tenant directory, API keys with
-their id pointers, the webhook directory and telemetry events all have item
-types, key schemas and tests. What has not happened is the other half: the auth
-core takes every one of those six **by name** rather than discovering it by type
-assertion, so none of them reaches a route until the composition root hands it
-over, and that lands with the admin surface.
+`stores.enable.telemetry` is still refused by `checkStoreSupport` on both
+drivers, on the same rule the other five used to fall under: the DynamoDB store
+implements it, but the telemetry store reaches a route only through the tools
+router's `ToolsOptions.TelemetryStore`, which the `tools` block hands over. Until
+it does, the flag would validate, start cleanly and do nothing — the exact
+misconfiguration §1.17 exists to refuse — so `driverStores` keeps answering the
+narrower question it has always answered, "does turning the flag on change what
+the deployment does", and the refusal names the driver rather than shrugging.
 
-`driverStores` therefore answers a narrower question than "can the driver store
-this": it answers "does turning the flag on change what the deployment does".
-Listing the six today would let an operator enable a knob that validates, starts
-cleanly, and does nothing — which is the exact misconfiguration §1.17 exists to
-refuse, and the reason the refusal names the driver rather than shrugging.
-
-Nothing else about these six is waiting on a decision. When the admin surface
-mounts, each flag becomes a real switch and the refusal disappears for it alone.
-
-The three admin listers that arrived with the same block — the user, session and
-role enumerations the admin tables page through — need no flag at all and have
-none: the core finds them by type-asserting the user, session and RBAC stores it
-was already given, so they are live wherever those are.
+The three admin listers and the two profile flag writers need no flag at all
+and have none: `AdminUserStore`, `SessionLister`, `RoleLister`,
+`UserAdminFlagStore` and `UserTwoFactorPolicyStore` are found by type-asserting
+the user, session and RBAC stores the core was already given, so they are live
+wherever those are. The two writers arrived with the admin surface, because it
+is the first block with a route that writes either flag (§16.2).
 
 ## 5. `email.*`, knob by knob
 
@@ -1491,7 +1493,7 @@ or the cookies want a shared parent domain and `cookies.sameSite` set
 accordingly. `infra/sam/template.yaml`'s `EnableCloudFront` exists for exactly
 that: one hostname in front of both.
 
-### 15.4 `ui.assetsDir`, and `ui.uploadDir` which is not honoured
+### 15.4 `ui.assetsDir`, and `ui.uploadDir` which names an S3 location
 
 **`ui.assetsDir`** replaces the built-in pages with your own. It is file-only —
 a path inside the deployment artifact, the same position `email.templatesDir` is
@@ -1507,48 +1509,337 @@ tried in that order — **refuses the deployment at cold start**, naming the thr
 That refusal exists because the alternative is a stack that 404s every page while
 every health check passes.
 
-**`ui.uploadDir` is accepted by the schema and honoured by nothing.**
-`GET <prefix>/ui/assets/logo/*` and `GET <prefix>/ui/assets/uploads/*` answer 404
-in every configuration, which is the core's own unconfigured behaviour — the two
-mounts do not exist, rather than failing on a store that is not there. Setting
-the knob is reported at cold start as a knob this build does not act on.
+**`ui.uploadDir` names an S3 location on this product, `s3://<bucket>[/<prefix>]`,
+and is honoured as one.** It is the reference's single upload-location knob —
+the directory its admin router writes into and its UI router serves from — and
+`config-schema.md` §1.12 recorded that the serverless target would be S3. With an
+S3 location set, one `auth.UploadStore` is built over that bucket and prefix
+(`internal/integration/aws/s3_uploads.go`) and handed to the core; the console's
+four upload routes write through it, and `GET <prefix>/ui/assets/logo/*` and
+`GET <prefix>/ui/assets/uploads/*` serve the same objects back from it, through
+the core's own `UploadFS` composition, with `UIOptions.Uploads` left nil. §16.5
+carries the knob, the bucket the stack creates for it and what each request
+costs. The former deviation `ui-uploaded-assets-are-not-served` is retired and
+indexed under "Retired" in [deviations.md](deviations.md).
 
-Three reasons, and the first is decisive on its own. **There is no writer:** the
-upload route is an admin route, this build mounts none, so a read path would read
-an empty location on every deployment. **A directory is the wrong noun here:**
-`/var/task` is read-only and `/tmp` is per execution environment, so a logo
-uploaded during one cold start would be invisible to the next request and gone by
-the one after — the serverless shape is an S3 location, which `config-schema.md`
-§1.12 already records, and that is a different thing behind the same knob.
-**And an `fs.FS` over S3 costs a `GetObject` per `Open`,** misses included, on a
-path every page of the hosted UI requests whether or not anyone ever uploaded
-anything. Registered as `ui-uploaded-assets-are-not-served`
-([deviations.md](deviations.md)).
+**A plain path is accepted and honoured by nothing**, and is reported at cold
+start as a knob this runtime cannot act on, with the `s3://` form as the remedy.
+`/var/task` is read-only and `/tmp` is per execution environment, so a directory
+would hold a logo for one cold start and lose it by the next; the value is
+accepted rather than refused so a document written for another port in the
+family still loads here. With no location, or a path, the two asset paths answer
+404 — the reference's own behaviour with `uploadDir` unset — and a logo is set
+with `ui.branding.logoUrl`, which the SSR injection writes into every page.
 
-Until the upload store lands, set `ui.branding.logoUrl` to a URL you host
-elsewhere. This build honours it and writes it into every rendered page.
+### 15.5 `ui.enabled` is safe to turn on
 
-### 15.5 The caveat that matters right now
+**The caveat this section used to carry is closed.** It said to leave
+`ui.enabled` off on a deployed stack because the vendored assets are the
+reference's complete set — `admin.js` and `admin.css` among them — and the admin
+dashboard would load and then fail against `/admin/*` routes this build did not
+mount. Those routes are mounted now, from the `admin` block (§16), so a
+deployment that turns the UI on gets the auth pages *and* a console that works,
+under whichever access policy the document names.
 
-**Leave `ui.enabled` off on a deployed stack until the admin surface lands, and
-know why.**
+The other half of the old caveat turned out not to exist. The vendored auth pages
+and `auth.js` call `${apiPrefix}/…` and nothing else, and `admin.js` calls
+`<admin>/…` and nothing else: nothing in the fourteen vendored assets references
+a `/tools/*` route (`awesome-go-auth/ui/upstream/assets`, grepped rather than
+assumed). So `ui.enabled` waits on nothing in the `tools` block; the hosted UI is
+complete with the admin surface alone.
 
-The vendored assets are the reference's, complete — which means they include
-`admin.js` and `admin.css`, and the pages reference `/admin/*` and `/tools/*`
-routes that **this build does not mount**. The `admin` and `tools` domains are
-still refused by the phase gate. So a deployment that turns the UI on today gets
-working login, registration, password-reset, magic-link, verification and 2FA
-pages, and an admin dashboard that loads and then fails against routes that
-answer 404.
+## 16. `admin.*`, knob by knob
 
-Nothing about that is a bug in this block: the UI is servable, configurable and
-tested, and the login half genuinely works. It is a gap between a complete asset
-set and an incomplete route surface, and it closes when the admin and tools
-surfaces land. Until then the stack template's own configuration leaves the UI
-off, deliberately, and this paragraph is here so that turning it on is a decision
-rather than a discovery.
+The admin console: the reference's `createAdminRouter`
+(`src/router/admin.router.ts`), mounted by the imported adapter at
+`admin.basePath` as a **sibling** of the api prefix — the reference's own layout,
+where the host mounts the admin router beside the auth router and tells it where
+the auth router lives (`admin.router.ts:152-157`) — and guarded by the access
+policy the document names. Everything under it comes from the adapter; nothing
+in this binary adds a route there. `cmd/auth/admin.go` builds the value and
+argues every field; this section is the same map from the operator's side.
 
-## 16. Two worked postures
+| Path | Type | Default | Env var |
+|---|---|---|---|
+| `admin.enabled` | boolean | `false` | `AWESOME_AUTH_ADMIN_ENABLED` |
+| `admin.accessPolicy` | `first-user` \| `is-admin-flag` \| `open` \| `rbac:<role>` \| `permission:<perm>` | unset | `AWESOME_AUTH_ADMIN_ACCESS_POLICY` |
+| `admin.bootstrapSecret` | secret | unset | `AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET` (+ `_SECRETSMANAGER` / `_SSM_PARAMETER`) |
+| `admin.rootUser.email` | email | unset | `AWESOME_AUTH_ADMIN_ROOT_EMAIL` |
+| `admin.rootUser.passwordHash` | secret, a bcrypt hash | unset | `AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH` (+ `_SECRETSMANAGER` / `_SSM_PARAMETER`) |
+| `admin.cookiePrefix` | string | unset | `AWESOME_AUTH_ADMIN_COOKIE_PREFIX` |
+| `admin.loginPath` | absolute path or URL | unset | `AWESOME_AUTH_ADMIN_LOGIN_PATH` |
+| `admin.basePath` | absolute path | `/admin` | `AWESOME_AUTH_ADMIN_BASE_PATH` |
+| `admin.sessionTtl` | duration | `24h` — **reported, not honoured** (§16.8) | `AWESOME_AUTH_ADMIN_SESSION_TTL` |
+| `admin.upload.maxFileSizeMb` | integer 1–50 | `5` — **reported, not honoured** (§16.8) | `AWESOME_AUTH_ADMIN_UPLOAD_MAX_FILE_SIZE_MB` |
+
+**`admin.enabled` alone mounts nothing.** The core mounts the console only when
+it is enabled *and* an access decision exists (`HTTPConfig.AdminMounted`), and
+refuses to serve the reference's third arm — enabled, no policy, no secret, a
+stderr warning and every route open (`admin.router.ts:530-536`) — which is the
+upstream deviation `admin-console-requires-an-explicit-policy`. The product
+refuses the same document one layer earlier, at load, with rule RS-6. The two
+agree, and the effect is that no deployment of this product can come up serving
+an unguarded console by omission; the open console is one named policy away, and
+the name is `open`.
+
+### 16.1 The four policies, and what each one grants
+
+The guard runs on every route under the mount except the two documentation
+routes (§16.3) and the two static assets, and it decides on every request — the
+login route establishes *who* the caller is, and the guard decides *whether that
+person may use the console* the next time they call. A user the policy will
+refuse therefore logs in successfully and is answered `403 {"error":"Forbidden"}`
+by the very next request, exactly as in the reference.
+
+- **`open`** grants every request: no token is read, no store is consulted, no
+  principal is established. It is the reference's own default and its own
+  advice for it — "use only behind a VPN or IP allow-list" (`admin.router.ts:29`).
+  The contract suite reports a console that answers a bare `GET <admin>/api/ping`
+  with 200 as a fault, in as many words.
+- **`first-user`** grants the user whose id is first in `ListUsers(1, 0)` — the
+  first registered account, in the store's own order, which on the DynamoDB
+  driver is `(tenant, id)` ascending. RS-10 refuses it on a driver that cannot
+  enumerate users. **On a table with accounts that predate the D6 release it
+  elects the wrong person until the backfill has run** (§16.6).
+- **`is-admin-flag`** grants a user whose `isAdmin` flag is set, and reads
+  nothing else — not `role`, not RBAC. Nobody is flagged on day one; the
+  console's own `POST <admin>/users/{id}/promote` with `{"method":"flag"}` sets
+  it, which is what the root user (§16.2) exists to reach. The DynamoDB store
+  gained the writer for this flag with this block; before it, the policy admitted
+  exactly the users somebody had flagged by editing the table.
+- **`rbac:<role>`** and **`permission:<perm>`** are this product's sugar over the
+  reference's custom-predicate arm (`admin.router.ts:41`, `:376`). The first
+  grants a user holding `<role>` in their own tenant (`GetRolesForUser(user.id,
+  user.tenantId)` contains it); the second grants a user holding `<perm>` through
+  any of their roles (`UserHasPermission`). Both need `stores.enable.rbac`, which
+  the loader requires beside them. **A store error is a denial, never a 500**:
+  the reference wraps the whole evaluation in a `try/catch` whose catch sets
+  `granted = false` (`:378-380`), the core keeps that on its predicate seam, and
+  a console whose role store is unreachable answers 403 to everyone rather than
+  failing open. The tenant is the user's own because a role is a tenant-scoped
+  assignment in the store's vocabulary; a single-tenant deployment passes `""`.
+
+A predicate that cannot reach its store is the one case where "denial" is the
+product's decision rather than the reference's transcription, and it is the same
+direction the rate limiter's fail-open argument runs in reverse: a guard that
+fails open is not a guard.
+
+### 16.2 How you get in: two credentials, one secret, and the fix you inherit
+
+The guard reads a bearer token, then a cookie, and accepts exactly two kinds:
+
+- **an ordinary access token** minted by `POST <prefix>/login` — cookie or
+  bearer — for a user the policy admits. This is why there is no
+  `admin.jwtSecret` knob. The core's `AdminOptions.JWTSecret` is left empty, which
+  it reads as `security.jwt.accessTokenSecret`; that is what the reference's
+  "must match `AuthConfig.accessTokenSecret`" (`admin.router.ts:70-78`) asks a
+  host to arrange by hand, what `config-schema.md` §1.13 folded into RS-7, and
+  the arrangement under which a session on the auth router opens the console.
+- **an admin token** minted by `POST <admin>/login`, which accepts three things
+  in order: the root user, the bootstrap secret, and an ordinary user's
+  email and password looked up in the empty tenant (`admin.router.ts:552-573`).
+  The route is JSON, sits outside the auth router's CSRF chain, and sets the
+  session under the **same cookie name as the auth access token**, which is the
+  reference's deliberate arrangement and has the reference's consequence:
+  logging into the console replaces the browser's auth session cookie until the
+  next `/refresh`.
+
+**What the shared secret does not do here.** In the reference a bare
+`jwt.verify` over that secret makes *every* token the secret signs an admin
+credential — a refresh token, and the typed step-up token a user holds after a
+password and before a second factor, so the console can be entered without the
+second factor the deployment requires. The core types the admin token and
+accepts only `typ:"admin"` and `typ:"access"`, honouring `isRoot` only on the
+first: the upstream deviation `admin-guard-accepts-only-typed-session-tokens`.
+This product inherits that fix by construction, because it never signs a token
+with anything but the core, and it is why a different `JWTSecret` would be a
+loss and not a hardening — it would sever the first credential without buying
+back anything the second lacks.
+
+**The root user** (`admin.rootUser.email` and `.passwordHash`) is a credential
+that lives in configuration rather than in the user table, for "environments
+without local users": compared by exact email at `POST <admin>/login`, verified
+against a **bcrypt hash** that is a secret reference and never sits in the
+document, and minting a token that carries `isRoot` — the one claim that skips
+the store lookup and the policy alike. It is the most privileged credential the
+console has and is as strong as the hash and the access-token secret together.
+An email with no resolvable hash **refuses the cold start**: it would be a login
+form that is served and always answers "Invalid credentials", which is the
+silent shape this product refuses everywhere else. A value that is not a bcrypt
+hash is refused for the same reason. Hash the password yourself
+(`htpasswd -nbBC 12 x 'the password' | cut -d: -f2`) and store the hash.
+
+**The bootstrap secret** (`admin.bootstrapSecret`) is the reference's deprecated
+`adminSecret`, kept because the reference keeps it and because it is an honest
+bootstrap. With no policy it is the legacy guard — a bearer token compared
+against the `Authorization` header, 401 absent and 403 wrong — and the shell is
+served unguarded with the SPA holding the secret in `sessionStorage`. Beside a
+policy it is also a *password* the login route accepts for the empty email or
+the literal `admin`, minting an `isRoot` token. Prefer a policy and a root user.
+
+**`admin.cookiePrefix`, and the empty string.** The core's field is a `*string`
+because the reference distinguishes an explicit empty prefix — the bare name
+`accessToken` — from no prefix at all, which derives the name from the cookie
+options on the way out and tries `__Host-accessToken`, `__Secure-accessToken`
+and `accessToken` in that order on the way in. The product schema is a plain
+string and cannot spell the difference, so this build decides it: **empty is
+unset.** The name is then derived from `cookies.secure`, `cookies.path` and
+`cookies.domain` exactly as the auth routes derive theirs, which keeps the admin
+cookie and the session cookies from disagreeing about the deployment — and the
+one deployment where the bare name is *wanted*, a non-`Secure` one, is the one
+where derivation already yields it. An explicit `""` has no use case the
+derivation does not cover and is not expressible. A non-empty value is an
+explicit override, as there. The `Secure` flag comes from `cookies.secure` and
+never from `X-Forwarded-Proto` (`admin-cookie-secure-flag-is-configured-not-forwarded`).
+
+**`admin.loginPath`** redirects an unauthenticated *browser* — a GET that
+accepts `text/html` — to `<loginPath>?redirect=<admin path>` instead of serving
+the built-in form. It is emitted as given; the redirect parameter is the
+router's own mount and never anything read off the request.
+
+### 16.3 The unauthenticated GET, narrowed, and the documentation pair
+
+In the reference an unauthenticated GET carrying `Accept: text/html` is let
+through to *every* guarded route when no `loginPath` is configured
+(`admin.router.ts:318-325`): `curl -H 'Accept: text/html' <admin>/api/users`
+reads the user table with no credential, because the handler behind the guard
+never looks at the marker. The core lets that branch reach exactly one route —
+the HTML shell, whose whole job in that state is to render the login form with
+every feature flag emptied — and answers 401 everywhere else
+(`admin-unauthenticated-get-serves-only-the-login-form`). This product inherits
+it; the contract suite pins the 401.
+
+**The console's own documentation pair** — `GET <admin>/api/openapi.json` and
+`GET <admin>/api/docs` — follows `docs.swagger` exactly as the auth router's pair
+does (§12): `true`, `false`, or `auto`, which is on outside production and off in
+it, resolved by the same function so the two pairs cannot disagree. There is one
+thing to weigh before leaving it on that the auth router's pair does not carry:
+**these two are the only routes under `<admin>/api` the reference registers with
+no guard** (`admin.router.ts:1499`, `:1517`), so an anonymous caller reads the
+whole documented admin surface — every path, every body — and, because the
+document's path items follow the configured stores, learns which optional
+features this deployment wired. The core reproduces the asymmetry rather than
+tidying it away and says why (`AdminOptions.Docs`); the product adds the same
+`Content-Security-Policy` the auth router's page gets, because the console's
+Swagger page is the same HTML loading the same unpinned CDN bundle onto the same
+origin (`docs-page-carries-a-content-security-policy`). The cold-start log warns
+when the pair is mounted.
+
+### 16.4 The stores behind the tabs
+
+The console draws a tab for each store it was handed, and hands nothing it was
+not: the `admin` slot of `coreOptionSets` passes the five stores the core takes
+by name, each behind its `stores.enable` flag (§4.1), and the feature object
+`GET <admin>/api/ping` answers with — the same object the shell injects — says
+which are on. `sessions`, `templates` and `control` follow the session,
+template and settings stores other blocks handed over; `twoFAPolicy` needs a
+user lister and the 2FA-policy writer, both of which the DynamoDB store has now;
+`linkedAccounts` follows the OAuth block; `upload` follows §16.5.
+
+The DynamoDB store implements all of them (D6) and the memory driver carries the
+core's own in-memory implementations, so the same document draws the same tabs
+on both — with the memory driver's usual caveat that every store is per
+execution environment, so a role assigned through one cold start is unknown to
+the next. RS-12 already refuses that driver in production.
+
+### 16.5 Uploads: `ui.uploadDir` as an S3 location, and what a logo costs
+
+The console's file picker — `POST <admin>/api/upload/logo`, `/bg-image`,
+`GET /api/upload/files`, `DELETE /api/upload/{name}` — is registered only when
+an upload store is configured, and the store is built from `ui.uploadDir`
+spelled as `s3://<bucket>[/<prefix>]` (§15.4). The stack creates such a bucket
+with `EnableAdminUploads=true`: private, SSE-S3 encrypted, every public-access
+block on, ACLs disabled, and the function granted exactly the store's five calls
+on the `uploads/` prefix and nothing else in S3
+(`infra/sam/README.md`, "Admin console"). The objects are served to browsers by
+the function under `<prefix>/ui/assets/uploads/<name>` — the URL the upload
+routes answer with, derived from the mount
+(`admin-upload-base-url-is-derived-from-the-mount`) — and by nothing else; the
+bucket has no website configuration and no public read.
+
+What it costs, in the shape §14.5 uses: **one `PutObject` per upload, one
+`ListObjectsV2` per files listing, one `HeadObject` plus one `DeleteObject` per
+delete, and one `GetObject` per page view that fetches the logo — misses
+included**, because a miss is a `GetObject` that answers 404. Storage is
+~USD 0.023 per GB-month, cents for a handful of images; requests are
+~USD 0.0004 per thousand `GET`s. [cost-model.md §2.6](cost-model.md) carries the
+arithmetic. Every stored object records its `Content-Type` from the key's
+extension at write time, because an S3 object stored without one is served as
+`binary/octet-stream` forever after and no browser paints a logo under that type.
+
+The size bound is the core's `UploadMaxBytes`, a constant carrying the
+reference's multer limit of 5 MiB; `admin.upload.maxFileSizeMb` reaches it only
+when it says 5 (§16.8).
+
+### 16.6 The backfill you owe before `first-user` and the users tab are right
+
+`GET <admin>/api/users` and the `first-user` policy both read
+`AdminUserStore.ListUsers`, which on the DynamoDB driver is a Query over a
+**sparse** index — a constant partition key and a `<tenant>#<id>` sort key that
+`CreateUser` has written since the D6 release, and nothing before it wrote at
+all. A profile written earlier is found by every other route and is invisible to
+exactly these two: the users tab under-reports and `first-user` elects the wrong
+person, and neither failure looks like one from outside. D6 declared the debt;
+this block ships the job that pays it:
+
+```sh
+./scripts/toolchain.sh go run ./cmd/migrate backfill-users \
+  --table <stores.connection.tableName> --region <region> --profile <yours> [--dry-run]
+```
+
+One page per iteration, resumable from the key an interrupted run prints
+(`--start-key`), idempotent — a swept table matches nothing and writes nothing —
+and safe while the table is serving, because every write is a conditional
+`UpdateItem` naming the two index attributes and guarded by
+`attribute_exists(PK) AND attribute_not_exists(GSI1PK)`: a profile registered or
+deleted mid-sweep is skipped, never overwritten and never resurrected. It is an
+operator command and not something the function does because it is a `Scan`,
+which the execution role deliberately does not grant. **Run it once against a
+table that predates D6 before turning `admin.enabled` on there**; the cold-start
+log says so whenever the console mounts on the DynamoDB driver, because it is
+the only place this deployment can.
+
+### 16.7 The promote route's own limiter
+
+The core's `AdminOptions.RateLimiter` is a second limiter slot, separate from the
+auth router's, spread onto **exactly one route**: `POST <admin>/users/{id}/promote`,
+the route that changes who is an administrator. The admin login is deliberately
+not limited, on either line (`admin-promote-route-comes-from-the-development-line`).
+The reference's default is nil — an empty middleware list — and this product
+fills the slot anyway, under the rule that fills the auth router's (§14): with
+`rateLimit.enabled` on, the promote route shares `rateLimit.max` and
+`rateLimit.windowSeconds`, runs its limiter *ahead of the guard* so an
+over-budget caller is refused before a token is verified or a policy evaluated,
+and is keyed by the **client address under either `keyBy`** — its body names how
+to promote and its path names the person being promoted, and neither is a
+subject a caller should be able to mint budgets with. The refusal is the same
+429 §14.3 describes, and the register entry `rate-limited-routes-answer-429`
+names the route. With `rateLimit.enabled: false` the slot is nil, which is the
+reference exactly.
+
+### 16.8 What the cold start tells you, and the two knobs it reports
+
+`admin console mounted` names the mount, the policy and what it grants, which
+credentials the guard accepts, whether a root user and a bootstrap secret are
+configured, and whether the documentation pair is on — with a `Warn` for the
+pair, and a `Warn` naming the backfill on the DynamoDB driver. `admin console
+not mounted` says why: the block is off, or (for a document that bypassed the
+loader) it is on with no access decision. `admin stores wired` lists which of
+the five stores were handed over and whether an upload store was built.
+
+Two knobs of the block are **reported rather than honoured**, by `unwiredKnobs`,
+and only when they differ from the value the core applies. `admin.sessionTtl`:
+the core signs the admin token with the reference's fixed `expiresIn: '24h'`
+and the cookie with the matching `maxAge` (`admin.router.ts:585`, `:610`), and
+exposes no option for either, so the deployed lifetime is 24h whatever the
+document says. `admin.upload.maxFileSizeMb`: the upload routes bound a file at
+`UploadMaxBytes`, a constant carrying the reference's multer limit of 5 MiB,
+with no option beside it. Both knobs are `[new]` in the schema — inventions over
+values the reference hard-codes — and their defaults are those values, so a
+document that leaves them alone reports nothing. `ui.uploadDir` in its
+filesystem spelling is the third report (§15.4).
+
+## 17. Two worked postures
 
 **Mail through SES, templates from the artifact.** Every key that is not
 `email.*` here is load-bearing: `stores.enable.templates` needs a driver that

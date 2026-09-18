@@ -233,7 +233,7 @@ func WireDeviations() []WireDeviation {
 				"rateLimit.scope, which the vocabulary does not offer. " +
 				"cmd/auth/ratelimit_test.go TestRateLimitResponseIsExactlyThis and " +
 				"TestTheShippedDefaultsAreTheOnesTheRegisterClaims fail the day this entry stops describing the product.",
-			Spec: "docs/spec/config-schema.md §1.16; docs/spec/data-model.md §1.5 row #61 and §2.3; docs/config-reference.md §13 and §16",
+			Spec: "docs/spec/config-schema.md §1.16; docs/spec/data-model.md §1.5 row #61 and §2.3; docs/config-reference.md §14 and §16",
 		},
 		// ui-uploaded-assets-are-not-served was registered by the hosted-UI
 		// block and retired by the admin surface. Its three reasons -- no
