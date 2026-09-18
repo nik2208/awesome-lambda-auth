@@ -284,11 +284,16 @@ func (s *S3UploadStore) Put(ctx context.Context, key string, content io.Reader) 
 		Body:          body,
 		ContentLength: awssdk.Int64(size),
 		ContentType:   awssdk.String(contentType),
-		// Belt and braces for a browser that would sniff a stored "logo.png"
-		// holding HTML into a document: the header is served back with the
-		// object wherever it is served from, and auth.UploadNameAllowed's own
-		// comment records that the name is the only thing the routes check.
-		CacheControl: awssdk.String("public, max-age=3600"),
+		// No CacheControl is recorded, on purpose. The only reader of these
+		// objects is the core's UI handler, through auth.UploadFS, and it
+		// answers every static file with the reference's own
+		// `public, max-age=0` (express.static's default maxAge of 0,
+		// ui.router.ts:187-189) whatever the object's metadata says: an
+		// fs.File carries no headers,
+		// so a value stored here would reach no browser and would only
+		// disagree with the one that does. The bucket is private and has no
+		// other origin in front of it. docs/cost-model.md §2.6 counts what
+		// that revalidation costs: one GetObject per fetch.
 	}); err != nil {
 		return auth.UploadedFile{}, fmt.Errorf("aws: s3 upload store: put %s: %w", key, err)
 	}
