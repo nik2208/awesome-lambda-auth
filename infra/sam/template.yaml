@@ -895,7 +895,7 @@ Parameters:
   #      no credential and is for a stack behind a network boundary, which
   #      nothing in this template provides (no WAF, no allow-list, no private
   #      endpoint), so it is accepted only from a document and warned about;
-  #      "first-user" is refused at cold start on every driver (RS-18),
+  #      "first-user" is refused at cold start on every driver (RS-17),
   #      because on this product ids are random and the policy would hand the
   #      console to whoever drew the lowest one.
   #   3. Give yourself a way in. Under is-admin-flag nobody is flagged on day
@@ -915,7 +915,7 @@ Parameters:
   # guard accepts the ordinary access-token cookie, so that cookie's SameSite
   # attribute is the only defence its writes have against a cross-site form
   # post. The Rule AdminConsoleNeedsSameSiteCookies refuses the console beside
-  # CookieSameSite "none" at changeset time, as RS-19 does at cold start.
+  # CookieSameSite "none" at changeset time, as RS-18 does at cold start.
   #
   # What the console's session is NOT: revocable. The guard verifies signature,
   # type, issuer and expiry and never consults the session store, so
@@ -952,7 +952,7 @@ Parameters:
       one value this template offers. "open" (everyone, no credential — the
       reference's default) is ConfigFile-only and only for a stack nobody
       outside your network can reach; "first-user" is refused at cold start
-      (RS-18: ids are random here, so it would admit whoever drew the lowest
+      (RS-17: ids are random here, so it would admit whoever drew the lowest
       one). The rbac:<role> and permission:<perm> forms are set in ConfigFile,
       where stores.enable.rbac can be switched on beside them.
 
@@ -996,7 +996,11 @@ Parameters:
       404, which is the reference's behaviour with uploadDir unset. On, the
       bucket costs its storage (cents for a few logos; ~USD 0.023 per GB-month)
       plus ~USD 0.0004 per thousand requests for every page view that fetches
-      the logo — see docs/cost-model.md §2.6.
+      the logo — see docs/cost-model.md §2.6. The largest file the console can
+      take through this API is about 4.4 MiB, not the reference's 5 MiB: a
+      multipart body reaches the function base64-encoded inside a 6 MB
+      invocation event, and past that API Gateway answers its own 413 body
+      before the function runs (config-reference.md §16.5).
 
   # -----------------------------------------------------------------------
   # Observability, alarms and budget
@@ -1468,7 +1472,7 @@ Rules:
           Secrets Manager secret holding that user's bcrypt password hash.
           Without it the root login is served and can never succeed.
 
-  # RS-19 at changeset time. The console sits outside the CSRF chain and its
+  # RS-18 at changeset time. The console sits outside the CSRF chain and its
   # guard accepts the ordinary access-token cookie, so that cookie's SameSite
   # attribute is the only thing between a cross-site form post and every admin
   # write, promote included. Parameter-only: both knobs are parameters here,

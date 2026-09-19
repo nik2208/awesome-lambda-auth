@@ -373,10 +373,27 @@ func TestLogUISurfaceNamesWhatADeploymentCannotSee(t *testing.T) {
 	t.Run("an upload location the UI serves from", func(t *testing.T) {
 		t.Parallel()
 		out := captureUILog(t, uiEnv(t, "AWESOME_AUTH_UI_UPLOAD_DIR", "s3://logos/uploads"))
-		for _, want := range []string{"ui.uploadDir", "uploaded assets on the hosted UI", "/auth/ui/assets/uploads/*", "GetObject"} {
+		for _, want := range []string{"ui.uploadDir", "uploaded assets on the hosted UI", "/auth/ui/assets/uploads/*", "GetObject", uploadAssetCSP} {
 			if !strings.Contains(out, want) {
 				t.Errorf("the cold-start log does not say %q:\n%s", want, out)
 			}
+		}
+	})
+
+	// The plain-path spelling builds no store, and the line says so instead
+	// of claiming the two paths are served from one: the two cold-start lines
+	// about ui.uploadDir — this one and the knob gap — used to contradict each
+	// other, and this one was the wrong one on the wire.
+	t.Run("an upload path the UI cannot serve from", func(t *testing.T) {
+		t.Parallel()
+		out := captureUILog(t, uiEnv(t, "AWESOME_AUTH_UI_UPLOAD_DIR", "/var/uploads"))
+		for _, want := range []string{"uploaded assets on the hosted UI are not served", "/var/uploads", "/auth/ui/assets/uploads/* answer 404"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("the cold-start log does not say %q:\n%s", want, out)
+			}
+		}
+		if strings.Contains(out, "from the upload store") {
+			t.Errorf("the cold-start log claims a filesystem path is served from the upload store:\n%s", out)
 		}
 	})
 }

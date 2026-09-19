@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -45,6 +46,36 @@ import (
 // Express router does (core admin.go, "What is not wrapped around it"). The
 // vendored admin.js posts to <admin>/login as JSON with no CSRF header, so a
 // double-submit check there would refuse every login the shipped SPA makes.
+// Two consequences follow and both are the product's to state. With no CSRF
+// check, the SameSite attribute of the cookie the guard accepts is the only
+// thing between a cross-site form post and every admin write; RS-18 therefore
+// refuses the console beside cookies.sameSite: none. And the product's own CORS
+// layer, which the reference mounts INSIDE the auth router
+// (auth.router.ts:512-527) and never on the admin router, is kept off the admin
+// mount (app.go corsExemptMounts): an allow-listed SPA origin gets the
+// reference's credentialed CORS on the auth routes and nothing on the console.
+//
+// ── what POST <admin>/login does not do, and what the product adds to it ─────
+//
+// The console's own login is password-only. Its third arm looks the email up
+// in the empty tenant and verifies the password (core admin.go adminLogin,
+// admin.router.ts:566-573), and that is the whole check: no TOTP or SMS step,
+// no consultation of the account's enrolment or of the settings store's
+// require2FA. An account that POST <prefix>/login would challenge for a second
+// factor is signed into the console on its password alone, with a 24h admin
+// token. That is the reference's behaviour, the core reproduces it, and this
+// binary cannot close it without a route it may not add -- so it is registered
+// as a product deviation (admin-login-skips-the-second-factor), stated in
+// config-reference §16.2 beside the paragraph that used to read as if the
+// 2FA-bypass class were closed, and mitigated two ways. The rateLimit block
+// is put in front of the route by a middleware over the mount (ratelimit.go
+// newAdminLoginLimiter), on the same budget and the same keyBy rule as
+// POST <prefix>/login, because the route was otherwise an unlimited password
+// oracle for every user in the empty tenant and a constant-time compare
+// against the bootstrap secret. And admin.loginPath, pointed at the hosted
+// login, sends a browser through the flow that does enforce the second factor;
+// the ordinary access token it ends with is an admin credential the guard
+// judges. A deployment that requires 2FA sets it.
 //
 // ── the mapping, field by field ──────────────────────────────────────────────
 //
@@ -156,7 +187,9 @@ import (
 // beside the auth router's for the reason that one is set there — it captures
 // the counter only the composition root holds. See newAdminPromoteLimiter in
 // ratelimit.go for why the slot is filled rather than left nil, and for why
-// its subject is the client address.
+// its subject is the client address. The login's limiter is not in this slot,
+// which the core spreads onto the promote route alone; it is a middleware over
+// the mount (newAdminLoginLimiter, applied by assembleHandler).
 //
 // **sessionTtl and upload.maxFileSizeMb reach nothing, and say so.** The core
 // signs the admin token with the reference's fixed expiresIn: '24h' and the
@@ -213,6 +246,22 @@ import (
 // UI paths answer 404 — which is the reference's own behaviour with uploadDir
 // unset, so nothing is registered for it.
 //
+// What is registered is the header the read path adds. The reference's
+// allow-list admits .svg by name, and an SVG served same-origin is a document
+// that may carry script, running with the auth cookies; the core states the
+// trade and hands it to the host (upload_store.go UploadNameAllowed).
+// uploadAssetHeaders below takes it: a sandboxing Content-Security-Policy and
+// nosniff on the two asset paths, in the shape docsSecurityHeaders has, so no
+// route is added (uploaded-assets-carry-a-content-security-policy).
+//
+// One bound the docs used to call "deployed" is not reachable here and is
+// stated in config-reference §16.5 instead: the core refuses a file over
+// UploadMaxBytes (5 MiB) with its own 413 envelope, but a multipart body reaches
+// this function base64-encoded inside a synchronous invocation event capped at
+// 6 MB (internal/lambdahttp/request.go), so a file past roughly 4.4 MiB never
+// reaches the core and is refused by the platform with its own 413 body. The
+// effective ceiling is the platform's, and the knob-gap text says so.
+//
 // ── what the console cannot see, and the backfill it depends on ──────────────
 //
 // GET <admin>/api/users reads AdminUserStore.ListUsers, which on the DynamoDB
@@ -224,7 +273,7 @@ import (
 // the only place this deployment can say it.
 //
 // The 'first-user' policy read the same lister and is refused at load on every
-// driver (RS-18), for a reason the backfill cannot fix: the lister orders by
+// driver (RS-17), for a reason the backfill cannot fix: the lister orders by
 // id, ids are random, and "the first user" is whoever drew the lowest one.
 // adminAccessPolicy keeps the mapping for a Config that bypassed the loader,
 // and logAdminSurface says what that Config gets. The register entry is
@@ -551,7 +600,9 @@ func adminKnobGaps(cfg *config.Config) []knobGap {
 		gaps = append(gaps, knobGap{
 			Path: "admin.upload.maxFileSizeMb",
 			Problem: fmt.Sprintf("the auth core bounds an upload at UploadMaxBytes, a constant carrying the reference's multer limit of %d MiB (admin.router.ts:1016), "+
-				"so the deployed bound stays %d MiB and not the configured %d", auth.UploadMaxBytes>>20, auth.UploadMaxBytes>>20, mb),
+				"so the bound the core applies stays %d MiB and not the configured %d -- and the bound a client actually meets is lower still: "+
+				"a multipart body reaches this function base64-encoded inside a 6 MB invocation event, so a file past roughly 4.4 MiB is refused by API Gateway "+
+				"with its own 413 body before the core sees it", auth.UploadMaxBytes>>20, auth.UploadMaxBytes>>20, mb),
 			Remedy: "remove the override until the core exports an option for it; the schema marks the knob [new] over a value the reference hard-codes",
 		})
 	}
@@ -596,11 +647,11 @@ func logAdminSurface(cfg *config.Config, hc auth.HTTPConfig, log *slog.Logger) {
 	case policy == config.AdminAccessPolicyOpen:
 		grants = "EVERY request, with no token read and no store consulted -- the reference's own default, for use only behind a network boundary this stack does not provide"
 	case policy == config.AdminAccessPolicyFirstUser:
-		// Unreachable for a Config that went through the loader: RS-18 refuses
+		// Unreachable for a Config that went through the loader: RS-17 refuses
 		// the policy on every driver, because ids are random here and the
 		// "first" user is whoever drew the lowest one. Said plainly for the
 		// Config that bypassed it.
-		grants = "the user whose id sorts first in ListUsers(1, 0) -- the LOWEST RANDOM id, not the first registered account; RS-18 refuses this policy at load and this deployment bypassed the loader"
+		grants = "the user whose id sorts first in ListUsers(1, 0) -- the LOWEST RANDOM id, not the first registered account; RS-17 refuses this policy at load and this deployment bypassed the loader"
 	case policy == config.AdminAccessPolicyIsAdmin:
 		grants = "a user whose isAdmin flag is set; POST " + mount + "/users/{id}/promote with method=flag sets it"
 	case strings.HasPrefix(policy, config.AdminAccessPolicyRBACPrefix):
@@ -681,6 +732,64 @@ func checkAdminMounted(cfg *config.Config, hc auth.HTTPConfig) error {
 			"-- set admin.accessPolicy or reference admin.bootstrapSecret from a store (RS-6)")
 	}
 	return nil
+}
+
+// uploadAssetCSP is the policy every uploaded asset is served under. It is
+// aimed at one file type on the reference's allow-list: an SVG is an XML
+// document that may carry script, and served same-origin it would run with
+// the auth cookies — where the CSRF cookie is readable from JavaScript by
+// design and the admin API has no CSRF layer. `sandbox` makes a top-level SVG
+// an opaque-origin document with scripts, forms and navigation off;
+// `default-src 'none'` closes every fetch; `style-src 'unsafe-inline'` is
+// what lets an honest SVG's own <style> render. The core names the trade and
+// hands it to the host (upload_store.go UploadNameAllowed: "behind a
+// Content-Security-Policy, or drops 'svg'"); this is the first of those, taken
+// because dropping svg would break a console that offers it and would be a
+// different product from the reference.
+const uploadAssetCSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+
+// uploadAssetHeaders decorates the two paths the hosted UI serves uploaded
+// assets from — <prefix>/ui/assets/logo/* and <prefix>/ui/assets/uploads/* —
+// with uploadAssetCSP and X-Content-Type-Options: nosniff.
+//
+// The shape is docsSecurityHeaders': a middleware over the whole mux that
+// registers no pattern, so the adapter still owns the surface. It matches on
+// the resolved prefix and the core's UIRoute, so a customised api prefix moves
+// the headers with the routes. nosniff is the other half of the core's warning
+// on the same seam: the allow-list tests the file's name and nothing else, so
+// a file named logo.png holding HTML is stored and served as image/png, and a
+// host serving the prefix without nosniff "is relying on the type header
+// alone".
+//
+// Identity when no store is built — a plain-path ui.uploadDir, or none — or the
+// UI is off, because then both paths answer 404 and a policy on a 404 is a
+// claim about a surface this deployment does not have. With a store built the
+// headers go on every response under the two paths, misses included, because
+// a 404 body is a document too. Registered as
+// uploaded-assets-carry-a-content-security-policy (deviations.go).
+func uploadAssetHeaders(cfg *config.Config) func(http.Handler) http.Handler {
+	identity := func(next http.Handler) http.Handler { return next }
+	if !cfg.UI.Enabled {
+		return identity
+	}
+	if _, _, isS3, _ := awsintegration.ParseS3Location(cfg.UI.UploadDir); !isS3 {
+		return identity
+	}
+	mount := httpConfig(cfg).Prefix() + auth.UIRoute
+	paths := [...]string{mount + "/assets/logo/", mount + "/assets/uploads/"}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for _, p := range paths {
+				if strings.HasPrefix(r.URL.Path, p) {
+					h := w.Header()
+					h.Set("Content-Security-Policy", uploadAssetCSP)
+					h.Set("X-Content-Type-Options", "nosniff")
+					break
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // adminPromoteScope is the counter scope of the promote route's limiter. It is

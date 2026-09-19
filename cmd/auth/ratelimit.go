@@ -624,19 +624,23 @@ func (t *rateLimitTier) serve(w http.ResponseWriter, r *http.Request, scope, sub
 // the console's own limiter slot, which the core applies to exactly one route,
 // POST <admin>/users/{id}/promote, ahead of the guard — and to nothing else on
 // that surface, the admin login included, on either line (core admin.go,
-// AdminOptions.RateLimiter).
+// AdminOptions.RateLimiter). The login gets a limiter of its own below,
+// newAdminLoginLimiter, by a different mechanism.
 //
 // ── why the slot is filled, and not left nil ─────────────────────────────────
 //
-// nil is the reference's own default — the dev line collapses an absent
-// rateLimiter to an empty middleware list (node-auth admin.router.ts:577) and
-// ships no algorithm — so leaving it nil would be reproducing the reference. It
-// is filled anyway, under the same house rule that fills HTTPConfig.RateLimiter:
-// a product has to be safe with an empty configuration, and this is the one
-// route on the console that changes *who is an administrator*. It runs before
-// the guard, so a caller over budget is refused before a token is verified, a
-// profile is read or a policy — possibly ListUsers, on 'first-user' — is
-// evaluated; that is what makes the slot worth anything against an
+// nil is the reference's own default — the private development line, which is
+// where the promote route and this slot come from, collapses an absent
+// rateLimiter to an empty middleware list (its admin.router.ts:577; the
+// published v1.9.0 file has neither the slot nor the route, and that line
+// number there is the login's 401 — see the core's
+// admin-promote-route-comes-from-the-development-line) and ships no algorithm —
+// so leaving it nil would be reproducing the reference. It is filled anyway,
+// under the same house rule that fills HTTPConfig.RateLimiter: a product has to
+// be safe with an empty configuration, and this is the one route on the console
+// that changes *who is an administrator*. It runs before the guard, so a caller
+// over budget is refused before a token is verified, a profile is read or a
+// policy is evaluated; that is what makes the slot worth anything against an
 // unauthenticated flood at the most privileged write in the deployment.
 //
 // ── why the auth router's limiter cannot serve it ────────────────────────────
@@ -665,16 +669,6 @@ func (t *rateLimitTier) serve(w http.ResponseWriter, r *http.Request, scope, sub
 // argument names: an office behind one NAT shares one budget of ten promotions
 // a minute, which for this route is not a hardship.
 //
-// ── what is deliberately not limited ─────────────────────────────────────────
-//
-// The admin login. The slot does not cover it and this function does not
-// reach past the slot to add one: the dev line leaves POST <admin>/login
-// unlimited (node-auth admin.router.ts:614), the core reproduces that and says
-// so, and a limiter this binary bolted onto a route the core mounts would be
-// the product wrapping a route it does not own. The bound on that route is the
-// bcrypt cost of each guess. An operator who wants more puts the console behind
-// a network boundary, which is where the reference's own advice for it lives.
-//
 // Nil when the block is off, which is the reference's behaviour exactly and
 // the core's pass-through.
 func newAdminPromoteLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logger) func(http.Handler) http.Handler {
@@ -685,6 +679,74 @@ func newAdminPromoteLimiter(cfg *config.Config, counter rateLimitCounter, log *s
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tier.serve(w, r, adminPromoteScope, clientAddress(r), next)
+		})
+	}
+}
+
+// adminLoginScope is the counter scope of the console login's limiter, a
+// sibling of adminPromoteScope for the same reason: a name the shared counter
+// keys on that no document can spell.
+const adminLoginScope = "admin-login"
+
+// newAdminLoginLimiter puts the rateLimit block in front of POST <admin>/login,
+// as a middleware over the mux rather than through any slot: the core has none
+// for this route, on either line (core admin.go adminLogin, "No rate limiting
+// of its own"), and its comment says what a host that wants one does — wraps
+// the handler the adapter mounts. This is that wrap. It registers no pattern
+// and matches one method on one path, so the adapter still owns the route.
+//
+// ── why the login is limited at all ──────────────────────────────────────────
+//
+// This file used to argue the opposite: that the bound on the route was the
+// bcrypt cost of each guess, and that a limiter here would be the product
+// wrapping a route it does not own. The first half was false. The route has
+// three arms (admin.router.ts:552-573, core adminLogin), and only the first and
+// third pay bcrypt: the second compares the presented password against
+// admin.bootstrapSecret in constant time for the empty email or the literal
+// "admin", and a hit mints an isRoot token that skips the store and the policy.
+// The third arm pays bcrypt only for an email the store holds; an unknown one
+// is refused at the cost of a lookup, which is also a timing oracle for which
+// addresses exist. And the whole route is the one place in the deployment
+// where POST <prefix>/login's limit could be side-stepped: the same
+// email-and-password pair, guessed at against the same user store, on a route
+// the default rateLimit.scope did not reach. The second half of the old
+// argument stands and is answered by the shape: a middleware matching one
+// route is not a route.
+//
+// ── what it shares with the auth login ───────────────────────────────────────
+//
+// The budget (rateLimit.max, rateLimit.windowSeconds), the switch
+// (rateLimit.enabled), the counter, the refusal (writeRateLimited) and the
+// subject rule: keyBy decides, exactly as it does for POST <prefix>/login —
+// the body's normalised email under `email`, the client address under `ip`,
+// and the address whenever the body names no subject, which is what the
+// bootstrap-secret arm's empty email falls to. The scope is its own, so a
+// caller who has spent the auth login's budget on an address has not spent
+// this one; the alternative, sharing `login`'s scope, would let the console's
+// login exhaust a user's budget on the auth router and the other way round,
+// and the two routes are not one surface.
+//
+// Identity — not nil — when the block is off or the login routes are not
+// mounted: assembleHandler always wraps, and a nil there would be a nil
+// dereference rather than the reference's behaviour. The login routes exist
+// only under a session policy (core AdminGuard.LoginRoutesMounted), which is
+// what a non-nil AccessPolicy means here.
+func newAdminLoginLimiter(cfg *config.Config, counter rateLimitCounter, log *slog.Logger) func(http.Handler) http.Handler {
+	identity := func(next http.Handler) http.Handler { return next }
+	hc := httpConfig(cfg)
+	if !cfg.RateLimit.Enabled || !hc.AdminMounted() || hc.Admin.AccessPolicy == nil {
+		return identity
+	}
+	tier := newRateLimitTier(cfg.RateLimit.Max, time.Duration(cfg.RateLimit.WindowSeconds)*time.Second, counter, log)
+	login := hc.AdminPath() + auth.AdminLoginPath
+	keyBy := cfg.RateLimit.KeyBy
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != login {
+				next.ServeHTTP(w, r)
+				return
+			}
+			tier.serve(w, r, adminLoginScope, rateLimitSubject(r, keyBy, subjectFromEmail), next)
 		})
 	}
 }

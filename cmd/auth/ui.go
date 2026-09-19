@@ -10,6 +10,7 @@ import (
 	auth "github.com/nik2208/awesome-go-auth"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
+	awsintegration "github.com/nik2208/awesome-lambda-auth/internal/integration/aws"
 )
 
 // The hosted UI: everything under GET <prefix>/ui — the config document, the
@@ -387,12 +388,24 @@ func logUISurface(cfg *config.Config, log *slog.Logger) {
 	// upload store, and the two asset paths serve it (uiUploadsFollowTheUploadStore);
 	// a plain path is a knob gap reported by unwiredKnobs (admin.go,
 	// adminKnobGaps). What is said here is only which of the two this
-	// deployment is in, because the UI is the surface a visitor sees it on.
+	// deployment is in, because the UI is the surface a visitor sees it on --
+	// and it is decided the way newUploadStore decides it, on the spelling, so
+	// the two lines cannot disagree: this one used to claim "served from the
+	// upload store" for a plain path that built none.
 	if dir := strings.TrimSpace(cfg.UI.UploadDir); dir != "" {
-		log.Info("uploaded assets on the hosted UI",
-			slog.String("path", "ui.uploadDir"),
-			slog.String("value", dir),
-			slog.String("served", mount+"/assets/logo/* and "+mount+"/assets/uploads/* from the upload store, one GetObject per request, misses included"),
-			slog.String("note", uiUploadsFollowTheUploadStore))
+		if _, _, isS3, _ := awsintegration.ParseS3Location(dir); isS3 {
+			log.Info("uploaded assets on the hosted UI",
+				slog.String("path", "ui.uploadDir"),
+				slog.String("value", dir),
+				slog.String("served", mount+"/assets/logo/* and "+mount+"/assets/uploads/* from the upload store, one GetObject per request, misses included"),
+				slog.String("headers", "every response under the two paths carries Content-Security-Policy "+uploadAssetCSP+" and X-Content-Type-Options: nosniff (uploaded-assets-carry-a-content-security-policy)"),
+				slog.String("note", uiUploadsFollowTheUploadStore))
+		} else {
+			log.Info("uploaded assets on the hosted UI are not served",
+				slog.String("path", "ui.uploadDir"),
+				slog.String("value", dir),
+				slog.String("effect", "a filesystem path builds no upload store on this runtime, so GET "+mount+"/assets/logo/* and GET "+mount+"/assets/uploads/* answer 404 and the console draws no file picker"),
+				slog.String("note", "the knob gap for ui.uploadDir names the s3:// spelling that would; the reference's meaning of the knob cannot be honoured here"))
+		}
 	}
 }

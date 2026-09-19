@@ -324,55 +324,12 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	logUISurface(cfg, log)
 	logAdminSurface(cfg, httpConfig(cfg), log)
 
-	var handler http.Handler = mux
-	// The documentation responses carry a Content-Security-Policy. It is a
-	// middleware and not a route — it registers no pattern, so the adapter still
-	// owns every path under the api prefix — and it is the only thing this
-	// binary can do about the reference's Swagger page loading an unpinned
-	// third-party bundle onto the auth origin. docs.go argues what that buys and
-	// what it does not; with the routes unmounted it is the identity wrapper.
-	handler = docsSecurityHeaders(cfg)(handler)
-	// Refresh-token rotation replay detection needs a per-request precondition
-	// carrier installed on the request context: the DynamoDB store fills it in
-	// GetSessionByRefreshTokenHash and consumes it in UpdateSession so that two
-	// concurrent refreshes of one token resolve to a single winner and a replay is
-	// revoked immediately instead of one request later. rotation.go documents this
-	// as "the HTTP layer must call it once per request"; without it the store logs
-	// warnDegradedRotation and falls back to attribute_not_exists(revokedAt). Only
-	// the DynamoDB store consumes the scope — the memory store ignores it — so the
-	// wrap is gated on the driver to avoid a pointless allocation per request.
-	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
-		handler = rotationScopeMiddleware(handler)
-	}
-	// The migration marker travels from the store's profile read to the password
-	// verifier through a second per-request carrier, of exactly the same shape and
-	// for a closely related reason: a ctx cannot be mutated by the callee, so the
-	// HTTP layer installs an empty scope and the two ends fill and consume it.
-	// What is different is the motive — here it is so that the marker never has to
-	// live on auth.User, which auth.NewPublicUser serialises. See
-	// migrationScopeMiddleware.
-	if cfg.Stores.Migration.Active() {
-		handler = migrationScopeMiddleware(handler)
-	}
-	handler = corsMiddleware(cfg.HTTP.CORS.Origins)(handler)
-	handler = accessLog(log, handler)
-	// The last two wraps are the observability pair, and their order is the
-	// argument: the carrier has to exist before anything can read it, and the
-	// access log is one of the things that reads it. So correlationScope sits
-	// between them, and auth.EventContextMiddleware ends up outermost — ahead of
-	// CORS, ahead of the access log, ahead of everything.
-	//
-	// EventContextMiddleware is the core's, not a re-implementation, and
-	// httpConfig(cfg) is the same pure function of the same document that
-	// mountAuthSurface hands the adapter. The adapter installs the carrier again
-	// inside its own guard chain (awesome-go-auth adapter/nethttp/nethttp.go:257)
-	// for the routes it owns; that install recomputes the identical value, so
-	// this one costs a context value on those routes and buys the carrier on the
-	// ones the adapter does not own — GET /healthz today, whatever a later block
-	// mounts outside the api prefix tomorrow. See the correlation section of
-	// logging.go for why this binary never reads the header itself.
-	handler = correlationScope(log)(handler)
-	handler = auth.EventContextMiddleware(httpConfig(cfg))(handler)
+	// The middleware chain is one function, assembleHandler, so that the test
+	// harness (admin_test.go newAdminSurface) builds the very chain New builds
+	// and a header this binary adds -- or must not add -- is seen where it is
+	// asserted. The console's login limiter is built here for the reason the
+	// other two are: it counts with the shared counter.
+	handler := assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, log))
 
 	app := &App{Config: cfg, Logger: log, Handler: handler}
 
@@ -409,6 +366,93 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		slog.Bool("adminConsole", httpConfig(cfg).AdminMounted()))
 
 	return app, nil
+}
+
+// assembleHandler wraps the mounted mux in every middleware this binary adds,
+// in the order New has always applied them. It is a function of the same
+// document and the same mux so that a test can build the exact handler the
+// binary serves — admin_test.go's newAdminSurface used to omit the CORS layer
+// and could not see that the console had been put behind it (review finding #1).
+//
+// Innermost to outermost:
+//
+//   - The console's login limiter, matching one route (POST <admin>/login) and
+//     nothing else; identity when the console or the block is off.
+//   - The two header middlewares. Neither registers a pattern, so the adapter
+//     still owns every path under the api prefix — that is the only thing this
+//     binary can do about the reference's Swagger page loading an unpinned
+//     third-party bundle onto the auth origin (docs.go), and about the
+//     reference serving uploaded SVGs same-origin with the auth cookies
+//     (admin.go, uploadAssetHeaders). Both are the identity wrapper when their
+//     routes are not mounted.
+//   - Refresh-token rotation replay detection needs a per-request precondition
+//     carrier installed on the request context: the DynamoDB store fills it in
+//     GetSessionByRefreshTokenHash and consumes it in UpdateSession so that two
+//     concurrent refreshes of one token resolve to a single winner and a replay
+//     is revoked immediately instead of one request later. rotation.go
+//     documents this as "the HTTP layer must call it once per request"; without
+//     it the store logs warnDegradedRotation and falls back to
+//     attribute_not_exists(revokedAt). Only the DynamoDB store consumes the
+//     scope, so the wrap is gated on the driver.
+//   - The migration marker travels from the store's profile read to the
+//     password verifier through a second per-request carrier of the same shape:
+//     a ctx cannot be mutated by the callee, so the HTTP layer installs an empty
+//     scope and the two ends fill and consume it. See migrationScopeMiddleware.
+//   - CORS, everywhere but the admin mount (corsExemptMounts).
+//   - The observability pair, whose order is the argument: the carrier has to
+//     exist before anything can read it, and the access log is one of the
+//     things that reads it. So correlationScope sits between them, and
+//     auth.EventContextMiddleware ends up outermost — ahead of CORS, ahead of
+//     the access log, ahead of everything. EventContextMiddleware is the core's,
+//     and httpConfig(cfg) is the same pure function of the same document that
+//     mountAuthSurface hands the adapter. The adapter installs the carrier again
+//     inside its own guard chain (awesome-go-auth adapter/nethttp/nethttp.go:257)
+//     for the routes it owns; that install recomputes the identical value, so
+//     this one costs a context value on those routes and buys the carrier on the
+//     ones the adapter does not own — GET /healthz today, whatever a later block
+//     mounts outside the api prefix tomorrow. See the correlation section of
+//     logging.go for why this binary never reads the header itself.
+func assembleHandler(cfg *config.Config, log *slog.Logger, mux http.Handler, adminLoginRL func(http.Handler) http.Handler) http.Handler {
+	handler := mux
+	if adminLoginRL != nil {
+		handler = adminLoginRL(handler)
+	}
+	handler = docsSecurityHeaders(cfg)(handler)
+	handler = uploadAssetHeaders(cfg)(handler)
+	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
+		handler = rotationScopeMiddleware(handler)
+	}
+	if cfg.Stores.Migration.Active() {
+		handler = migrationScopeMiddleware(handler)
+	}
+	handler = corsMiddleware(cfg.HTTP.CORS.Origins, corsExemptMounts(cfg)...)(handler)
+	handler = accessLog(log, handler)
+	handler = correlationScope(log)(handler)
+	handler = auth.EventContextMiddleware(httpConfig(cfg))(handler)
+	return handler
+}
+
+// corsExemptMounts names the mounts the CORS layer must not touch: today the
+// admin console, when it is mounted.
+//
+// The reference's CORS layer is `router.use(cors(...))` INSIDE the auth router
+// (auth.router.ts:512-527); createAdminRouter is a separate Express router
+// (admin.router.ts:503-510) and sets no Access-Control header of any kind. A
+// product-wide layer would therefore have put the console behind credentialed
+// CORS the reference never grants it — and the console has no CSRF check, so an
+// allow-listed SPA origin would have gained readable, credentialed cross-origin
+// access to the most privileged API in the deployment, with any origin able to
+// use a bearer. Exempting the mount rather than narrowing the layer to the api
+// prefix keeps every other path where it was (GET /healthz, and an
+// idProvider.jwksPath a document may place outside the prefix, whose discovery
+// document a browser client does fetch). The tools router is the reference's
+// other sibling router and will want the same exemption when its block lands.
+func corsExemptMounts(cfg *config.Config) []string {
+	hc := httpConfig(cfg)
+	if !hc.AdminMounted() {
+		return nil
+	}
+	return []string{hc.AdminPath()}
 }
 
 // buildCore turns the validated configuration and the opened stores into the

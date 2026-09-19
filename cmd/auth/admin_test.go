@@ -19,6 +19,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/nik2208/awesome-lambda-auth/internal/config"
+	ddbstore "github.com/nik2208/awesome-lambda-auth/internal/store/dynamodb"
+	"github.com/nik2208/awesome-lambda-auth/internal/store/migrating"
 )
 
 // The admin console, driven the way the binary builds it: a Config loaded from
@@ -87,19 +89,26 @@ func loadAdmin(t *testing.T, env map[string]string) *config.Config {
 }
 
 // adminSurface is the deployment's whole HTTP handler for cfg, built exactly
-// as New builds it minus the loader and the Lambda event layer, plus the
-// memory bundle the core was handed, so a test can reach the stores directly
-// where the wire offers no route (assigning a role, seeding an upload).
+// as New builds it minus the loader and the Lambda event layer — the same
+// mount and, through assembleHandler, the same middleware chain, so a header
+// this binary adds or must not add is seen here — plus the memory bundle the
+// core was handed, so a test can reach the stores directly where the wire
+// offers no route (assigning a role, seeding an upload, enrolling a factor).
 type adminSurface struct {
 	handler http.Handler
 	stores  memoryStoreBundle
 	core    *auth.Auth
 }
 
+// newAdminSurface builds the surface. opts.Logger is honoured when set, so a
+// test that asserts what does NOT reach the log can capture it; nil discards.
 func newAdminSurface(t *testing.T, cfg *config.Config, opts Options, counter rateLimitCounter) *adminSurface {
 	t.Helper()
-	log := discardLogger()
-	opts.Logger = log
+	log := opts.Logger
+	if log == nil {
+		log = discardLogger()
+		opts.Logger = log
+	}
 	users := newMemoryStoreBundle()
 	deliver, err := newDelivery(cfg, opts.Mail, opts.SMS, opts.HTTPClient, log)
 	if err != nil {
@@ -116,7 +125,8 @@ func newAdminSurface(t *testing.T, cfg *config.Config, opts Options, counter rat
 	if err := mountAuthSurface(mux, core, cfg, newRateLimiter(cfg, counter, log), newAdminPromoteLimiter(cfg, counter, log)); err != nil {
 		t.Fatalf("mountAuthSurface: %v", err)
 	}
-	return &adminSurface{handler: docsSecurityHeaders(cfg)(mux), stores: users, core: core}
+	logAdminSurface(cfg, httpConfig(cfg), log)
+	return &adminSurface{handler: assembleHandler(cfg, log, mux, newAdminLoginLimiter(cfg, counter, log)), stores: users, core: core}
 }
 
 // call issues one request against the surface. body is JSON when non-nil.
@@ -283,14 +293,14 @@ func TestAdminAccessPolicyMapsEverySpelling(t *testing.T) {
 	} {
 		var cfg *config.Config
 		if tc.policy == config.AdminAccessPolicyFirstUser {
-			// RS-18 refuses first-user at load on every driver, so the only
+			// RS-17 refuses first-user at load on every driver, so the only
 			// Config that reaches this arm is one that bypassed the loader;
 			// the mapping is kept for it and pinned here the same way.
 			cfg = loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin))
 			cfg.Admin.AccessPolicy = tc.policy
 			if _, err := config.Load(context.Background(), config.Options{Getenv: envFunc(adminEnv(tc.policy)), AllowUnimplemented: true}); err == nil ||
-				!strings.Contains(err.Error(), "[RS-18]") {
-				t.Errorf("first-user loaded, or was refused by something other than RS-18: %v", err)
+				!strings.Contains(err.Error(), "[RS-17]") {
+				t.Errorf("first-user loaded, or was refused by something other than RS-17: %v", err)
 			}
 		} else {
 			cfg = loadAdmin(t, adminEnv(tc.policy))
@@ -429,6 +439,15 @@ func TestAdminConsoleIsMountedGuardedAndServed(t *testing.T) {
 	}
 	if body := rec.Body.String(); !strings.Contains(body, `"operator@example.test"`) || !strings.Contains(body, `"total":`) {
 		t.Errorf("the users listing does not carry the registered account and a total: %s", body)
+	}
+
+	// The five handed-over stores reach their routes, not just the ping's
+	// feature flags: one read per tab, each answering the reference's 200
+	// rather than the 404 an unhanded store gets (TestAdminStoresFollowTheirFlags).
+	for _, path := range []string{"/admin/api/roles", "/admin/api/tenants", "/admin/api/api-keys", "/admin/api/webhooks", "/admin/api/users/" + id + "/metadata"} {
+		if rec := s.call(t, http.MethodGet, path, nil, withCookie(cookie)); rec.Code != http.StatusOK {
+			t.Errorf("GET %s answered %d with its store handed over, want 200: %s", path, rec.Code, rec.Body.String())
+		}
 	}
 
 	// Settings round trip through the store the `settings` slot handed over.
@@ -611,6 +630,19 @@ func TestUploadedAssetsAreServedFromTheUploadStore(t *testing.T) {
 	if ct := got.Header().Get("Content-Type"); !strings.HasPrefix(ct, "image/png") {
 		t.Errorf("GET %s Content-Type = %q, want image/png", url, ct)
 	}
+	// The registered headers (uploaded-assets-carry-a-content-security-policy):
+	// the sandboxing policy and nosniff on the asset, and neither on an auth
+	// route, so the middleware is seen to match the two paths and nothing else.
+	if got.Header().Get("Content-Security-Policy") != uploadAssetCSP || got.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("GET %s carries CSP %q and X-Content-Type-Options %q; an uploaded asset is served under %q and nosniff",
+			url, got.Header().Get("Content-Security-Policy"), got.Header().Get("X-Content-Type-Options"), uploadAssetCSP)
+	}
+	if miss := s.call(t, http.MethodGet, "/auth/ui/assets/uploads/absent.svg", nil); miss.Header().Get("Content-Security-Policy") != uploadAssetCSP {
+		t.Errorf("a miss under the upload path carries CSP %q; a 404 body is a document too", miss.Header().Get("Content-Security-Policy"))
+	}
+	if cfgResp := s.call(t, http.MethodGet, "/auth/ui/config", nil); cfgResp.Header().Get("Content-Security-Policy") != "" {
+		t.Errorf("GET /auth/ui/config carries CSP %q; the upload policy must stay on the two asset paths", cfgResp.Header().Get("Content-Security-Policy"))
+	}
 	// Both legacy and unified paths, as the reference mounts both.
 	if got := s.call(t, http.MethodGet, "/auth/ui/assets/logo/"+filename, nil); got.Code != http.StatusOK {
 		t.Errorf("GET /auth/ui/assets/logo/%s answered %d, want 200", filename, got.Code)
@@ -644,8 +676,14 @@ func TestAPlainUploadPathBuildsNoStoreAndIsReported(t *testing.T) {
 	if features["upload"] != false {
 		t.Errorf("features.upload = %v for a filesystem path, want false", features["upload"])
 	}
-	if rec := s.call(t, http.MethodGet, "/auth/ui/assets/uploads/x.png", nil); rec.Code != http.StatusNotFound {
+	rec := s.call(t, http.MethodGet, "/auth/ui/assets/uploads/x.png", nil)
+	if rec.Code != http.StatusNotFound {
 		t.Errorf("GET /auth/ui/assets/uploads/x.png answered %d with no store, want the reference's 404", rec.Code)
+	}
+	// No store, no policy: a header on a surface this deployment does not have
+	// would be a claim about it.
+	if rec.Header().Get("Content-Security-Policy") != "" {
+		t.Errorf("a 404 with no upload store carries CSP %q", rec.Header().Get("Content-Security-Policy"))
 	}
 
 	gaps := map[string]knobGap{}
@@ -780,10 +818,11 @@ func TestAdminPromoteRouteIsRateLimited(t *testing.T) {
 		t.Error("429 carries no Retry-After")
 	}
 
-	// The admin login is deliberately unlimited, on either line.
-	for i := 1; i <= 5; i++ {
-		if rec := s.call(t, http.MethodPost, "/admin/login", map[string]string{"email": "nobody@example.test", "password": "wrong"}); rec.Code == http.StatusTooManyRequests {
-			t.Fatalf("POST /admin/login was rate limited on attempt %d; the slot covers the promote route alone", i)
+	// The admin login has a budget of its own, on its own scope: two attempts
+	// on the promote route did not spend it.
+	for i := 1; i <= 2; i++ {
+		if rec := s.call(t, http.MethodPost, "/admin/login", map[string]string{"email": "nobody@example.test", "password": "wrong"}); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("POST /admin/login attempt %d answered %d, want 401 (under budget, refused by the credential check)", i, rec.Code)
 		}
 	}
 	// And a different address is a different budget.
@@ -910,5 +949,303 @@ func TestDriverStoresListTheConsoleStores(t *testing.T) {
 	}
 	if fmt.Sprint(enabledStores(config.Defaults().Stores.Enable)) != "[sessions tokens users]" {
 		t.Error("the defaults changed; the console's flags must stay off by default")
+	}
+}
+
+// ── the login: limited, and second-factor-blind ──────────────────────────────
+
+// TestAdminLoginIsRateLimited: POST <admin>/login sits under the rateLimit
+// block through the middleware assembleHandler applies, on its own scope, keyed
+// the way POST <prefix>/login is keyed — the body's email under the default
+// keyBy — so a guess run against one account is refused with the registered 429
+// while another account, and the promote route, still have their budgets.
+func TestAdminLoginIsRateLimited(t *testing.T) {
+	t.Parallel()
+	cfg := loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin,
+		"AWESOME_AUTH_RATE_LIMIT_ENABLED", "true",
+		"AWESOME_AUTH_RATE_LIMIT_MAX", "2",
+		"AWESOME_AUTH_RATE_LIMIT_WINDOW_SECONDS", "60",
+	))
+	s := newAdminSurface(t, cfg, Options{}, nil)
+
+	guess := func(email string) *httptest.ResponseRecorder {
+		return s.call(t, http.MethodPost, "/admin/login", map[string]string{"email": email, "password": "not-the-password"})
+	}
+	for i := 1; i <= 2; i++ {
+		if rec := guess(testAdminRootEmail); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("guess %d answered %d, want 401 (under budget)", i, rec.Code)
+		}
+	}
+	rec := guess(testAdminRootEmail)
+	if rec.Code != http.StatusTooManyRequests || rec.Body.String() != rateLimitBody || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("guess 3 answered %d %q Retry-After=%q, want the registered 429", rec.Code, rec.Body.String(), rec.Header().Get("Retry-After"))
+	}
+	// The budget is per account under keyBy email: a different address in the
+	// body is a different budget, and the bootstrap arm's empty email falls
+	// back to the client address, which is a third.
+	if rec := guess("someone-else@example.test"); rec.Code != http.StatusUnauthorized {
+		t.Errorf("another account's first guess answered %d, want 401", rec.Code)
+	}
+	if rec := guess(""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("the bootstrap arm's first guess answered %d, want 401", rec.Code)
+	}
+	// Nothing else on the console is touched by this limiter: the ping is
+	// refused by the guard, not the budget.
+	if rec := s.call(t, http.MethodGet, "/admin/api/ping", nil); rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /admin/api/ping answered %d after the login budget was spent, want 401", rec.Code)
+	}
+
+	// Off with the block, identity with the console unmounted: never nil,
+	// because assembleHandler always wraps.
+	if newAdminLoginLimiter(mustLoad(t, with(baseEnv(), "AWESOME_AUTH_RATE_LIMIT_ENABLED", "false")), nil, discardLogger()) == nil ||
+		newAdminLoginLimiter(mustLoad(t, baseEnv()), nil, discardLogger()) == nil {
+		t.Error("newAdminLoginLimiter returned nil; assembleHandler wraps unconditionally and wants the identity")
+	}
+}
+
+// TestAdminLoginSkipsTheSecondFactor pins the product deviation
+// admin-login-skips-the-second-factor: an account POST <prefix>/login
+// challenges for a TOTP code is signed into the console by POST <admin>/login
+// on its password alone, and the token it gets is an admin credential the
+// policy then judges. It fails the day upstream's login honours
+// TwoFactorPolicy, which is when the entry is retired.
+func TestAdminLoginSkipsTheSecondFactor(t *testing.T) {
+	t.Parallel()
+	s := newAdminSurface(t, loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin)), Options{}, nil)
+	const email = "second-factor@example.test"
+	id, _ := s.registerAndLogin(t, email)
+	// Enrolment through the store rather than through /2fa/setup: the claim is
+	// about what the admin login asks, not about TOTP.
+	if err := s.stores.UpdateTOTPSecret(context.Background(), id, "", "JBSWY3DPEHPK3PXP", true); err != nil {
+		t.Fatalf("enable TOTP on the account: %v", err)
+	}
+
+	// The auth router challenges.
+	login := s.call(t, http.MethodPost, "/auth/login", map[string]string{"email": email, "password": testPassword})
+	if login.Code != http.StatusOK || decodeJSON(t, login)["requiresTwoFactor"] != true {
+		t.Fatalf("POST /auth/login answered %d %s, want the second-factor challenge; the account is not gated and this test proves nothing", login.Code, login.Body.String())
+	}
+
+	// The console does not.
+	rec := s.call(t, http.MethodPost, "/admin/login", map[string]string{"email": email, "password": testPassword})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /admin/login for a second-factor account answered %d: %s\n"+
+			"If upstream's admin login now honours the second factor, retire admin-login-skips-the-second-factor", rec.Code, rec.Body.String())
+	}
+	var cookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if strings.HasSuffix(c.Name, "accessToken") && c.Value != "" {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatalf("the admin login set no session cookie: %v", rec.Result().Cookies())
+	}
+	// Authenticated and judged by the policy — 403, not 401 — and admitted
+	// the moment the flag is set, with no factor ever presented.
+	if rec := s.call(t, http.MethodGet, "/admin/api/ping", nil, withCookie(cookie)); rec.Code != http.StatusForbidden {
+		t.Fatalf("ping with the unflagged account's admin token answered %d, want 403 (a credential the policy refuses)", rec.Code)
+	}
+	if rec := s.call(t, http.MethodPost, "/admin/users/"+id+"/promote", map[string]string{"method": "flag"}, withCookie(s.rootLogin(t))); rec.Code != http.StatusOK {
+		t.Fatalf("promote answered %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := s.call(t, http.MethodGet, "/admin/api/ping", nil, withCookie(cookie)); rec.Code != http.StatusOK {
+		t.Errorf("ping with the flagged account's admin token answered %d, want 200: the console was entered on a password alone", rec.Code)
+	}
+}
+
+// ── the single-tenant detail route ───────────────────────────────────────────
+
+// TestAdminUserDetailIsSingleTenant pins the product deviation
+// admin-user-detail-is-single-tenant: the listing shows a row under a tenant
+// and the detail route beside it answers 404 for the same id, because the
+// pinned core looks the id up in the empty tenant. It fails the day the pin
+// moves to a core whose detail route spans tenants (UserLookupStore, upstream
+// PR #92), which is when the entry is retired.
+func TestAdminUserDetailIsSingleTenant(t *testing.T) {
+	t.Parallel()
+	s := newAdminSurface(t, loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin)), Options{}, nil)
+	cookie := s.rootLogin(t)
+	plainID, _ := s.registerAndLogin(t, "plain@example.test")
+	const tenantedID = "usr_00000000000000000000000000tenant"
+	if _, err := s.stores.CreateUser(context.Background(), auth.User{ID: tenantedID, Email: "tenanted@acme.test", TenantID: "acme"}); err != nil {
+		t.Fatalf("create a tenanted user: %v", err)
+	}
+
+	listing := s.call(t, http.MethodGet, "/admin/api/users", nil, withCookie(cookie))
+	if listing.Code != http.StatusOK || !strings.Contains(listing.Body.String(), tenantedID) || !strings.Contains(listing.Body.String(), plainID) {
+		t.Fatalf("GET /admin/api/users answered %d and does not list both accounts: %s", listing.Code, listing.Body.String())
+	}
+	if rec := s.call(t, http.MethodGet, "/admin/api/users/"+plainID, nil, withCookie(cookie)); rec.Code != http.StatusOK {
+		t.Errorf("detail of an empty-tenant user answered %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	rec := s.call(t, http.MethodGet, "/admin/api/users/"+tenantedID, nil, withCookie(cookie))
+	if rec.Code != http.StatusNotFound || decodeJSON(t, rec)["error"] != "User not found" {
+		t.Fatalf("detail of a tenanted user answered %d %s, want 404 {\"error\":\"User not found\"} on the v0.11.0 core\n"+
+			"If the pinned core now spans tenants on this route, retire admin-user-detail-is-single-tenant", rec.Code, rec.Body.String())
+	}
+}
+
+// ── the CORS layer stops at the mount ────────────────────────────────────────
+
+// TestAdminMountIsOutsideTheCORSLayer: the reference mounts its CORS layer
+// inside the auth router and its admin router carries none of it, so an
+// allow-listed origin gets the credentialed headers on the auth routes and
+// nothing — no Allow-Origin, no Vary, no preflight short-circuit — on the
+// console (app.go corsExemptMounts). Built through assembleHandler, which is
+// the chain New builds; the old harness omitted the layer and could not see
+// the console sitting behind it.
+func TestAdminMountIsOutsideTheCORSLayer(t *testing.T) {
+	t.Parallel()
+	const origin = "https://app.example.test"
+	s := newAdminSurface(t, loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin, "AWESOME_AUTH_CORS_ORIGINS", origin)), Options{}, nil)
+	withOrigin := func(r *http.Request) { r.Header.Set("Origin", origin) }
+
+	me := s.call(t, http.MethodGet, "/auth/me", nil, withOrigin)
+	if me.Header().Get("Access-Control-Allow-Origin") != origin {
+		t.Fatalf("GET /auth/me to an allow-listed origin carries Access-Control-Allow-Origin %q, want %q; the layer is off and this test proves nothing",
+			me.Header().Get("Access-Control-Allow-Origin"), origin)
+	}
+	for _, path := range []string{"/admin", "/admin/", "/admin/api/ping", "/admin/login", "/admin/assets/admin.js"} {
+		rec := s.call(t, http.MethodGet, path, nil, withOrigin)
+		if v := rec.Header().Get("Access-Control-Allow-Origin"); v != "" {
+			t.Errorf("GET %s carries Access-Control-Allow-Origin %q; the reference's admin router sets no CORS header", path, v)
+		}
+		if strings.Contains(rec.Header().Get("Vary"), "Origin") {
+			t.Errorf("GET %s carries Vary: Origin; the console is outside the CORS layer", path)
+		}
+		pre := s.call(t, http.MethodOptions, path, nil, withOrigin)
+		if pre.Code == http.StatusNoContent && pre.Header().Get("Access-Control-Allow-Origin") != "" {
+			t.Errorf("OPTIONS %s was answered by the CORS layer's preflight; the console must see its own requests", path)
+		}
+	}
+}
+
+// ── nothing the console handles reaches the log ──────────────────────────────
+
+// TestNoAdminCredentialReachesTheLog extends delivery_test.go's
+// TestNoCredentialReachesTheLog to the credentials this block introduces: the
+// root password and its hash, the bootstrap secret, the admin session cookie,
+// and the key and secret the console hands back when an API key and a webhook
+// are created through it. The chain is New's, access log included, and the
+// logger is at Debug so that what is asserted absent had every chance to
+// appear.
+func TestNoAdminCredentialReachesTheLog(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	cfg := loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin, "AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET", testBootstrapSecret))
+	s := newAdminSurface(t, cfg, Options{Logger: newLogger(&buf, slog.LevelDebug)}, nil)
+
+	if rec := s.call(t, http.MethodPost, "/admin/login", map[string]string{"email": testAdminRootEmail, "password": "not-" + testAdminRootPassword}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a wrong root password answered %d, want 401", rec.Code)
+	}
+	cookie := s.rootLogin(t)
+	boot := s.call(t, http.MethodPost, "/admin/login", map[string]string{"email": "", "password": testBootstrapSecret})
+	if boot.Code != http.StatusOK {
+		t.Fatalf("the bootstrap-secret login answered %d: %s", boot.Code, boot.Body.String())
+	}
+	var secrets []string
+	for _, c := range boot.Result().Cookies() {
+		if c.Value != "" {
+			secrets = append(secrets, c.Value)
+		}
+	}
+	secrets = append(secrets, cookie.Value, testAdminRootPassword, testRootHash, testBootstrapSecret)
+
+	key := s.call(t, http.MethodPost, "/admin/api/api-keys", map[string]any{"name": "ci", "scopes": []string{"read"}}, withCookie(cookie))
+	if key.Code != http.StatusOK && key.Code != http.StatusCreated {
+		t.Fatalf("POST /admin/api/api-keys answered %d: %s", key.Code, key.Body.String())
+	}
+	keyMaterial := 0
+	for k, v := range decodeJSON(t, key) {
+		// Every long string the route hands back is key material of one kind
+		// or another; the name is the one short value.
+		if str, ok := v.(string); ok && len(str) >= 20 && k != "id" {
+			secrets = append(secrets, str)
+			keyMaterial++
+		}
+	}
+	if keyMaterial == 0 {
+		t.Fatalf("the API-key route answered no key material, so this half proves nothing: %s", key.Body.String())
+	}
+	const webhookSecret = "webhook-signing-secret-0123456789abcdef"
+	hook := s.call(t, http.MethodPost, "/admin/api/webhooks", map[string]any{"url": "https://hooks.example.test/in", "events": []string{"user.created"}, "secret": webhookSecret}, withCookie(cookie))
+	if hook.Code != http.StatusOK && hook.Code != http.StatusCreated {
+		t.Fatalf("POST /admin/api/webhooks answered %d: %s", hook.Code, hook.Body.String())
+	}
+	secrets = append(secrets, webhookSecret)
+
+	out := buf.String()
+	if out == "" || !strings.Contains(out, "admin console mounted") {
+		t.Fatalf("the cold-start and access log is empty or missing the console's line, so this test proves nothing:\n%s", out)
+	}
+	for _, secret := range secrets {
+		if strings.Contains(out, secret) {
+			t.Errorf("a credential of the admin surface appears in the log: %q\n%s", secret, out)
+		}
+	}
+}
+
+// ── the driver's store satisfies what the admin slot asks of it ──────────────
+
+// TestDynamoDBStoreSatisfiesTheAdminStoreProvider is the settings block's
+// convention (TestDynamoDBStoreSatisfiesTheSettingsStore) applied to the five
+// accessors the admin slot finds structurally: an accessor renamed on the
+// production driver, or on the migrating wrapper that embeds it, would
+// otherwise surface only as a cold-start refusal in a deployed stack.
+func TestDynamoDBStoreSatisfiesTheAdminStoreProvider(t *testing.T) {
+	t.Parallel()
+	store, err := ddbstore.New(stubDynamoAPI{}, ddbstore.Options{TableName: "unused", Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	for name, v := range map[string]any{
+		"*dynamodb.Store":               store,
+		"*migrating.MigratingUserStore": &migrating.MigratingUserStore{Store: store},
+		"memoryStoreBundle":             newMemoryStoreBundle(),
+	} {
+		provider, ok := v.(adminStoreProvider)
+		if !ok {
+			t.Errorf("%s does not satisfy adminStoreProvider, so adminOptions could never find its stores", name)
+			continue
+		}
+		if provider.Metadata() == nil || provider.Roles() == nil || provider.Tenants() == nil || provider.APIKeys() == nil || provider.Webhooks() == nil {
+			t.Errorf("%s answers nil from one of the five accessors; adminOptions would refuse the flag at cold start", name)
+		}
+	}
+}
+
+// nilRolesProvider is a driver whose store exposes the accessors but hands
+// back no RBAC store — the shape adminOptions' second refusal exists for.
+type nilRolesProvider struct{ memoryStoreBundle }
+
+func (nilRolesProvider) Roles() auth.RolesPermissionsStore { return nil }
+
+// TestAdminOptionsRefusesAStoreTheDriverLacks drives the two refusal branches
+// of adminOptions: a flag on for a user store that exposes none of the five,
+// and a flag on for a provider whose accessor answers nil. Both name the flag
+// and refuse rather than draw a tab over a 404.
+func TestAdminOptionsRefusesAStoreTheDriverLacks(t *testing.T) {
+	t.Parallel()
+	cfg := loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin))
+
+	_, err := adminOptions(cfg, Options{}, auth.NewMemoryUserStore(), discardLogger())
+	if err == nil || !strings.Contains(err.Error(), "exposes none of them") {
+		t.Errorf("a bare user store with the console's flags on: %v, want a refusal naming the missing accessors", err)
+	}
+	_, err = adminOptions(cfg, Options{}, nilRolesProvider{newMemoryStoreBundle()}, discardLogger())
+	if err == nil || !strings.Contains(err.Error(), "stores.enable.rbac") {
+		t.Errorf("a provider with no RBAC store: %v, want a refusal naming stores.enable.rbac", err)
+	}
+	// And with every flag off, neither shape refuses: the flags are the switch.
+	off := loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin,
+		"AWESOME_AUTH_STORES_ENABLE_METADATA", "false",
+		"AWESOME_AUTH_STORES_ENABLE_RBAC", "false",
+		"AWESOME_AUTH_STORES_ENABLE_TENANTS", "false",
+		"AWESOME_AUTH_STORES_ENABLE_API_KEYS", "false",
+		"AWESOME_AUTH_STORES_ENABLE_WEBHOOKS", "false",
+	))
+	if _, err := adminOptions(off, Options{}, auth.NewMemoryUserStore(), discardLogger()); err != nil {
+		t.Errorf("a bare user store with every flag off was refused: %v", err)
 	}
 }

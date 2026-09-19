@@ -133,8 +133,8 @@ func WireDeviations() []WireDeviation {
 		},
 		{
 			ID: "docs-page-carries-a-content-security-policy",
-			Surface: "the response headers of GET <prefix>/docs and GET <prefix>/openapi.json, and -- with the admin console mounted -- " +
-				"of the console's own pair, GET <admin>/api/docs and GET <admin>/api/openapi.json",
+			Surface: "the response headers of GET <prefix>/docs and GET <prefix>/openapi.json, and -- with admin.enabled -- " +
+				"of GET <admin>/api/docs and GET <admin>/api/openapi.json",
 			Behaviour: "Both documentation responses carry a Content-Security-Policy, X-Content-Type-Options: nosniff " +
 				"and Referrer-Policy: no-referrer. The page's policy pins the one CDN origin the reference's HTML " +
 				"loads from and denies everything else -- no fetch or XHR off this origin, no image beacon, no form " +
@@ -236,9 +236,76 @@ func WireDeviations() []WireDeviation {
 			Spec: "docs/spec/config-schema.md §1.16; docs/spec/data-model.md §1.5 row #61 and §2.3; docs/config-reference.md §14 and §16",
 		},
 		{
+			ID:      "admin-login-skips-the-second-factor",
+			Surface: "POST <admin>/login, for an account with a second factor enabled or a deployment whose settings require one",
+			Behaviour: "The route mints a 24-hour admin token on email and password alone. It consults neither the account's " +
+				"enrolment nor the settings store's require2FA, so an account that POST <prefix>/login would challenge for a " +
+				"TOTP or SMS code is signed into the console without one. The product puts the rateLimit block in front of the " +
+				"route -- same budget, same window, same keyBy rule as POST <prefix>/login, its own counter scope -- and " +
+				"documents admin.loginPath, pointed at the hosted login, as the way a browser reaches the console through the " +
+				"flow that does enforce the second factor.",
+			Reference: "The same: the login's third arm is findByEmail(email) and a password compare and nothing else " +
+				"(src/router/admin.router.ts:566-573), and the route is unlimited (:543). The reference also leaves the route " +
+				"outside every limiter it has, which is none.",
+			Why: "Not a decision this product made: the core reproduces the reference's login as written (admin.go adminLogin), " +
+				"and the rule against forking the core stands. It is registered because this product's own docs and cold-start " +
+				"log say the 2FA-bypass class is closed by admin-guard-accepts-only-typed-session-tokens -- which closes the " +
+				"typed-token hole, where a step-up tempToken opened the console -- and this route is the exception that " +
+				"paragraph would otherwise hide: the second factor is skipped not by presenting the wrong token but by never " +
+				"being asked. It is reachable at all because wiring the admin block mounts the route, so an operator who " +
+				"requires 2FA has to learn it from the register and not from an incident. What the product can add without a " +
+				"route it adds: the limiter, because the route was otherwise an unlimited password oracle for every user in " +
+				"the empty tenant, and for the bootstrap secret a constant-time compare with no bcrypt cost at all; and RS-6's " +
+				"length floor on that secret. cmd/auth/admin_test.go TestAdminLoginSkipsTheSecondFactor fails the day upstream " +
+				"makes the login honour TwoFactorPolicy, which is when this entry is retired.",
+			Spec: "docs/config-reference.md §16.2 and §16.7; upstream deviation admin-guard-accepts-only-typed-session-tokens",
+		},
+		{
+			ID:      "uploaded-assets-carry-a-content-security-policy",
+			Surface: "the response headers of GET <prefix>/ui/assets/uploads/* and GET <prefix>/ui/assets/logo/*, when an upload store is built",
+			Behaviour: "Every response under the two paths carries Content-Security-Policy: default-src 'none'; style-src " +
+				"'unsafe-inline'; sandbox and X-Content-Type-Options: nosniff. The bytes, the Content-Type, the Cache-Control " +
+				"and the status codes are untouched; with no upload store the two paths answer 404 with no header, as the " +
+				"reference does with uploadDir unset.",
+			Reference: "express.static serves the upload directory with no header beyond its own Content-Type and caching " +
+				"(src/router/ui.router.ts:185-191), and the upload filter admits .svg by name (admin.router.ts:1018-1022).",
+			Why: "An SVG is an XML document that may carry script, and served same-origin it runs with the auth cookies, on the " +
+				"origin where the CSRF cookie is readable from JavaScript by design and where the admin API has no CSRF layer. " +
+				"The author is an administrator -- the upload routes are behind the guard -- but an administrator's browser " +
+				"can be handed a file, and the core says this is the host's trade to take: \"serves the upload prefix from a " +
+				"separate origin, or behind a Content-Security-Policy, or drops 'svg' by wrapping the store\" " +
+				"(upload_store.go UploadNameAllowed). This product has one origin and will not break a console that offers " +
+				"svg, so it takes the middle one. `sandbox` makes a top-level SVG an opaque-origin document with scripts, " +
+				"forms and navigation off; default-src 'none' closes every fetch; style-src 'unsafe-inline' keeps an honest " +
+				"SVG's own <style> rendering. nosniff is the core's other warning on the same seam: the filter tests the name " +
+				"and nothing else, so a file called logo.png holding HTML is stored and served as image/png, and without " +
+				"nosniff a browser may decide otherwise. A header middleware adds no route, which is what keeps this inside " +
+				"the rule that this binary registers nothing under the api prefix. cmd/auth/admin_test.go " +
+				"TestUploadedAssetsAreServedFromTheUploadStore pins both headers on a served asset and their absence on the " +
+				"auth routes.",
+			Spec: "docs/config-reference.md §16.5; docs-page-carries-a-content-security-policy (the same shape, on the documentation pair)",
+		},
+		{
+			ID:      "admin-user-detail-is-single-tenant",
+			Surface: "GET <admin>/api/users/{id}, for a user who lives under a tenant",
+			Behaviour: "Answers 404 {\"error\":\"User not found\"} for a row the listing beside it, GET <admin>/api/users, shows: " +
+				"the listing spans every tenant and the detail looks the id up in the empty tenant only.",
+			Reference: "findById(id) carries no tenant at all (src/router/admin.router.ts:789-800), so the detail spans tenants " +
+				"exactly as the listing does.",
+			Why: "Core-caused and not fixable here: the pinned core's adminGetUser calls GetUserByID(id, \"\") with the empty " +
+				"tenant as a literal (admin_read.go:396), because the UserStore seam has no tenant-free lookup; the fix is " +
+				"written upstream as UserLookupStore (awesome-go-auth PR #92) and not tagged, so this build stays on v0.11.0 " +
+				"and serves what v0.11.0 serves. Every account this binary registers lives in the empty tenant, so the two " +
+				"routes agree on a table this deployment filled itself; migrate cognito --tenant is what produces the rows " +
+				"they disagree on. A product-side route would be a route under the admin path, and this binary adds none. " +
+				"cmd/auth/admin_test.go TestAdminUserDetailIsSingleTenant fails the day the pin moves to a core whose detail " +
+				"route spans tenants, which is when this entry is retired.",
+			Spec: "docs/config-reference.md §16.4; upstream awesome-go-auth PR #92 (UserLookupStore)",
+		},
+		{
 			ID:      "admin-first-user-policy-is-refused",
 			Surface: "admin.accessPolicy: first-user, and therefore who the console admits",
-			Behaviour: "The policy is refused at start on every store driver (RS-18). The spelling stays in the schema so a " +
+			Behaviour: "The policy is refused at start on every store driver (RS-17). The spelling stays in the schema so a " +
 				"document written for another port parses and meets the refusal, which names the way in: admin.rootUser " +
 				"or admin.bootstrapSecret, then POST <admin>/users/{id}/promote {\"method\":\"flag\"} under is-admin-flag.",
 			Reference: "accessPolicy: 'first-user' grants whoever listUsers(1, 0) returns first, documented as \"the first " +
@@ -253,9 +320,9 @@ func WireDeviations() []WireDeviation {
 				"a creation-ordered listing, which is a store seam the core would have to grow (the lister's order is a " +
 				"contract, AdminUserStore) -- an upstream change, and one to file. Until then the honest answer is to refuse " +
 				"the policy and say why, rather than ship a knob whose documented meaning is not what it does. " +
-				"internal/config/rules_test.go TestRefuseToStartRules (the RS-18 case) pins the refusal; it retires the day " +
+				"internal/config/rules_test.go TestRefuseToStartRules (the RS-17 case) pins the refusal; it retires the day " +
 				"the pinned core lists by creation time or mints monotonic ids.",
-			Spec: "docs/config-reference.md §16.1; docs/spec/config-schema.md §2 RS-18",
+			Spec: "docs/config-reference.md §16.1; docs/spec/config-schema.md §2 RS-17",
 		},
 		// ui-uploaded-assets-are-not-served was registered by the hosted-UI
 		// block and retired by the admin surface. Its three reasons -- no

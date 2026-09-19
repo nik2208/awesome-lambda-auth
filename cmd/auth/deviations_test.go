@@ -17,6 +17,8 @@ import (
 func TestWireDeviationIDsArePinned(t *testing.T) {
 	want := []string{
 		"admin-first-user-policy-is-refused",
+		"admin-login-skips-the-second-factor",
+		"admin-user-detail-is-single-tenant",
 		"csrf-enabled-by-default",
 		"docs-page-carries-a-content-security-policy",
 		"idp-kid-derived-from-key-material",
@@ -26,6 +28,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",
+		"uploaded-assets-carry-a-content-security-policy",
 		// ui-uploaded-assets-are-not-served was retired by the admin surface:
 		// the upload store is the writer D7 said was missing, and the read
 		// path now serves it. docs/deviations.md keeps the entry under

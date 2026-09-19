@@ -536,7 +536,7 @@ is [docs/config-reference.md §16](../../docs/config-reference.md).
 | Parameter | Meaning |
 |---|---|
 | `EnableAdminConsole` | `true` mounts the console. Off by default. |
-| `AdminAccessPolicy` | `is-admin-flag`, the one value the template offers. `open` (everyone, no credential) is `ConfigFile`-only and warned about, because every front door here is internet-facing; `first-user` is refused at cold start on every driver (RS-18: ids are random on this product, so the policy would admit whoever drew the lowest one). The `rbac:<role>` and `permission:<perm>` forms need `stores.enable.rbac`, which is a document knob, so they are set in `ConfigFile`. |
+| `AdminAccessPolicy` | `is-admin-flag`, the one value the template offers. `open` (everyone, no credential) is `ConfigFile`-only and warned about, because every front door here is internet-facing; `first-user` is refused at cold start on every driver (RS-17: ids are random on this product, so the policy would admit whoever drew the lowest one). The `rbac:<role>` and `permission:<perm>` forms need `stores.enable.rbac`, which is a document knob, so they are set in `ConfigFile`. |
 | `AdminRootEmail` + `AdminRootPasswordHashArn` | The bootstrap administrator: an address and a Secrets Manager secret holding that user's **bcrypt hash** — the output of bcrypt, never the password. Required together; a changeset with one and not the other is refused by a Rule. The root user bypasses the policy, which is how the first administrator gets in under `is-admin-flag` and promotes the second. |
 | `EnableAdminUploads` | Creates the private bucket above and points `ui.uploadDir` at `s3://<bucket>/uploads`. Off by default. |
 
@@ -572,7 +572,7 @@ clears the cookie, and rotating the access-token secret is the one kill switch;
 console for an account the deployment would otherwise challenge, so a
 deployment that requires 2FA points `admin.loginPath` at the hosted login,
 whose flow does (`admin-login-skips-the-second-factor`); and it has **no CSRF
-check**, so the Rule refuses the console beside `CookieSameSite=none` (RS-19).
+check**, so the Rule refuses the console beside `CookieSameSite=none` (RS-18).
 The function rate-limits `/admin/login` under the same `rateLimit` block as the
 auth login.
 

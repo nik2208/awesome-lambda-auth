@@ -583,7 +583,7 @@ func TestTheRootUserFollowsTheConsoleSwitch(t *testing.T) {
 // TestTheConsoleParameterOffersOnlyTheFlagPolicy pins the two values that
 // left AdminAccessPolicy's AllowedValues: `open` admits the world on a stack
 // whose every front door is internet-facing, and `first-user` is refused at
-// cold start on every driver (RS-18). Both stay in the schema so a family
+// cold start on every driver (RS-17). Both stay in the schema so a family
 // document parses and meets the warning or the refusal; neither is something
 // this template should offer as a choice.
 func TestTheConsoleParameterOffersOnlyTheFlagPolicy(t *testing.T) {
@@ -604,7 +604,7 @@ func TestTheConsoleParameterOffersOnlyTheFlagPolicy(t *testing.T) {
 		t.Fatalf("read %s: %v", templateFile, err)
 	}
 	if !strings.Contains(strings.ReplaceAll(string(raw), "\r\n", "\n"), "AdminConsoleNeedsSameSiteCookies:") {
-		t.Error("the Rule refusing the console beside CookieSameSite none is gone (RS-19 at changeset time)")
+		t.Error("the Rule refusing the console beside CookieSameSite none is gone (RS-18 at changeset time)")
 	}
 }
 

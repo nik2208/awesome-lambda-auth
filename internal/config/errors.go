@@ -48,7 +48,7 @@ const (
 	// on RS-5.
 	RuleMigrationIncomplete = "RS-13"
 
-	// RS-14 to RS-17 belong to the tools block (D9a), which numbered them first
+	// RS-14 to RS-16 belong to the tools block (D9a), which numbered them first
 	// and lands beside this one; the admin surface takes the two after them.
 	//
 	// RuleFirstUserRandomIDs refuses admin.accessPolicy: first-user on every
@@ -63,7 +63,7 @@ const (
 	// drivers that can, for the reason that what they list is not what the
 	// policy assumes. cmd/auth/deviations.go admin-first-user-policy-is-refused
 	// carries the argument and names the day it retires.
-	RuleFirstUserRandomIDs = "RS-18"
+	RuleFirstUserRandomIDs = "RS-17"
 
 	// RuleAdminCrossSiteCookie refuses the admin console under a session policy
 	// beside cookies.sameSite: none. The console sits outside the CSRF chain by
@@ -73,7 +73,7 @@ const (
 	// SameSite attribute is the only thing between a cross-site form post and
 	// every admin write, POST <admin>/users/{id}/promote included. RS-5 makes
 	// `none` need Secure; this one makes it and the console exclusive.
-	RuleAdminCrossSiteCookie = "RS-19"
+	RuleAdminCrossSiteCookie = "RS-18"
 
 	// RuleSchemaVersion is not in the §2 table because §4 states it separately:
 	// a document whose major version this build does not know refuses to start

@@ -1381,7 +1381,7 @@ below.
 | `ui.headless` | boolean | `false` | `AWESOME_AUTH_UI_HEADLESS` |
 | `ui.customCss` | string | none | — (file-only) |
 | `ui.assetsDir` | string (directory) | none; the vendored assets | — (file-only) |
-| `ui.uploadDir` | string (directory) | none; **accepted and not honoured**, see §15.4 | `AWESOME_AUTH_UI_UPLOAD_DIR` |
+| `ui.uploadDir` | `s3://<bucket>[/<prefix>]` (a filesystem path loads and is reported by `unwiredKnobs`) | none, see §15.4 and §16.5 | `AWESOME_AUTH_UI_UPLOAD_DIR` |
 | `ui.branding.siteName` | string | `Awesome Node Auth` | `AWESOME_AUTH_UI_SITE_NAME` |
 | `ui.branding.primaryColor` | string | `#4a90d9` | `AWESOME_AUTH_UI_PRIMARY_COLOR` |
 | `ui.branding.secondaryColor` | string | `#6c757d` | `AWESOME_AUTH_UI_SECONDARY_COLOR` |
@@ -1562,7 +1562,7 @@ argues every field; this section is the same map from the operator's side.
 | Path | Type | Default | Env var |
 |---|---|---|---|
 | `admin.enabled` | boolean | `false` | `AWESOME_AUTH_ADMIN_ENABLED` |
-| `admin.accessPolicy` | `is-admin-flag` \| `open` \| `rbac:<role>` \| `permission:<perm>` \| `first-user` (parses, **refused at start**, RS-18) | unset | `AWESOME_AUTH_ADMIN_ACCESS_POLICY` |
+| `admin.accessPolicy` | `is-admin-flag` \| `open` \| `rbac:<role>` \| `permission:<perm>` \| `first-user` (parses, **refused at start**, RS-17) | unset | `AWESOME_AUTH_ADMIN_ACCESS_POLICY` |
 | `admin.bootstrapSecret` | secret | unset | `AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET` (+ `_SECRETSMANAGER` / `_SSM_PARAMETER`) |
 | `admin.rootUser.email` | email | unset | `AWESOME_AUTH_ADMIN_ROOT_EMAIL` |
 | `admin.rootUser.passwordHash` | secret, a bcrypt hash | unset | `AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH` (+ `_SECRETSMANAGER` / `_SSM_PARAMETER`) |
@@ -1596,7 +1596,7 @@ by the very next request, exactly as in the reference.
   advice for it — "use only behind a VPN or IP allow-list" (`admin.router.ts:29`).
   The contract suite reports a console that answers a bare `GET <admin>/api/ping`
   with 200 as a fault, in as many words.
-- **`first-user`** is **refused at start on every driver** (RS-18), and the
+- **`first-user`** is **refused at start on every driver** (RS-17), and the
   schema keeps the spelling only so a document written for another port parses
   here and meets the refusal rather than a schema error. The reference grants
   "the first registered user", meaning whoever `listUsers(1, 0)` returns first
@@ -1654,17 +1654,48 @@ The guard reads a bearer token, then a cookie, and accepts exactly two kinds:
   logging into the console replaces the browser's auth session cookie until the
   next `/refresh`.
 
+**The console's own login does not enforce the second factor.** Its third arm
+is a password check and nothing else: no TOTP or SMS step, no look at the
+account's enrolment, no look at the settings store's `require2FA`. An account
+that `POST <prefix>/login` challenges is signed into the console by
+`POST <admin>/login` on its password alone, with a 24-hour admin token, and
+the policy then judges that token like any other. That is the reference's
+behaviour, the core reproduces it, and this binary cannot close it without a
+route it may not add — so it is registered
+(`admin-login-skips-the-second-factor`, pinned by
+`TestAdminLoginSkipsTheSecondFactor`) and mitigated two ways. The route is
+**rate limited** under the same `rateLimit` block as the auth login (§16.7);
+before this it was an unlimited password oracle for every user in the empty
+tenant and, for the bootstrap secret, a constant-time compare with no bcrypt
+cost per guess. And **`admin.loginPath`, pointed at the hosted login**
+(`<prefix>/ui/login`), sends a browser through the flow that does enforce the
+second factor: the ordinary access token it ends with is the first credential
+above, and the guard judges it. A deployment that requires 2FA sets it.
+
+**Neither credential is revocable through the session store.** The guard
+verifies signature, `typ`, issuer and expiry and never consults the store, so
+`sessions.checkOn: allcalls` does not reach the console: an access token whose
+session was revoked or logged out stays an admin credential until it expires,
+and the admin token — a `sid`-less JWT — lives its 24 hours whatever happens to
+the account. `POST <admin>/logout` only clears the cookie. The one kill switch
+is rotating `security.jwt.accessTokenSecret`, which ends every session in the
+deployment. And there is no route on either line that *clears* an `isAdmin`
+flag: demoting an administrator is a table edit
+(`internal/store/dynamodb/user_flags.go`).
+
 **What the shared secret does not do here.** In the reference a bare
 `jwt.verify` over that secret makes *every* token the secret signs an admin
 credential — a refresh token, and the typed step-up token a user holds after a
 password and before a second factor, so the console can be entered without the
-second factor the deployment requires. The core types the admin token and
-accepts only `typ:"admin"` and `typ:"access"`, honouring `isRoot` only on the
-first: the upstream deviation `admin-guard-accepts-only-typed-session-tokens`.
-This product inherits that fix by construction, because it never signs a token
-with anything but the core, and it is why a different `JWTSecret` would be a
-loss and not a hardening — it would sever the first credential without buying
-back anything the second lacks.
+second factor the deployment requires by presenting the wrong kind of token.
+The core types the admin token and accepts only `typ:"admin"` and
+`typ:"access"`, honouring `isRoot` only on the first: the upstream deviation
+`admin-guard-accepts-only-typed-session-tokens`. This product inherits that fix
+by construction, because it never signs a token with anything but the core, and
+it is why a different `JWTSecret` would be a loss and not a hardening — it would
+sever the first credential without buying back anything the second lacks. It
+closes the typed-token hole and nothing else: the paragraph two above is the
+route where the factor is skipped by never being asked.
 
 **The root user** (`admin.rootUser.email` and `.passwordHash`) is a credential
 that lives in configuration rather than in the user table, for "environments
@@ -1687,7 +1718,22 @@ bootstrap. With no policy it is the legacy guard — a bearer token compared
 against the `Authorization` header, 401 absent and 403 wrong — and the shell is
 served unguarded with the SPA holding the secret in `sessionStorage`. Beside a
 policy it is also a *password* the login route accepts for the empty email or
-the literal `admin`, minting an `isRoot` token. Prefer a policy and a root user.
+the literal `admin`, minting an `isRoot` token — compared in constant time with
+no bcrypt cost per guess, which is why RS-6 refuses one shorter than 32
+characters (the HS256 floor) and why the login is rate limited. Prefer a policy
+and a root user.
+
+**The console has no CSRF check, and `SameSite` is its whole defence.** The
+vendored SPA posts to `<admin>/login` as JSON with no CSRF header, so a
+double-submit check would refuse every login it makes; the guard accepts the
+ordinary access-token cookie; and the promote handler decodes its body loosely
+with no `Content-Type` check. What keeps a cross-site `<form method=POST>` from
+reaching `POST <admin>/users/{id}/promote` is the `SameSite` attribute on the
+cookie — `lax`, the reference's own default and this product's. RS-18 therefore
+**refuses the console beside `cookies.sameSite: none`**, and the SAM Rule
+`AdminConsoleNeedsSameSiteCookies` refuses the same pair at changeset time. The
+product's CORS layer is kept off the admin mount for the same reason the
+reference never puts one there (`cmd/auth/app.go`, `corsExemptMounts`).
 
 **`admin.cookiePrefix`, and the empty string.** The core's field is a `*string`
 because the reference distinguishes an explicit empty prefix — the bare name
@@ -1719,7 +1765,11 @@ never looks at the marker. The core lets that branch reach exactly one route —
 the HTML shell, whose whole job in that state is to render the login form with
 every feature flag emptied — and answers 401 everywhere else
 (`admin-unauthenticated-get-serves-only-the-login-form`). This product inherits
-it; the contract suite pins the 401.
+it; the narrowed branch — an HTML `GET` of a guarded route answering 401 — is
+pinned in `cmd/auth/admin_test.go` `TestAdminConsoleIsMountedGuardedAndServed`
+and in the core's own tests, not in the contract suite, whose every anonymous
+guarded request carries `Accept: application/json` and so exercises the branch
+the reference answers 401 on too.
 
 **The console's own documentation pair** — `GET <admin>/api/openapi.json` and
 `GET <admin>/api/docs` — follows `docs.swagger` exactly as the auth router's pair
@@ -1770,7 +1820,11 @@ the fix is written upstream (`UserLookupStore`) and **not tagged**, so this buil
 stays on `v0.11.0` and serves what `v0.11.0` serves. Nothing here works around
 it — a product-side route would be a route under the admin path, and this binary
 adds none (§12.3 says why) — and the DynamoDB store's half, an item keyed on the
-id alone, lands with the pin that can call it.
+id alone, lands with the pin that can call it. It is registered as
+`admin-user-detail-is-single-tenant`, because the product register's scope
+includes a divergence a core route causes that this product cannot fix without
+forking the core; `TestAdminUserDetailIsSingleTenant` fails the day the pin
+moves to a core whose detail route spans tenants.
 
 ### 16.5 Uploads: `ui.uploadDir` as an S3 location, and what a logo costs
 
@@ -1806,9 +1860,31 @@ arithmetic. Every stored object records its `Content-Type` from the key's
 extension at write time, because an S3 object stored without one is served as
 `binary/octet-stream` forever after and no browser paints a logo under that type.
 
-The size bound is the core's `UploadMaxBytes`, a constant carrying the
-reference's multer limit of 5 MiB; `admin.upload.maxFileSizeMb` reaches it only
-when it says 5 (§16.8).
+**Every response under the two asset paths carries a header the reference does
+not send**: `Content-Security-Policy: default-src 'none'; style-src
+'unsafe-inline'; sandbox` and `X-Content-Type-Options: nosniff`. The reference's
+upload filter admits `.svg` by name, and an SVG is a document that may carry
+script; served same-origin it would run with the auth cookies, on the origin
+where the CSRF cookie is JavaScript-readable and the admin API has no CSRF
+layer. The core names the trade and hands it to the host; this product takes
+the header rather than dropping `svg`, because a console that offers it would
+break. `sandbox` makes a top-level SVG an opaque-origin document with scripts
+off, and `nosniff` keeps a `logo.png` that holds HTML from being sniffed into
+one. Registered as `uploaded-assets-carry-a-content-security-policy`; with no
+store both paths answer 404 with no header, as the reference does.
+
+**The size bound.** The core refuses a file over `UploadMaxBytes` — a constant
+carrying the reference's multer limit of 5 MiB — with its own 413
+`{"error":"File too large"}`, and `admin.upload.maxFileSizeMb` reaches it only
+when it says 5 (§16.8). **That bound is not the one a client meets here.** A
+multipart body reaches this function base64-encoded inside a synchronous
+invocation event, and the event is capped at 6 MB, so a file past roughly
+**4.4 MiB** never reaches the core: API Gateway refuses it with its own 413 and
+its own body, `{"message":"Request Entity Too Large"}`, not the admin envelope.
+Between 4.4 and 5 MiB the reference accepts and this product does not; above
+5 MiB both refuse, with different bodies. The effective ceiling is the
+platform's, the knob-gap text for `admin.upload.maxFileSizeMb` says so, and a
+deployment that needs larger logos puts them in the bucket by another route.
 
 ### 16.6 The backfill you owe before the users tab is right
 
@@ -1818,7 +1894,7 @@ driver is a Query over a **sparse** index — a constant partition key and a
 nothing before it wrote at all. A profile written earlier is found by every
 other route and is invisible to exactly this one: the users tab under-reports,
 and the failure does not look like one from outside. (The `first-user` policy
-read the same index and would have been wrong here for a second reason; RS-18
+read the same index and would have been wrong here for a second reason; RS-17
 refuses it, §16.1.) D6 declared the debt; this block ships the job that pays it:
 
 ```sh
@@ -1838,13 +1914,23 @@ table that predates D6 before turning `admin.enabled` on there**; the cold-start
 log says so whenever the console mounts on the DynamoDB driver, because it is
 the only place this deployment can.
 
-### 16.7 The promote route's own limiter
+### 16.7 The promote route's own limiter, and the login's
 
 The core's `AdminOptions.RateLimiter` is a second limiter slot, separate from the
 auth router's, spread onto **exactly one route**: `POST <admin>/users/{id}/promote`,
-the route that changes who is an administrator. The admin login is deliberately
-not limited, on either line (`admin-promote-route-comes-from-the-development-line`).
-The reference's default is nil — an empty middleware list — and this product
+the route that changes who is an administrator. The admin login is not in that
+slot on either line (`admin-promote-route-comes-from-the-development-line`), and
+the reference leaves it unlimited; this product does not. **`POST <admin>/login`
+is limited by a middleware over the mount** (`cmd/auth/ratelimit.go`,
+`newAdminLoginLimiter`) — the core's own comment says a host that wants one
+wraps the handler the adapter mounts, and a middleware matching one route adds
+no route — on the same `rateLimit.max` and `rateLimit.windowSeconds`, the same
+switch, the same counter and the same `keyBy` rule as `POST <prefix>/login`: the
+body's normalised email under `email`, the client address under `ip` and
+whenever the body names none (the bootstrap arm's empty email). Its counter
+scope is its own, so the console's login cannot spend a user's budget on the
+auth router or the other way round. §16.2 says why the route needed one.
+The reference's default for the promote slot is nil — an empty middleware list — and this product
 fills the slot anyway, under the rule that fills the auth router's (§14): with
 `rateLimit.enabled` on, the promote route shares `rateLimit.max` and
 `rateLimit.windowSeconds`, runs its limiter *ahead of the guard* so an
@@ -1859,12 +1945,16 @@ reference exactly.
 ### 16.8 What the cold start tells you, and the two knobs it reports
 
 `admin console mounted` names the mount, the policy and what it grants, which
-credentials the guard accepts, whether a root user and a bootstrap secret are
-configured, and whether the documentation pair is on — with a `Warn` for the
-pair, and a `Warn` naming the backfill on the DynamoDB driver. `admin console
-not mounted` says why: the block is off, or (for a document that bypassed the
-loader) it is on with no access decision. `admin stores wired` lists which of
-the five stores were handed over and whether an upload store was built.
+credentials the guard accepts (and that the console's login skips the second
+factor and that neither credential is revocable), whether a root user and a
+bootstrap secret are configured (`bootstrapSecretConfigured`, a boolean — the
+value itself is never logged), and whether the documentation pair is on — with
+a `Warn` for the pair, a `Warn` naming the backfill on the DynamoDB driver, and
+the whole line at `Warn` rather than `Info` under the `open` policy, which the
+loader also warns about. `admin console not mounted` says why: the block is
+off, or (for a document that bypassed the loader) it is on with no access
+decision. `admin stores wired` lists which of the five stores were handed over
+and whether an upload store was built.
 
 Two knobs of the block are **reported rather than honoured**, by `unwiredKnobs`,
 and only when they differ from the value the core applies. `admin.sessionTtl`:

@@ -38,12 +38,12 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 	checkRS11OAuthProviders(c, d)
 	checkRS12MemoryStore(c, d)
 	checkRS13Migration(c, capabilities, d)
-	checkRS18FirstUserRandomIDs(c, d)
-	checkRS19AdminCrossSiteCookie(c, d)
+	checkRS17FirstUserRandomIDs(c, d)
+	checkRS18AdminCrossSiteCookie(c, d)
 	checkStoreRequirements(c, d)
 }
 
-// checkRS18FirstUserRandomIDs: the first-user policy does not elect the first
+// checkRS17FirstUserRandomIDs: the first-user policy does not elect the first
 // user here, so it is refused on every driver.
 //
 // The reference's evaluation is `listUsers(1, 0)` and compare the first id
@@ -62,7 +62,7 @@ func checkRules(c *Config, capabilities func(string) StoreCapabilities, d *diagn
 //
 // Not conditioned on admin.enabled, like RS-10: a policy that would be wrong
 // the day the switch is flipped is wrong in the document today.
-func checkRS18FirstUserRandomIDs(c *Config, d *diagnostics) {
+func checkRS17FirstUserRandomIDs(c *Config, d *diagnostics) {
 	if c.Admin.AccessPolicy != AdminAccessPolicyFirstUser {
 		return
 	}
@@ -74,7 +74,7 @@ func checkRS18FirstUserRandomIDs(c *Config, d *diagnostics) {
 			"POST <admin>/users/{id}/promote {\"method\":\"flag\"}; or rbac:<role> / permission:<perm> beside stores.enable.rbac")
 }
 
-// checkRS19AdminCrossSiteCookie: the console and SameSite=None are exclusive.
+// checkRS18AdminCrossSiteCookie: the console and SameSite=None are exclusive.
 //
 // The admin router is mounted outside the auth router's CSRF chain, by the
 // reference's design and the core's (admin.go, "What is not wrapped around
@@ -89,7 +89,7 @@ func checkRS18FirstUserRandomIDs(c *Config, d *diagnostics) {
 // rule says that, with a console mounted under a session policy, `none` is not
 // available at all. The legacy bootstrap-secret guard reads only the
 // Authorization header and `open` reads nothing, so neither is in scope.
-func checkRS19AdminCrossSiteCookie(c *Config, d *diagnostics) {
+func checkRS18AdminCrossSiteCookie(c *Config, d *diagnostics) {
 	if !c.Admin.Enabled || c.Cookies.SameSite != SameSiteNone {
 		return
 	}

@@ -167,8 +167,8 @@ func TestRefuseToStartRules(t *testing.T) {
 		},
 		{
 			// Two rules fire on this document, RS-10 above for the driver and
-			// RS-18 for the ids, and each names its own reason.
-			name: "RS-18 first-user policy elects the lowest random id, on every driver",
+			// RS-17 for the ids, and each names its own reason.
+			name: "RS-17 first-user policy elects the lowest random id, on every driver",
 			mutate: func(doc Document) {
 				set(doc, "admin.enabled", true)
 				set(doc, "admin.accessPolicy", "first-user")
@@ -180,7 +180,7 @@ func TestRefuseToStartRules(t *testing.T) {
 			wantMessage:        "lowest random id",
 		},
 		{
-			name: "RS-19 admin console under a session policy with sameSite none",
+			name: "RS-18 admin console under a session policy with sameSite none",
 			mutate: func(doc Document) {
 				set(doc, "cookies.sameSite", "none")
 				set(doc, "cookies.secure", true)
