@@ -28,6 +28,7 @@ func TestWireDeviationIDsArePinned(t *testing.T) {
 		"refresh-token-families",
 		"runtime-settings-seed-only-fills-absent-keys",
 		"templates-dir-only-seeds-absent-ids",
+		"tools-api-key-refusal-is-the-cores-bare-401",
 		"tools-stream-is-not-mounted-on-api-gateway",
 		"ui-uploaded-assets-are-not-served",
 	}

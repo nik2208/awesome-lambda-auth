@@ -466,10 +466,33 @@ func collectWarnings(cfg *Config) {
 			"resource-server mode is on with no expected issuer, so the iss claim is not validated",
 			"set resourceServer.issuer to the issuer your identity provider mints")
 	}
-	if normalizeEnum(cfg.Tools.Auth) == ToolsAuthNone || cfg.Tools.Auth == "" {
+	// Only for the literal, and only with the block on. An unset tools.auth used
+	// to be read as `none` here, which was harmless while the phase gate refused
+	// the whole block and became the open door by omission the day it did not;
+	// validateTools now refuses it under tools.enabled, so the one way to reach
+	// this warning is to have written the word. With the block off no tools
+	// endpoint exists, and a warning about one on every cold start of every
+	// deployment taught operators to read past this line.
+	if cfg.Tools.Enabled && normalizeEnum(cfg.Tools.Auth) == ToolsAuthNone {
 		cfg.warn("tools.auth",
 			"the tools endpoints are unauthenticated, reproducing the reference's default",
 			"set tools.auth to session, apiKey or admin unless the endpoints are deliberately public")
+	}
+	// The session posture with cross-site cookies. The tools router sits
+	// outside the auth router's CSRF chain — the core mounts it bare — and the
+	// product's session guard performs the reference's double-submit for a
+	// cookie caller in its place (cmd/auth/tools.go, toolsDoubleSubmit), so a
+	// cross-site page cannot drive POST <tools>/track on a victim's cookie even
+	// with SameSite=None. What SameSite=None does change is what a *legitimate*
+	// cross-site front end has to do: it cannot read the csrf-token cookie of
+	// another site, so it has to call the tools routes with the bearer token
+	// rather than the cookie. A warning and not a refusal, because that is a
+	// working configuration; RS-5 already refuses the half that is not.
+	if cfg.Tools.Enabled && normalizeEnum(cfg.Tools.Auth) == ToolsAuthSession &&
+		normalizeEnum(cfg.Cookies.SameSite) == SameSiteNone {
+		cfg.warn("tools.auth",
+			"tools.auth is session and cookies.sameSite is none, so the access-token cookie is sent to the tools routes from any site; a cookie-authenticated POST there still needs the X-CSRF-Token double-submit, which a page on another site cannot supply",
+			"call the tools routes with the bearer access token from a cross-site front end, or choose tools.auth: apiKey")
 	}
 	if cfg.IsProduction() {
 		for _, path := range sortedKeys(cfg.secrets) {

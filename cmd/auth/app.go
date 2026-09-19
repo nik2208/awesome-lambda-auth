@@ -937,6 +937,14 @@ func driverStores(driver string) (map[string]bool, bool) {
 		// tools.auth: apiKey verifies against (tools.go). Every one of the
 		// three is handed over by name from newToolsWiring and toolsAccess.
 		//
+		// The listing is about the driver and cannot see the document, so it
+		// reopens the hole above for one combination: a flag switched on while
+		// its one consumer is off — any of the three with tools.enabled off,
+		// or apiKeys under a posture other than apiKey. That combination is
+		// reported by toolsKnobGaps at every cold start rather than refused
+		// here, for the reason given there, and
+		// TestUnwiredKnobsIsExactlyTheDocumentedList pins the rows.
+		//
 		// The three v0.8.0 admin listers are the exception that proves the rule
 		// and need no flag: AdminUserStore, SessionLister and RoleLister are
 		// discovered by type assertion on the user, session and RBAC stores, so
