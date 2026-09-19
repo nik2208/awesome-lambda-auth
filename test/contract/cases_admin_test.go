@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The admin console, black-box: the reference's admin router
@@ -125,37 +127,48 @@ func init() {
 
 		Case{
 			Name: "admin/shell-serves-the-login-form-anonymously",
-			Doc: "reference src/router/admin.router.ts:318-325, :406-496 — an unauthenticated GET <admin>/ that accepts text/html is 200 " +
-				"with the HTML shell, window.__ADMIN_CONFIG__ injected, and sessionBased true under a session policy",
-			Needs: []Capability{CapAdmin},
+			Doc: "reference src/router/admin.router.ts:311-325, :406-496 — an unauthenticated GET <admin>/ that accepts text/html is 200 " +
+				"with the HTML shell, window.__ADMIN_CONFIG__ injected and sessionBased true under a session policy, or 302 to " +
+				"<loginPath>?redirect=… when the host configured one; the two static assets are public either way",
+			Needs: []Capability{CapAdmin, CapAdminSession},
 			Run: func(t *testing.T, e *Env) {
 				r := e.NewClient().GET(t, adminPath()+"/", Header("Accept", "text/html"))
-				r.mustStatus(t, 200)
-				if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
-					t.Errorf("Content-Type = %q, want text/html\n  %s", ct, r.where())
-				}
-				page := string(r.Body)
-				i := strings.Index(page, "window.__ADMIN_CONFIG__ = ")
-				if i < 0 {
-					t.Fatalf("the shell carries no window.__ADMIN_CONFIG__ block, so admin.js cannot find its mount or its features\n  %s", r.where())
-				}
-				var cfg struct {
-					Base          string `json:"base"`
-					SessionBased  bool   `json:"sessionBased"`
-					AuthAPIPrefix string `json:"authApiPrefix"`
-				}
-				dec := json.NewDecoder(strings.NewReader(page[i+len("window.__ADMIN_CONFIG__ = "):]))
-				if err := dec.Decode(&cfg); err != nil {
-					t.Fatalf("the injected config is not JSON (%v)\n  %s", err, r.where())
-				}
-				if cfg.Base != adminPath()[1:] {
-					t.Errorf("injected base = %q, want the mount %q — the SPA would call routes under the wrong path\n  %s", cfg.Base, adminPath()[1:], r.where())
-				}
-				if !cfg.SessionBased {
-					t.Errorf("injected sessionBased = false under a session policy; the SPA would render the bearer-secret form\n  %s", r.where())
-				}
-				if cfg.AuthAPIPrefix != e.Prefix {
-					t.Errorf("injected authApiPrefix = %q, want %q — the console tells the SPA where the auth router lives\n  %s", cfg.AuthAPIPrefix, e.Prefix, r.where())
+				r.mustStatusIn(t, 200, 302)
+				if r.Status == 302 {
+					// admin.loginPath: the console sends a browser to the
+					// operator's login page with its own mount as the redirect
+					// parameter (admin.router.ts:311-315). The suite cannot know
+					// the configured path; it can know the shape.
+					loc, err := url.Parse(r.Header.Get("Location"))
+					if err != nil || !strings.HasPrefix(loc.Query().Get("redirect"), adminPath()[1:]) {
+						t.Errorf("Location = %q, want <loginPath>?redirect=<the admin mount, URL-encoded>\n  %s", r.Header.Get("Location"), r.where())
+					}
+				} else {
+					if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+						t.Errorf("Content-Type = %q, want text/html\n  %s", ct, r.where())
+					}
+					cfg, ok := adminShellConfig(string(r.Body))
+					if !ok {
+						t.Fatalf("the shell carries no window.__ADMIN_CONFIG__ block, or it is not JSON, so admin.js cannot find its mount or its features\n  %s", r.where())
+					}
+					if cfg.Base != adminPath()[1:] {
+						t.Errorf("injected base = %q, want the mount %q — the SPA would call routes under the wrong path\n  %s", cfg.Base, adminPath()[1:], r.where())
+					}
+					if !cfg.SessionBased {
+						t.Errorf("injected sessionBased = false under a session policy; the SPA would render the bearer-secret form\n  %s", r.where())
+					}
+					// The reference emits the host-supplied apiPrefix option
+					// (`features.authApiPrefix || '/auth'`, admin.router.ts:445),
+					// not the mount it observes, so a host that mounted the auth
+					// router elsewhere and did not say so is a conforming
+					// deployment whose value differs from e.Prefix. What is the
+					// contract is that the SPA is told an absolute path.
+					if !strings.HasPrefix(cfg.AuthAPIPrefix, "/") {
+						t.Errorf("injected authApiPrefix = %q, want an absolute path — the console tells the SPA where the auth router lives\n  %s", cfg.AuthAPIPrefix, r.where())
+					}
+					if cfg.AuthAPIPrefix != e.Prefix {
+						t.Logf("note: injected authApiPrefix = %q while the suite drives the auth router at %q; the reference emits the host's option, not the mount", cfg.AuthAPIPrefix, e.Prefix)
+					}
 				}
 				// The two static assets the shell loads are public, as the
 				// reference registers them (admin.router.ts:688-701).
@@ -169,7 +182,7 @@ func init() {
 			Name: "admin/login-sets-the-session-and-ping-reads-it",
 			Doc: "reference src/router/admin.router.ts:543-611, :741-743 — POST <admin>/login {email,password} is 200 {\"success\":true} " +
 				"with the session cookie, and GET <admin>/api/ping with that cookie is 200 {ok:true, features:{…}}",
-			Needs: []Capability{CapAdmin, CapAdminCredential},
+			Needs: []Capability{CapAdmin, CapAdminSession, CapAdminCredential},
 			Run: func(t *testing.T, e *Env) {
 				c := adminLogin(t, e)
 				r := c.GET(t, adminPath()+"/api/ping")
@@ -208,7 +221,7 @@ func init() {
 			Name: "admin/users-listing-has-the-reference-shape",
 			Doc: "reference src/router/admin.router.ts:748-790 — GET <admin>/api/users is 200 {users:[…], total:n} with the lister, " +
 				"or 501 {error:'IUserStore.listUsers is not implemented', users:[], total:0} without one; never a bare array",
-			Needs: []Capability{CapAdmin, CapAdminCredential},
+			Needs: []Capability{CapAdmin, CapAdminSession, CapAdminCredential},
 			Run: func(t *testing.T, e *Env) {
 				// A fresh account, so the listing has at least one row this run
 				// can vouch for on the stack.
@@ -250,10 +263,10 @@ func init() {
 
 		Case{
 			Name: "admin/settings-round-trip",
-			Doc: "reference src/router/admin.router.ts:951-971 — GET <admin>/api/settings is the settings object unwrapped, PUT merges " +
-				"a partial object and answers 200 {\"success\":true}, and the next GET reflects it; 404 {error:'Settings store not " +
-				"configured'} on both without a store",
-			Needs: []Capability{CapAdmin, CapAdminCredential},
+			Doc: "reference src/router/admin.router.ts:951-987 — GET <admin>/api/settings is the settings object unwrapped; PUT merges " +
+				"a partial object and PATCH /api/settings/ui merges into the ui block, each answering 200 {\"success\":true}, and the " +
+				"next GET reflects the change; 404 {error:'Settings store not configured'} on every settings route without a store",
+			Needs: []Capability{CapAdmin, CapAdminSession, CapAdminCredential},
 			Run: func(t *testing.T, e *Env) {
 				c := adminLogin(t, e)
 				r := c.GET(t, adminPath()+"/api/settings")
@@ -265,29 +278,86 @@ func init() {
 					t.Skip("this deployment wires no settings store (stores.enable.settings), which is a configuration and not a fault")
 				}
 				before := r.obj(t)
-				// Write back the value the stack already holds, so a run leaves
-				// the deployment exactly as it found it: the round trip is the
-				// contract, not the change.
-				current, _ := before["require2FA"].(bool)
-				put := c.PUT(t, adminPath()+"/api/settings", body{"require2FA": current})
-				put.mustStatus(t, 200)
-				if put.obj(t)["success"] != true {
-					t.Errorf("PUT body = %v, want {\"success\":true}\n  %s", put.obj(t), put.where())
-				}
-				after := c.GET(t, adminPath()+"/api/settings").mustStatus(t, 200).obj(t)
-				if got, _ := after["require2FA"].(bool); got != current {
-					t.Errorf("require2FA after the PUT = %v, want %v\n  %s", got, current, put.where())
+
+				// The write half has two rules and they pull in opposite
+				// directions. It must be non-vacuous: a PUT that persisted
+				// nothing and answered {"success":true} must fail here, which
+				// means the value written has to differ from the value read.
+				// And it must leave the stack exactly as it found it — not
+				// only the same values but the same KEYS, because on this
+				// product a key's presence carries meaning: the cold-start
+				// seed fills only absent keys (runtime-settings-seed-only-
+				// fills-absent-keys), so materialising require2FA: false where
+				// the store held no such key would permanently disarm a later
+				// `runtimeSettings.require2fa: true` in the document. So the
+				// case round-trips a key the store already holds and restores
+				// it, and when the store holds nothing restorable it skips the
+				// write half rather than invent a key.
+				settings := adminPath() + "/api/settings"
+				switch {
+				case before["require2FA"] != nil:
+					// Present: flip it, see it, put it back. The key stays
+					// present throughout, with its original value at the end.
+					current, _ := before["require2FA"].(bool)
+					t.Cleanup(func() {
+						c.PUT(t, settings, body{"require2FA": current}).mustStatus(t, 200)
+					})
+					put := c.PUT(t, settings, body{"require2FA": !current})
+					put.mustStatus(t, 200)
+					if put.obj(t)["success"] != true {
+						t.Errorf("PUT body = %v, want {\"success\":true}\n  %s", put.obj(t), put.where())
+					}
+					after := c.GET(t, settings).mustStatus(t, 200).obj(t)
+					if got, _ := after["require2FA"].(bool); got != !current {
+						t.Errorf("require2FA after PUT %v = %v; the merge persisted nothing\n  %s", !current, got, put.where())
+					}
+				case before["ui"] != nil:
+					// A ui block is present: PATCH one member and restore the
+					// whole block with a PUT, which replaces `ui` as a unit
+					// (the store's merge is shallow, admin.router.ts:979-981)
+					// — so a member the block did not hold is gone again at
+					// the end, not left behind as an empty string.
+					original, _ := before["ui"].(map[string]any)
+					if original == nil {
+						original = map[string]any{}
+					}
+					t.Cleanup(func() {
+						c.PUT(t, settings, body{"ui": original}).mustStatus(t, 200)
+					})
+					probe := fmt.Sprintf("contract-probe-%d", time.Now().UnixNano())
+					patch := c.PATCH(t, settings+"/ui", body{"siteName": probe})
+					patch.mustStatus(t, 200)
+					if patch.obj(t)["success"] != true {
+						t.Errorf("PATCH body = %v, want {\"success\":true}\n  %s", patch.obj(t), patch.where())
+					}
+					after := c.GET(t, settings).mustStatus(t, 200).obj(t)
+					ui, _ := after["ui"].(map[string]any)
+					if ui["siteName"] != probe {
+						t.Errorf("ui.siteName after the PATCH = %v, want %q; the merge persisted nothing\n  %s", ui["siteName"], probe, patch.where())
+					}
+					for k, v := range original {
+						if k != "siteName" && fmt.Sprint(ui[k]) != fmt.Sprint(v) {
+							t.Errorf("ui.%s after the PATCH = %v, want the untouched %v; the sub-object merge dropped a sibling\n  %s", k, ui[k], v, patch.where())
+						}
+					}
+				default:
+					t.Skipf("the settings store holds neither require2FA nor a ui block (%v); every write would create a key the seed reads as administrator-set, and the suite leaves the stack as it found it", before)
 				}
 			},
 		},
 	)
 }
 
-// PUT is the one method this file adds to the client: the settings route is
-// the only PUT on any surface the suite covers.
+// PUT and PATCH are the two methods this file adds to the client: the settings
+// routes are the only PUT and PATCH on any surface the suite covers.
 func (c *Client) PUT(t *testing.T, path string, b body, opts ...reqOpt) *Resp {
 	t.Helper()
 	return c.do(t, http.MethodPut, path, b, opts)
+}
+
+func (c *Client) PATCH(t *testing.T, path string, b body, opts ...reqOpt) *Resp {
+	t.Helper()
+	return c.do(t, http.MethodPatch, path, b, opts)
 }
 
 // adminProbeWhy renders the probe's observation for the report.

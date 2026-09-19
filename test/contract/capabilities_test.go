@@ -397,10 +397,42 @@ const CapAdmin Capability = "admin"
 // promote one, and the first account on a shared stack is somebody else's.
 const CapAdminCredential Capability = "admin-credential"
 
+// CapAdminSession is whether the console authenticates through a session — an
+// access policy, with POST <admin>/login and /logout mounted and the shell
+// rendering the email-and-password form — rather than through the legacy
+// bearer secret, under which the shell is served with sessionBased false, no
+// login route exists and the SPA holds the secret in sessionStorage. Both are
+// conforming deployments (admin.router.ts:516-537) and both answer 401 to the
+// anonymous ping, so the ping cannot tell them apart; the shell can, and this
+// is read off the anonymous shell's injected config. Every case that logs in,
+// or asserts the login form, needs it.
+const CapAdminSession Capability = "admin-session"
+
+// adminShellConfig parses the window.__ADMIN_CONFIG__ block out of the shell
+// the console serves an anonymous browser (admin.router.ts:406-496). The
+// three members are the ones the suite reads; ok is false when the block is
+// missing or is not JSON.
+func adminShellConfig(page string) (cfg struct {
+	Base          string `json:"base"`
+	SessionBased  bool   `json:"sessionBased"`
+	AuthAPIPrefix string `json:"authApiPrefix"`
+}, ok bool) {
+	const marker = "window.__ADMIN_CONFIG__ = "
+	i := strings.Index(page, marker)
+	if i < 0 {
+		return cfg, false
+	}
+	dec := json.NewDecoder(strings.NewReader(page[i+len(marker):]))
+	if err := dec.Decode(&cfg); err != nil {
+		return cfg, false
+	}
+	return cfg, true
+}
+
 func init() {
 	registerCapability(capabilityDecl{
 		Name:    CapAdmin,
-		Settles: []Capability{CapAdminCredential},
+		Settles: []Capability{CapAdminCredential, CapAdminSession},
 		Stage:   stageProbed,
 		Probe: func(t *testing.T, p *probeRun) {
 			// Anonymous, on GET <admin>/api/ping, on purpose. The route is
@@ -429,14 +461,53 @@ func init() {
 				p.Set(CapAdmin, capability{state: capBroken, why: adminProbeWhy(r, "neither the guard's 401, the unmounted 404 nor the open console's 200")})
 			}
 
+			// Session or legacy secret, read off the anonymous shell. Only a
+			// mounted, guarded console has a shell worth reading; the other
+			// three states settle this one by implication.
+			switch p.Env.Caps[CapAdmin].state {
+			case capOn:
+				shell := p.Anon.GET(t, adminPath()+"/", Header("Accept", "text/html"))
+				switch {
+				case shell.Status == 200:
+					cfg, ok := adminShellConfig(string(shell.Body))
+					switch {
+					case !ok:
+						p.Set(CapAdminSession, capability{state: capBroken, why: adminProbeWhy(shell, "the shell carries no window.__ADMIN_CONFIG__ block, so admin.js could not find its mount")})
+					case cfg.SessionBased:
+						p.Set(CapAdminSession, capability{state: capOn, why: adminProbeWhy(shell, "the shell injects sessionBased true: an access policy guards the console and POST <admin>/login is mounted")})
+					default:
+						p.Set(CapAdminSession, capability{state: capAbsent, why: adminProbeWhy(shell,
+							"the shell injects sessionBased false: the legacy bootstrap secret is the guard, no login route exists, and the SPA holds the secret in sessionStorage")})
+					}
+				case shell.Status == 302 && strings.Contains(shell.Header.Get("Location"), "redirect="):
+					// admin.loginPath: the session guard sends an anonymous
+					// browser to a login page of the operator's choosing
+					// (admin.router.ts:311-315) instead of rendering the form.
+					// The redirect exists only under a session policy, so it
+					// settles this on.
+					p.Set(CapAdminSession, capability{state: capOn, why: adminProbeWhy(shell,
+						"an anonymous browser is redirected to the configured loginPath ("+shell.Header.Get("Location")+"), which only the session guard does")})
+				default:
+					p.Set(CapAdminSession, capability{state: capBroken, why: adminProbeWhy(shell, "neither the shell (200 text/html) nor a loginPath redirect (302 with ?redirect=)")})
+				}
+			case capAbsent:
+				p.Set(CapAdminSession, capability{state: capAbsent, why: "no console is mounted"})
+			default:
+				p.Set(CapAdminSession, capability{state: capBroken, why: "the console itself is broken; see admin"})
+			}
+
+			// The half-declared shape has to be tested first: `declared` is
+			// already false for it, so an `!declared` arm above it would report
+			// a misconfigured run as a deployment without an administrator and
+			// silently skip every credentialed case.
 			email, password, declared := adminCredential()
 			switch {
+			case (email == "") != (password == ""):
+				p.Set(CapAdminCredential, capability{state: capBroken, why: fmt.Sprintf(
+					"only one of %s and %s is set; a half-declared credential is a misconfigured run, not a deployment without one", AdminEmailEnv, AdminPasswordEnv)})
 			case !declared:
 				p.Set(CapAdminCredential, capability{state: capAbsent, why: fmt.Sprintf(
 					"%s and %s are unset, so no administrator is declared; the suite cannot mint one", AdminEmailEnv, AdminPasswordEnv)})
-			case email != "" && password == "" || email == "" && password != "":
-				p.Set(CapAdminCredential, capability{state: capBroken, why: fmt.Sprintf(
-					"only one of %s and %s is set; a half-declared credential is a misconfigured run, not a deployment without one", AdminEmailEnv, AdminPasswordEnv)})
 			default:
 				p.Set(CapAdminCredential, capability{state: capOn, why: fmt.Sprintf("%s declares %s", AdminEmailEnv, email)})
 			}
