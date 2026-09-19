@@ -469,8 +469,57 @@ func TestTheUploadBucketIsPrivateEncryptedAndConditional(t *testing.T) {
 			t.Errorf("Sid %s is not conditioned on AdminUploadsEnabled; a stack without the bucket would grant S3 access to nothing, or to everything", sid)
 		}
 	}
+	// The assertions are positive, because the template writes its ARNs
+	// through ${AdminUploadsBucket.Arn} and a literal wildcard could never
+	// appear in an honest or a dishonest edit: what has to be seen is the
+	// prefix on the object grant, the bucket ARN and no s3:prefix condition on
+	// the listing grant, and no '*' Resource anywhere in the S3 block.
+	start := strings.Index(fn.body, "Sid: AdminUploadObjects")
+	end := strings.Index(fn.body[start:], "AWS::NoValue")
+	if start < 0 || end < 0 {
+		t.Fatal("cannot isolate the S3 statements in AuthFunction")
+	}
+	s3Block := fn.body[start : start+end]
+	if !strings.Contains(s3Block, "Resource: !Sub '${AdminUploadsBucket.Arn}/uploads/*'") {
+		t.Error("AdminUploadObjects is not scoped to ${AdminUploadsBucket.Arn}/uploads/*, the one prefix the store writes under")
+	}
+	if !strings.Contains(s3Block, "Resource: !GetAtt AdminUploadsBucket.Arn") {
+		t.Error("AdminUploadListing is not scoped to the bucket's own ARN")
+	}
+	// No prefix condition on the listing, on purpose: S3 answers a missing
+	// key 404 only to a caller that holds s3:ListBucket for that request, and
+	// a GetObject carries no s3:prefix, so a conditioned grant would turn
+	// every miss into a 403 the store reads as a failure
+	// (internal/integration/aws/s3_uploads.go, TestS3AccessDeniedIsAFailureNotAMiss).
+	if strings.Contains(s3Block, "s3:prefix") {
+		t.Error("AdminUploadListing carries an s3:prefix condition, which does not apply to GetObject/HeadObject and turns every missing upload into a 403 instead of a 404")
+	}
+	for _, line := range strings.Split(s3Block, "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "Resource:") && strings.Contains(trimmed, "'*'") {
+			t.Errorf("an S3 statement names Resource '*': %s", trimmed)
+		}
+	}
 	if strings.Contains(fn.body, "s3:*") || strings.Contains(fn.body, "arn:aws:s3:::*") {
-		t.Error("AuthFunction carries an S3 wildcard; every S3 grant is scoped to the upload bucket's prefix")
+		t.Error("AuthFunction carries an S3 wildcard; every S3 grant is scoped to the upload bucket")
+	}
+
+	// The bucket policy exists, is conditioned with the bucket, and only
+	// denies: the one thing a policy on a private bucket should add is the
+	// TLS requirement.
+	policy, ok := tpl.resources["AdminUploadsBucketPolicy"]
+	if !ok {
+		t.Fatal("AdminUploadsBucketPolicy is gone; the bucket must refuse requests that are not over TLS")
+	}
+	if policy.condition != "AdminUploadsEnabled" {
+		t.Errorf("AdminUploadsBucketPolicy Condition = %q, want AdminUploadsEnabled, the bucket's own switch", policy.condition)
+	}
+	for _, want := range []string{"Effect: Deny", "aws:SecureTransport: 'false'", "${AdminUploadsBucket.Arn}/*"} {
+		if !strings.Contains(policy.body, want) {
+			t.Errorf("AdminUploadsBucketPolicy lacks %q", want)
+		}
+	}
+	if strings.Contains(policy.body, "Effect: Allow") {
+		t.Error("AdminUploadsBucketPolicy grants something; the function's access comes from its role, and the bucket policy only denies")
 	}
 }
 

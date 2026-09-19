@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	auth "github.com/nik2208/awesome-go-auth"
 )
@@ -74,9 +76,18 @@ import (
 // the same two steps (existsSync, then unlinkSync, admin.router.ts:1074-1080)
 // and the core's comment on ErrUploadNotFound names the race that pair has:
 // two administrators deleting the same file, where the second's unlink throws
-// and the route answers 500. Here the second's DeleteObject succeeds — the
-// delete is idempotent — so the race answers "deleted" to both, which is the
-// better of the two answers and the one the seam's comment asks for.
+// and the route answers 500. What the seam asks for in that race is the
+// sentinel — "Delete removes one object and returns ErrUploadNotFound if there
+// was none", because a 404 for the loser is better than a 500 — and this store
+// gives it in the common ordering: the loser's HeadObject runs after the
+// winner's DeleteObject landed, finds nothing, and answers ErrUploadNotFound.
+// In the narrow interleaving where both HeadObjects run before either delete,
+// the loser's DeleteObject succeeds too — the delete is idempotent — and both
+// callers are answered "deleted". That is not what the seam asks for, and it
+// is said here rather than claimed otherwise; it is still not the reference's
+// 500, the object is gone either way, and closing it would take a conditional
+// delete S3 only offers on versioned or ETag-matched requests, for a window
+// two people have to hit within one round trip of each other.
 //
 // # What Open does not do
 //
@@ -426,6 +437,20 @@ func (s *S3UploadStore) Delete(ctx context.Context, key string) error {
 // NoSuchKey from GetObject, and the bare 404 NotFound from HeadObject, which
 // carries no body and therefore no error code — plus the HTTP status itself,
 // for an SDK version that models neither.
+//
+// **A 403 is deliberately not a miss.** S3 answers a request for an absent key
+// with 404 only to a caller that holds s3:ListBucket on the bucket; to one that
+// does not it answers 403 AccessDenied, so that the absence of a key is not
+// disclosed to somebody who may not enumerate them. Reading AccessDenied as
+// "not found" would make this store work under a role that lacks the listing
+// grant, and it would also turn every genuine permission fault — a bucket
+// policy edited by hand, a role narrowed, the wrong bucket named — into a
+// console that reports an empty, healthy upload tab. So the grant is the fix
+// and not the mapping: infra/sam/template.yaml gives the role s3:ListBucket on
+// the bucket with no s3:prefix condition (a condition GetObject and HeadObject
+// requests do not carry, so a conditioned grant does not apply to them), and a
+// 403 stays the store failure it is. TestS3AccessDeniedIsAFailureNotAMiss pins
+// the decision.
 func isS3NotFound(err error) bool {
 	var noSuchKey *s3types.NoSuchKey
 	if errors.As(err, &noSuchKey) {
@@ -441,6 +466,12 @@ func isS3NotFound(err error) bool {
 		case "NoSuchKey", "NotFound":
 			return true
 		}
+	}
+	// The status itself, last: a 404 whose code this SDK version models under
+	// neither name is still an absent object. Only 404 — see above for 403.
+	var response *smithyhttp.ResponseError
+	if errors.As(err, &response) && response.HTTPStatusCode() == http.StatusNotFound {
+		return true
 	}
 	return false
 }

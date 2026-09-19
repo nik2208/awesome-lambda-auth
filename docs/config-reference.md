@@ -1666,8 +1666,10 @@ console has and is as strong as the hash and the access-token secret together.
 An email with no resolvable hash **refuses the cold start**: it would be a login
 form that is served and always answers "Invalid credentials", which is the
 silent shape this product refuses everywhere else. A value that is not a bcrypt
-hash is refused for the same reason. Hash the password yourself
-(`htpasswd -nbBC 12 x 'the password' | cut -d: -f2`) and store the hash.
+hash is refused for the same reason. Hash the password yourself with a tool
+that prompts for it — `htpasswd -nBC 12 x | cut -d: -f2`, never the `-b` form,
+which puts the root administrator's password on the command line and so in
+shell history and the process list — and store the hash.
 
 **The bootstrap secret** (`admin.bootstrapSecret`) is the reference's deprecated
 `adminSecret`, kept because the reference keeps it and because it is an honest
@@ -1767,9 +1769,18 @@ The console's file picker — `POST <admin>/api/upload/logo`, `/bg-image`,
 an upload store is configured, and the store is built from `ui.uploadDir`
 spelled as `s3://<bucket>[/<prefix>]` (§15.4). The stack creates such a bucket
 with `EnableAdminUploads=true`: private, SSE-S3 encrypted, every public-access
-block on, ACLs disabled, and the function granted exactly the store's five calls
-on the `uploads/` prefix and nothing else in S3
-(`infra/sam/README.md`, "Admin console"). The objects are served to browsers by
+block on, ACLs disabled, a bucket policy that refuses any request not made over
+TLS, and the function granted exactly the store's five calls: the object calls on
+the `uploads/` prefix and `s3:ListBucket` on the bucket itself, with **no
+`s3:prefix` condition** — deliberately, because S3 answers a `GetObject` or
+`HeadObject` for an absent key with 404 only to a caller that holds
+`s3:ListBucket` for that request and with 403 to everyone else, and a listing
+grant conditioned on a prefix does not apply to a `GetObject`, which carries no
+prefix. The store reads a 403 as the failure it is and never as "not found", so
+a conditioned grant would turn every missing logo into a 500
+(`s3_uploads.go` `isS3NotFound`, `TestS3AccessDeniedIsAFailureNotAMiss`).
+Nothing else in S3 (`infra/sam/README.md`, "Admin console"). The objects are
+served to browsers by
 the function under `<prefix>/ui/assets/uploads/<name>` — the URL the upload
 routes answer with, derived from the mount
 (`admin-upload-base-url-is-derived-from-the-mount`) — and by nothing else; the

@@ -949,8 +949,10 @@ Parameters:
       ARN of an existing Secrets Manager secret holding the root user's bcrypt
       PASSWORD HASH — the output of bcrypt, beginning $2a$/$2b$/$2y$, never the
       password. Nothing is generated for you: hash the password yourself
-      (`htpasswd -nbBC 12 x 'the password' | cut -d: -f2`, or any bcrypt
-      tool) and store the hash. REQUIRED whenever AdminRootEmail is set. Append
+      (`htpasswd -nBC 12 x | cut -d: -f2`, which prompts for the password
+      so it never lands in shell history or the process list — never the -b
+      form, which takes it on the command line — or any bcrypt tool) and
+      store the hash. REQUIRED whenever AdminRootEmail is set. Append
       #<jsonKey> to select one key of a JSON secret document. The function
       reads it at cold start; the value never enters the template.
 
@@ -2410,8 +2412,21 @@ Resources:
         #
         # Two statements because IAM scopes them to two different ARNs: the
         # object actions to the objects under uploads/, the listing to the
-        # bucket itself with an s3:prefix condition so the role can
-        # enumerate that prefix and no other. No s3:PutObjectAcl, no
+        # bucket itself. The listing grant carries NO s3:prefix condition,
+        # and that is load-bearing for the 404s rather than a loosening: S3
+        # answers a GetObject or HeadObject for an absent key with 404 only
+        # to a caller that holds s3:ListBucket for that request, and with
+        # 403 AccessDenied otherwise, so that the absence of a key is not
+        # disclosed to somebody who may not enumerate them. A GetObject
+        # request carries no s3:prefix context key, so a listing grant
+        # conditioned on one does not apply to it, and every missing logo
+        # and every delete of an absent file would come back 403 -- which
+        # the store deliberately reads as the failure it is and never as
+        # "not found" (s3_uploads.go isS3NotFound,
+        # TestS3AccessDeniedIsAFailureNotAMiss), so the hosted UI would
+        # answer 500 where the reference answers 404. The bucket is
+        # stack-owned and holds nothing but this prefix, so listing it whole
+        # discloses nothing the prefix would not. No s3:PutObjectAcl, no
         # s3:DeleteBucket, no s3:PutBucketPolicy: an auth router that can
         # make its own bucket public is a bad example that propagates.
         #
@@ -2433,10 +2448,8 @@ Resources:
                 Effect: Allow
                 Action:
                   - s3:ListBucket
+                # Unconditioned on purpose; see the comment above.
                 Resource: !GetAtt AdminUploadsBucket.Arn
-                Condition:
-                  StringLike:
-                    s3:prefix: ['uploads/', 'uploads/*']
           - !Ref 'AWS::NoValue'
 
       Events:
@@ -2503,6 +2516,31 @@ Resources:
       Tags:
         - Key: awesome-lambda-auth
           Value: admin-uploads
+
+  # The one bucket policy, and it grants nothing: it refuses every request
+  # that did not arrive over TLS, for every principal, the function's role
+  # included. The SDK the store uses speaks https and never trips it; what it
+  # closes is an operator's `aws s3 --endpoint-url http://` or a future
+  # reader configured carelessly, and it costs nothing. BlockPublicPolicy
+  # above still applies: a Deny statement is not a public grant.
+  AdminUploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: AdminUploadsEnabled
+    Properties:
+      Bucket: !Ref AdminUploadsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AdminUploadsBucket.Arn
+              - !Sub '${AdminUploadsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   # ---------------------------------------------------------------------
   # Content delivery
