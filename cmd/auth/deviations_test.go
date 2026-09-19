@@ -16,6 +16,7 @@ import (
 // visible act: the ids are handles the docs and the operators key on.
 func TestWireDeviationIDsArePinned(t *testing.T) {
 	want := []string{
+		"admin-first-user-policy-is-refused",
 		"csrf-enabled-by-default",
 		"docs-page-carries-a-content-security-policy",
 		"idp-kid-derived-from-key-material",

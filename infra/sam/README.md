@@ -536,15 +536,15 @@ is [docs/config-reference.md §16](../../docs/config-reference.md).
 | Parameter | Meaning |
 |---|---|
 | `EnableAdminConsole` | `true` mounts the console. Off by default. |
-| `AdminAccessPolicy` | `is-admin-flag` (default), `first-user` or `open`. The `rbac:<role>` and `permission:<perm>` forms need `stores.enable.rbac`, which is a document knob, so they are set in `ConfigFile`. |
+| `AdminAccessPolicy` | `is-admin-flag`, the one value the template offers. `open` (everyone, no credential) is `ConfigFile`-only and warned about, because every front door here is internet-facing; `first-user` is refused at cold start on every driver (RS-18: ids are random on this product, so the policy would admit whoever drew the lowest one). The `rbac:<role>` and `permission:<perm>` forms need `stores.enable.rbac`, which is a document knob, so they are set in `ConfigFile`. |
 | `AdminRootEmail` + `AdminRootPasswordHashArn` | The bootstrap administrator: an address and a Secrets Manager secret holding that user's **bcrypt hash** — the output of bcrypt, never the password. Required together; a changeset with one and not the other is refused by a Rule. The root user bypasses the policy, which is how the first administrator gets in under `is-admin-flag` and promotes the second. |
 | `EnableAdminUploads` | Creates the private bucket above and points `ui.uploadDir` at `s3://<bucket>/uploads`. Off by default. |
 
-**Run the backfill first.** The console's user tab and the `first-user` policy
-read a sparse index that only accounts created since the D6 release are in;
-every older account is found by every other route and missing from those two,
-and nothing looks wrong from outside. Before turning the console on against a
-table that predates that release:
+**Run the backfill first.** The console's user tab reads a sparse index that
+only accounts created since the D6 release are in; every older account is found
+by every other route and missing from that one, and nothing looks wrong from
+outside. Before turning the console on against a table that predates that
+release:
 
 ```sh
 ./scripts/toolchain.sh go run ./cmd/migrate backfill-users \
@@ -564,7 +564,17 @@ so an ordinary `POST /auth/login` session also opens the console for a user
 the policy admits. The 2FA step-up token does **not**: the core accepts only
 `typ:"admin"` and `typ:"access"` (`admin-guard-accepts-only-typed-session-tokens`).
 The cookie is subject to the KNOWN LIMITATION at the top of the template
-exactly as the auth cookies are.
+exactly as the auth cookies are. Three things the session is not, all of them
+the reference's: it is **not revocable** — the guard never consults the session
+store, so `SessionCheckOn=allcalls` does not reach it, `/admin/logout` only
+clears the cookie, and rotating the access-token secret is the one kill switch;
+`/admin/login` **does not enforce a second factor** — password alone opens the
+console for an account the deployment would otherwise challenge, so a
+deployment that requires 2FA points `admin.loginPath` at the hosted login,
+whose flow does (`admin-login-skips-the-second-factor`); and it has **no CSRF
+check**, so the Rule refuses the console beside `CookieSameSite=none` (RS-19).
+The function rate-limits `/admin/login` under the same `rateLimit` block as the
+auth login.
 
 **The documentation pair.** With `docs.swagger` resolving to on (the default
 outside production), `GET /admin/api/openapi.json` and `GET /admin/api/docs`

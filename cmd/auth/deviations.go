@@ -235,6 +235,28 @@ func WireDeviations() []WireDeviation {
 				"TestTheShippedDefaultsAreTheOnesTheRegisterClaims fail the day this entry stops describing the product.",
 			Spec: "docs/spec/config-schema.md §1.16; docs/spec/data-model.md §1.5 row #61 and §2.3; docs/config-reference.md §14 and §16",
 		},
+		{
+			ID:      "admin-first-user-policy-is-refused",
+			Surface: "admin.accessPolicy: first-user, and therefore who the console admits",
+			Behaviour: "The policy is refused at start on every store driver (RS-18). The spelling stays in the schema so a " +
+				"document written for another port parses and meets the refusal, which names the way in: admin.rootUser " +
+				"or admin.bootstrapSecret, then POST <admin>/users/{id}/promote {\"method\":\"flag\"} under is-admin-flag.",
+			Reference: "accessPolicy: 'first-user' grants whoever listUsers(1, 0) returns first, documented as \"the first " +
+				"registered user\" (src/router/admin.router.ts:372-374), and the core reproduces the evaluation as written " +
+				"(admin.go evaluate).",
+			Why: "The policy's premise is monotonic ids, and this product does not have them. The core's newID is prefix + " +
+				"\"_\" + hex(16 random bytes) (security.go), the DynamoDB lister orders by its <tenant>#<id> sort key and the " +
+				"memory lister by id, so \"first\" is whoever holds the lowest random id today -- and every registration " +
+				"redraws: with one existing account a single POST <prefix>/register takes the console with probability one " +
+				"half, and the incumbent is locked out in the same moment. The register route is public and the guard " +
+				"accepts the newcomer's ordinary access token, so no operator setting compensates. Repairing it would mean " +
+				"a creation-ordered listing, which is a store seam the core would have to grow (the lister's order is a " +
+				"contract, AdminUserStore) -- an upstream change, and one to file. Until then the honest answer is to refuse " +
+				"the policy and say why, rather than ship a knob whose documented meaning is not what it does. " +
+				"internal/config/rules_test.go TestRefuseToStartRules (the RS-18 case) pins the refusal; it retires the day " +
+				"the pinned core lists by creation time or mints monotonic ids.",
+			Spec: "docs/config-reference.md §16.1; docs/spec/config-schema.md §2 RS-18",
+		},
 		// ui-uploaded-assets-are-not-served was registered by the hosted-UI
 		// block and retired by the admin surface. Its three reasons -- no
 		// writer, a directory is the wrong noun, an fs.FS over S3 costs a

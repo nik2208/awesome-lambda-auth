@@ -215,15 +215,20 @@ import (
 //
 // ── what the console cannot see, and the backfill it depends on ──────────────
 //
-// GET <admin>/api/users and the 'first-user' policy both read
-// AdminUserStore.ListUsers, which on the DynamoDB driver is a Query over a
-// sparse index that only profiles written since D6 are in. A table with older
-// rows under-reports the one and elects the wrong person for the other, and
-// neither failure is visible from outside. `migrate backfill-users` is the
-// one-time sweep that closes it (cmd/migrate, internal/store/dynamodb
-// backfill.go); logAdminSurface names it at cold start whenever the console
-// mounts on that driver, because the log is the only place this deployment
-// can say it.
+// GET <admin>/api/users reads AdminUserStore.ListUsers, which on the DynamoDB
+// driver is a Query over a sparse index that only profiles written since D6
+// are in. A table with older rows under-reports, and the failure is not visible
+// from outside. `migrate backfill-users` is the one-time sweep that closes it
+// (cmd/migrate, internal/store/dynamodb backfill.go); logAdminSurface names it
+// at cold start whenever the console mounts on that driver, because the log is
+// the only place this deployment can say it.
+//
+// The 'first-user' policy read the same lister and is refused at load on every
+// driver (RS-18), for a reason the backfill cannot fix: the lister orders by
+// id, ids are random, and "the first user" is whoever drew the lowest one.
+// adminAccessPolicy keeps the mapping for a Config that bypassed the loader,
+// and logAdminSurface says what that Config gets. The register entry is
+// admin-first-user-policy-is-refused (deviations.go).
 
 // adminStoreProvider is what the composition root asks of the driver's store,
 // structurally, the way settingsStoreProvider asks for the settings store:
@@ -589,9 +594,13 @@ func logAdminSurface(cfg *config.Config, hc auth.HTTPConfig, log *slog.Logger) {
 	grants := ""
 	switch {
 	case policy == config.AdminAccessPolicyOpen:
-		grants = "EVERY request, with no token read and no store consulted -- the reference's own default, for use only behind a network boundary"
+		grants = "EVERY request, with no token read and no store consulted -- the reference's own default, for use only behind a network boundary this stack does not provide"
 	case policy == config.AdminAccessPolicyFirstUser:
-		grants = "the user whose id is first in ListUsers(1, 0): the first registered account, in (tenant, id) order on the dynamodb driver"
+		// Unreachable for a Config that went through the loader: RS-18 refuses
+		// the policy on every driver, because ids are random here and the
+		// "first" user is whoever drew the lowest one. Said plainly for the
+		// Config that bypassed it.
+		grants = "the user whose id sorts first in ListUsers(1, 0) -- the LOWEST RANDOM id, not the first registered account; RS-18 refuses this policy at load and this deployment bypassed the loader"
 	case policy == config.AdminAccessPolicyIsAdmin:
 		grants = "a user whose isAdmin flag is set; POST " + mount + "/users/{id}/promote with method=flag sets it"
 	case strings.HasPrefix(policy, config.AdminAccessPolicyRBACPrefix):
@@ -603,22 +612,34 @@ func logAdminSurface(cfg *config.Config, hc auth.HTTPConfig, log *slog.Logger) {
 		grants = "any caller presenting admin.bootstrapSecret as a bearer token; the shell is served unguarded and the SPA holds the secret in sessionStorage"
 	}
 
-	credentials := "an access token minted by POST " + hc.Prefix() + "/login (cookie or bearer), or an admin token from POST " + mount + "/login"
+	credentials := "an access token minted by POST " + hc.Prefix() + "/login (cookie or bearer), or an admin token from POST " + mount + "/login -- " +
+		"the latter on a password alone, with no second factor (product deviation admin-login-skips-the-second-factor), and neither revocable by the session store"
 	if policy == config.AdminAccessPolicyOpen {
 		credentials = "none required"
 	}
 
-	log.Info("admin console mounted",
+	// Info, except for the one policy that is a hazard rather than a choice:
+	// an open console on a stack whose every front door is internet-facing is
+	// announced at Warn, as the unguarded documentation pair below is.
+	level := slog.LevelInfo
+	if policy == config.AdminAccessPolicyOpen {
+		level = slog.LevelWarn
+	}
+	// The attribute is bootstrapSecretConfigured and not bootstrapSecret: the
+	// bare name is on the redaction list (logging.go), so a boolean under it
+	// would print as [REDACTED] and the line could never say what it is for.
+	log.Log(context.Background(), level, "admin console mounted",
 		slog.String("mount", mount),
 		slog.String("accessPolicy", policy),
 		slog.String("grants", grants),
 		slog.String("credentials", credentials),
 		slog.Bool("rootUser", hc.Admin.RootUser != nil),
-		slog.Bool("bootstrapSecret", strings.TrimSpace(hc.Admin.Secret) != ""),
+		slog.Bool("bootstrapSecretConfigured", strings.TrimSpace(hc.Admin.Secret) != ""),
 		slog.String("loginPath", hc.Admin.LoginPath),
 		slog.Bool("docs", hc.Admin.Docs.Enabled),
 		slog.String("note", "an unauthenticated GET that accepts text/html reaches only the login shell, never a guarded route (upstream deviation admin-unauthenticated-get-serves-only-the-login-form); "+
-			"the 2FA step-up token is not an admin credential (admin-guard-accepts-only-typed-session-tokens)"))
+			"the 2FA step-up token is not an admin credential (admin-guard-accepts-only-typed-session-tokens); "+
+			"sessions.checkOn does not reach this surface, and an admin token lives its 24h whatever happens to the account -- rotating security.jwt.accessTokenSecret is the one kill switch"))
 
 	if hc.Admin.Docs.Enabled {
 		log.Warn("the admin console's documentation pair is mounted unguarded",
@@ -632,8 +653,8 @@ func logAdminSurface(cfg *config.Config, hc auth.HTTPConfig, log *slog.Logger) {
 	if cfg.Stores.Driver == config.StoreDriverDynamoDB {
 		log.Warn("the admin user directory is only as complete as the backfill",
 			slog.String("path", "stores.driver"),
-			slog.String("problem", "GET "+mount+"/api/users and the first-user policy read a sparse index that only profiles written since the D6 release are in; "+
-				"older profiles are found by every other method and missing from these two"),
+			slog.String("problem", "GET "+mount+"/api/users reads a sparse index that only profiles written since the D6 release are in; "+
+				"older profiles are found by every other method and missing from this one"),
 			slog.String("remedy", "run `migrate backfill-users --table "+cfg.Stores.Connection.TableName+" --region <region>` once against this table (idempotent, safe while serving); "+
 				"nothing in this function can do it, because the sweep is a Scan the execution role does not grant"))
 	}

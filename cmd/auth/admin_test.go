@@ -281,7 +281,21 @@ func TestAdminAccessPolicyMapsEverySpelling(t *testing.T) {
 		{"rbac:operators", "", true},
 		{"permission:console:use", "", true},
 	} {
-		got := adminAccessPolicy(loadAdmin(t, adminEnv(tc.policy)))
+		var cfg *config.Config
+		if tc.policy == config.AdminAccessPolicyFirstUser {
+			// RS-18 refuses first-user at load on every driver, so the only
+			// Config that reaches this arm is one that bypassed the loader;
+			// the mapping is kept for it and pinned here the same way.
+			cfg = loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin))
+			cfg.Admin.AccessPolicy = tc.policy
+			if _, err := config.Load(context.Background(), config.Options{Getenv: envFunc(adminEnv(tc.policy)), AllowUnimplemented: true}); err == nil ||
+				!strings.Contains(err.Error(), "[RS-18]") {
+				t.Errorf("first-user loaded, or was refused by something other than RS-18: %v", err)
+			}
+		} else {
+			cfg = loadAdmin(t, adminEnv(tc.policy))
+		}
+		got := adminAccessPolicy(cfg)
 		if got == nil {
 			t.Errorf("%s: nil policy", tc.policy)
 			continue
@@ -824,7 +838,7 @@ func TestAdminDocsPairFollowsDocsSwaggerAndCarriesThePolicy(t *testing.T) {
 // under-reports.
 func TestLogAdminSurfaceNamesTheBackfill(t *testing.T) {
 	t.Parallel()
-	cfg := loadAdmin(t, adminEnv(config.AdminAccessPolicyFirstUser,
+	cfg := loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin,
 		"AWESOME_AUTH_STORES_DRIVER", "dynamodb",
 		"AWESOME_AUTH_STORES_CONNECTION_TABLE_NAME", "auth-live",
 		"AWESOME_AUTH_STORES_CONNECTION_REGION", "eu-west-1",
@@ -832,10 +846,40 @@ func TestLogAdminSurfaceNamesTheBackfill(t *testing.T) {
 	var buf bytes.Buffer
 	logAdminSurface(cfg, httpConfig(cfg), newLogger(&buf, slog.LevelInfo))
 	out := buf.String()
-	for _, want := range []string{"admin console mounted", "first-user", "migrate backfill-users --table auth-live", "admin-unauthenticated-get-serves-only-the-login-form"} {
+	for _, want := range []string{
+		"admin console mounted", "is-admin-flag", "migrate backfill-users --table auth-live",
+		"admin-unauthenticated-get-serves-only-the-login-form", "admin-login-skips-the-second-factor",
+		// The boolean is readable: under its old name, bootstrapSecret, the
+		// redaction list turned it into [REDACTED] on every cold start.
+		`"bootstrapSecretConfigured":false`,
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("cold-start log does not say %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, `"bootstrapSecretConfigured":"[REDACTED]"`) {
+		t.Errorf("the bootstrap-secret boolean is redacted, so the line cannot say whether one is active:\n%s", out)
+	}
+
+	// With a secret configured the boolean flips, and the value itself never
+	// appears.
+	buf.Reset()
+	withSecret := loadAdmin(t, adminEnv(config.AdminAccessPolicyIsAdmin, "AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET", testBootstrapSecret))
+	logAdminSurface(withSecret, httpConfig(withSecret), newLogger(&buf, slog.LevelInfo))
+	if !strings.Contains(buf.String(), `"bootstrapSecretConfigured":true`) || strings.Contains(buf.String(), testBootstrapSecret) {
+		t.Errorf("with a bootstrap secret the line must say so and never carry it:\n%s", buf.String())
+	}
+
+	// The open console is a Warn, not an Info: it admits the world on a stack
+	// whose every front door is internet-facing.
+	buf.Reset()
+	open := loadAdmin(t, adminEnv(config.AdminAccessPolicyOpen))
+	logAdminSurface(open, httpConfig(open), newLogger(&buf, slog.LevelInfo))
+	if !strings.Contains(buf.String(), `"level":"WARN","msg":"admin console mounted"`) {
+		t.Errorf("an open console is not announced at Warn:\n%s", buf.String())
+	}
+	if !strings.Contains(out, `"level":"INFO","msg":"admin console mounted"`) {
+		t.Errorf("a guarded console is not announced at Info:\n%s", out)
 	}
 
 	buf.Reset()

@@ -794,7 +794,11 @@ Parameters:
     AllowedValues: [allcalls, refresh, none]
     Description: >-
       AWESOME_AUTH_SESSIONS_CHECK_ON. "allcalls" costs one strongly-consistent
-      GetItem on every authenticated request and buys immediate revocation.
+      GetItem on every authenticated request and buys immediate revocation on
+      the auth routes. It does not reach the admin console: its guard verifies
+      the token and never consults the session store, so a revoked session's
+      access token, and the console's own 24-hour admin token, stay admin
+      credentials until they expire.
 
   # -----------------------------------------------------------------------
   # Content delivery. The hosted UI is served by the function, from assets
@@ -885,8 +889,15 @@ Parameters:
   #   2. Decide who gets in. AdminAccessPolicy is the whole of that decision
   #      and there is no unguarded default: the function refuses to start
   #      with the console on and no policy (RS-6), and the core refuses to
-  #      mount one (admin-console-requires-an-explicit-policy). "open" is the
-  #      reference's own default and is for a stack behind a network boundary.
+  #      mount one (admin-console-requires-an-explicit-policy). This template
+  #      offers ONE value, is-admin-flag. The reference's two others are
+  #      ConfigFile-only here, deliberately: "open" admits every request with
+  #      no credential and is for a stack behind a network boundary, which
+  #      nothing in this template provides (no WAF, no allow-list, no private
+  #      endpoint), so it is accepted only from a document and warned about;
+  #      "first-user" is refused at cold start on every driver (RS-18),
+  #      because on this product ids are random and the policy would hand the
+  #      console to whoever drew the lowest one.
   #   3. Give yourself a way in. Under is-admin-flag nobody is flagged on day
   #      one, so the root user below is how the first administrator logs in
   #      and promotes the second. It is an email and a bcrypt hash in Secrets
@@ -899,7 +910,21 @@ Parameters:
   #
   # The console is served from the same origin as the auth routes and the
   # hosted UI, so the KNOWN LIMITATION at the top of this file applies to its
-  # 24-hour session cookie exactly as it applies to the auth cookies.
+  # 24-hour session cookie exactly as it applies to the auth cookies, and one
+  # thing more: the console sits outside the CSRF chain by design and its
+  # guard accepts the ordinary access-token cookie, so that cookie's SameSite
+  # attribute is the only defence its writes have against a cross-site form
+  # post. The Rule AdminConsoleNeedsSameSiteCookies refuses the console beside
+  # CookieSameSite "none" at changeset time, as RS-19 does at cold start.
+  #
+  # What the console's session is NOT: revocable. The guard verifies signature,
+  # type, issuer and expiry and never consults the session store, so
+  # SessionCheckOn "allcalls" buys nothing on this surface, POST /admin/logout
+  # only clears the cookie, and an admin token lives its 24 hours whatever
+  # happens to the account -- rotating the access-token secret is the one kill
+  # switch. Clearing an isAdmin flag has no route on either line; it is a table
+  # edit. And the console's own POST /admin/login is password-only: it does not
+  # enforce a second factor the deployment requires (config-reference.md §16.2).
   # -----------------------------------------------------------------------
 
   EnableAdminConsole:
@@ -910,23 +935,26 @@ Parameters:
       AWESOME_AUTH_ADMIN_ENABLED. "true" mounts the admin console at /admin,
       guarded by AdminAccessPolicy. Run `migrate backfill-users` against the
       table once before turning this on (see the comment above): the user tab
-      and the first-user policy read an index that pre-existing accounts are
-      not in until it runs.
+      reads an index that pre-existing accounts are not in until it runs. The
+      console's session is a 24-hour token the session store never sees:
+      SessionCheckOn does not apply to it, logout only clears the cookie, and
+      rotating the access-token secret is the only way to end one early. Its
+      own POST /admin/login does not enforce a second factor.
 
   AdminAccessPolicy:
     Type: String
     Default: is-admin-flag
-    AllowedValues: [is-admin-flag, first-user, open]
+    AllowedValues: [is-admin-flag]
     Description: >-
       AWESOME_AUTH_ADMIN_ACCESS_POLICY — who the console admits. "is-admin-flag"
       admits a user whose isAdmin flag is set (POST /admin/users/{id}/promote
-      sets it; the root user below is how the first one gets set).
-      "first-user" admits the first registered account, which on this table is
-      the first in (tenant, id) order AFTER the backfill has run. "open" admits
-      everyone with no credential at all — the reference's default — and is
-      only for a stack nobody outside your network can reach. The
-      rbac:<role> and permission:<perm> forms are set in ConfigFile, where
-      stores.enable.rbac can be switched on beside them.
+      sets it; the root user below is how the first one gets set). It is the
+      one value this template offers. "open" (everyone, no credential — the
+      reference's default) is ConfigFile-only and only for a stack nobody
+      outside your network can reach; "first-user" is refused at cold start
+      (RS-18: ids are random here, so it would admit whoever drew the lowest
+      one). The rbac:<role> and permission:<perm> forms are set in ConfigFile,
+      where stores.enable.rbac can be switched on beside them.
 
   AdminRootEmail:
     Type: String
@@ -1220,15 +1248,20 @@ Conditions:
   HasCloudFrontAliases: !Not [!Equals [!Ref CloudFrontAliases, '']]
   HasCloudFrontCertificate: !Not [!Equals [!Ref CloudFrontCertificateArn, '']]
 
-  # The admin console. The switch gates every admin variable; the root user's
-  # two halves are conditioned separately so that a hash ARN without an email
-  # is inert (no variable, no IAM read) rather than half-configured, and the
-  # Rule below refuses the other half-shape. The bucket is its own switch: it
-  # is the UI's read side as much as the console's write side, and a
-  # deployment may keep serving uploaded logos with the console turned off.
+  # The admin console. The switch gates every admin variable, the root user's
+  # pair included: HasAdminRootPasswordHash carries the switch as its first
+  # term, so a console turned off leaves no root-user variable behind and no
+  # IAM read of the hash -- a function that fetched a secret at cold start for
+  # a console it does not mount would be a permission it does not need. The
+  # root user's two halves are conditioned together so that a hash ARN without
+  # an email is inert (no variable, no IAM read) rather than half-configured,
+  # and the Rule below refuses the other half-shape. The bucket is its own
+  # switch: it is the UI's read side as much as the console's write side, and
+  # a deployment may keep serving uploaded logos with the console turned off.
   AdminConsoleEnabled: !Equals [!Ref EnableAdminConsole, 'true']
   HasAdminRootEmail: !Not [!Equals [!Ref AdminRootEmail, '']]
   HasAdminRootPasswordHash: !And
+    - !Condition AdminConsoleEnabled
     - !Condition HasAdminRootEmail
     - !Not [!Equals [!Ref AdminRootPasswordHashArn, '']]
   AdminUploadsEnabled: !Equals [!Ref EnableAdminUploads, 'true']
@@ -1434,6 +1467,21 @@ Rules:
           AdminRootEmail is set, so AdminRootPasswordHashArn must name the
           Secrets Manager secret holding that user's bcrypt password hash.
           Without it the root login is served and can never succeed.
+
+  # RS-19 at changeset time. The console sits outside the CSRF chain and its
+  # guard accepts the ordinary access-token cookie, so that cookie's SameSite
+  # attribute is the only thing between a cross-site form post and every admin
+  # write, promote included. Parameter-only: both knobs are parameters here,
+  # and the function refuses the same pair at cold start for a document.
+  AdminConsoleNeedsSameSiteCookies:
+    RuleCondition: !Equals [!Ref EnableAdminConsole, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CookieSameSite, 'none']]
+        AssertDescription: >-
+          EnableAdminConsole is true, so CookieSameSite cannot be "none": the
+          admin console has no CSRF check by design and accepts the access-token
+          cookie, so SameSite is the only defence its writes have against a
+          cross-site form post. Use lax (the default) or strict.
 
   AlarmEmailAndTopicAreExclusive:
     Assertions:
@@ -1992,9 +2040,11 @@ Resources:
 
           # --- admin console ---------------------------------------------
           # Every variable here is absent while EnableAdminConsole is
-          # "false", so an unconfigured stack loads the configuration it
-          # loaded before this block existed. The root user's hash is a
-          # REFERENCE with the _SECRETSMANAGER suffix, like the signing
+          # "false" -- the root user's pair through HasAdminRootPasswordHash,
+          # whose first term is the switch -- so an unconfigured stack loads
+          # the configuration it loaded before this block existed and reads
+          # no secret for a console it does not mount. The root user's hash
+          # is a REFERENCE with the _SECRETSMANAGER suffix, like the signing
           # secrets: the function fetches the value at cold start and the
           # bcrypt hash never enters the template or the environment.
           #
@@ -3362,14 +3412,25 @@ Outputs:
 
   # The console's front door and, when it exists, the bucket behind its upload
   # tab. The URL is the API's own; behind the distribution the same path is
-  # served under the CloudFront hostname, with the stage segment gone.
+  # served under the CloudFront hostname, with the stage segment gone -- and
+  # the stage segment is the whole problem for the console: the shell injects
+  # base "/admin" and loads /admin/assets/admin.js root-absolute, exactly as
+  # the reference's shell uses req.baseUrl, so on a named stage the browser
+  # asks for paths the API does not serve. The KNOWN LIMITATION at the top of
+  # this file names the cookie half; this is the other half, and the
+  # Description says so.
   AdminConsoleUrl:
     Condition: AdminConsoleEnabled
     Description: >-
       Where the admin console answers. GET here serves the login shell; the
       API beneath it is under /admin/api and answers 401 to anyone the access
       policy has not admitted. Run `migrate backfill-users` once before
-      relying on the user tab or the first-user policy.
+      relying on the user tab. On a named stage without CloudFront this URL
+      serves the shell but the shell is unusable: it links its assets and
+      its API root-absolute (/admin/assets/…, /admin/api/…) without the
+      stage segment, so the browser's follow-up requests never reach the
+      function. Use the $default stage, the distribution, or a custom domain
+      mapping.
     Value: !If
       - IsDefaultStage
       - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/admin'

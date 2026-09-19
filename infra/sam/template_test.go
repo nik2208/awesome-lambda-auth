@@ -523,6 +523,91 @@ func TestTheUploadBucketIsPrivateEncryptedAndConditional(t *testing.T) {
 	}
 }
 
+// ── the admin console's variables and grants follow its switch ──────────────
+
+// TestTheRootUserFollowsTheConsoleSwitch is the enforcement half of the
+// comment above HasAdminRootPasswordHash: the two root-user variables and the
+// IAM read of the hash exist only with the console on. Before it, a stack with
+// EnableAdminConsole=false and a root user configured still fetched the hash
+// at every cold start and held a GetSecretValue grant for a console it did
+// not mount, against two comments that said otherwise.
+func TestTheRootUserFollowsTheConsoleSwitch(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	body := strings.ReplaceAll(string(raw), "\r\n", "\n")
+
+	i := strings.Index(body, "HasAdminRootPasswordHash: !And")
+	if i < 0 {
+		t.Fatal("HasAdminRootPasswordHash is gone or no longer an !And")
+	}
+	condition := body[i:]
+	if j := strings.Index(condition, "\n\n"); j > 0 {
+		condition = condition[:j]
+	}
+	for _, want := range []string{"!Condition AdminConsoleEnabled", "!Condition HasAdminRootEmail", "AdminRootPasswordHashArn"} {
+		if !strings.Contains(condition, want) {
+			t.Errorf("HasAdminRootPasswordHash lacks the term %q:\n%s", want, condition)
+		}
+	}
+
+	tpl := load(t)
+	fn := tpl.resources["AuthFunction"]
+	if fn == nil {
+		t.Fatal("AuthFunction is gone")
+	}
+	for _, name := range []string{"AWESOME_AUTH_ADMIN_ROOT_EMAIL", "AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH_SECRETSMANAGER", "Sid: ReadAdminRootPasswordHash"} {
+		k := strings.Index(fn.body, name)
+		if k < 0 {
+			t.Errorf("AuthFunction no longer carries %s", name)
+			continue
+		}
+		// The condition sits within a few lines of the name, before it for the
+		// IAM statement (`- !If` / `- HasAdminRootPasswordHash`) and after it
+		// for a variable (`!If` / `- HasAdminRootPasswordHash`).
+		lo, hi := k-200, k+200
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > len(fn.body) {
+			hi = len(fn.body)
+		}
+		if !strings.Contains(fn.body[lo:hi], "HasAdminRootPasswordHash") {
+			t.Errorf("%s is not conditioned on HasAdminRootPasswordHash, so it outlives the console switch:\n%s", name, fn.body[lo:hi])
+		}
+	}
+}
+
+// TestTheConsoleParameterOffersOnlyTheFlagPolicy pins the two values that
+// left AdminAccessPolicy's AllowedValues: `open` admits the world on a stack
+// whose every front door is internet-facing, and `first-user` is refused at
+// cold start on every driver (RS-18). Both stay in the schema so a family
+// document parses and meets the warning or the refusal; neither is something
+// this template should offer as a choice.
+func TestTheConsoleParameterOffersOnlyTheFlagPolicy(t *testing.T) {
+	t.Parallel()
+	tpl := load(t)
+	param, ok := tpl.parameters["AdminAccessPolicy"]
+	if !ok {
+		t.Fatal("AdminAccessPolicy is gone")
+	}
+	if got := param.fields["AllowedValues"]; got != "[is-admin-flag]" {
+		t.Errorf("AdminAccessPolicy AllowedValues = %s, want [is-admin-flag]: open and first-user are ConfigFile-only", got)
+	}
+	if got := param.fields["Default"]; got != "is-admin-flag" {
+		t.Errorf("AdminAccessPolicy Default = %s, want is-admin-flag", got)
+	}
+	raw, err := os.ReadFile(templateFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", templateFile, err)
+	}
+	if !strings.Contains(strings.ReplaceAll(string(raw), "\r\n", "\n"), "AdminConsoleNeedsSameSiteCookies:") {
+		t.Error("the Rule refusing the console beside CookieSameSite none is gone (RS-19 at changeset time)")
+	}
+}
+
 // ── what must never be committed ────────────────────────────────────────────
 
 var (

@@ -1562,7 +1562,7 @@ argues every field; this section is the same map from the operator's side.
 | Path | Type | Default | Env var |
 |---|---|---|---|
 | `admin.enabled` | boolean | `false` | `AWESOME_AUTH_ADMIN_ENABLED` |
-| `admin.accessPolicy` | `first-user` \| `is-admin-flag` \| `open` \| `rbac:<role>` \| `permission:<perm>` | unset | `AWESOME_AUTH_ADMIN_ACCESS_POLICY` |
+| `admin.accessPolicy` | `is-admin-flag` \| `open` \| `rbac:<role>` \| `permission:<perm>` \| `first-user` (parses, **refused at start**, RS-18) | unset | `AWESOME_AUTH_ADMIN_ACCESS_POLICY` |
 | `admin.bootstrapSecret` | secret | unset | `AWESOME_AUTH_ADMIN_BOOTSTRAP_SECRET` (+ `_SECRETSMANAGER` / `_SSM_PARAMETER`) |
 | `admin.rootUser.email` | email | unset | `AWESOME_AUTH_ADMIN_ROOT_EMAIL` |
 | `admin.rootUser.passwordHash` | secret, a bcrypt hash | unset | `AWESOME_AUTH_ADMIN_ROOT_PASSWORD_HASH` (+ `_SECRETSMANAGER` / `_SSM_PARAMETER`) |
@@ -1596,11 +1596,21 @@ by the very next request, exactly as in the reference.
   advice for it — "use only behind a VPN or IP allow-list" (`admin.router.ts:29`).
   The contract suite reports a console that answers a bare `GET <admin>/api/ping`
   with 200 as a fault, in as many words.
-- **`first-user`** grants the user whose id is first in `ListUsers(1, 0)` — the
-  first registered account, in the store's own order, which on the DynamoDB
-  driver is `(tenant, id)` ascending. RS-10 refuses it on a driver that cannot
-  enumerate users. **On a table with accounts that predate the D6 release it
-  elects the wrong person until the backfill has run** (§16.6).
+- **`first-user`** is **refused at start on every driver** (RS-18), and the
+  schema keeps the spelling only so a document written for another port parses
+  here and meets the refusal rather than a schema error. The reference grants
+  "the first registered user", meaning whoever `listUsers(1, 0)` returns first
+  (`admin.router.ts:372-374`), and that is the first registered user only under
+  monotonic ids. On this product ids are 128 random bits (the core's `newID`),
+  the listers order by id — `(tenant, id)` ascending on the DynamoDB driver —
+  and so the policy would admit **whoever holds the lowest random id**, which
+  changes hands every time a later registrant draws a lower one: with one
+  existing account a single `POST <prefix>/register` takes the console with
+  probability one half, and the register route is public. RS-10 still refuses
+  the policy on a driver that cannot enumerate users at all. The way in is the
+  root user (§16.2) and `is-admin-flag`. Registered as
+  `admin-first-user-policy-is-refused`; it retires the day the core's listing
+  is creation-ordered or its ids are monotonic.
 - **`is-admin-flag`** grants a user whose `isAdmin` flag is set, and reads
   nothing else — not `role`, not RBAC. Nobody is flagged on day one; the
   console's own `POST <admin>/users/{id}/promote` with `{"method":"flag"}` sets
@@ -1800,16 +1810,16 @@ The size bound is the core's `UploadMaxBytes`, a constant carrying the
 reference's multer limit of 5 MiB; `admin.upload.maxFileSizeMb` reaches it only
 when it says 5 (§16.8).
 
-### 16.6 The backfill you owe before `first-user` and the users tab are right
+### 16.6 The backfill you owe before the users tab is right
 
-`GET <admin>/api/users` and the `first-user` policy both read
-`AdminUserStore.ListUsers`, which on the DynamoDB driver is a Query over a
-**sparse** index — a constant partition key and a `<tenant>#<id>` sort key that
-`CreateUser` has written since the D6 release, and nothing before it wrote at
-all. A profile written earlier is found by every other route and is invisible to
-exactly these two: the users tab under-reports and `first-user` elects the wrong
-person, and neither failure looks like one from outside. D6 declared the debt;
-this block ships the job that pays it:
+`GET <admin>/api/users` reads `AdminUserStore.ListUsers`, which on the DynamoDB
+driver is a Query over a **sparse** index — a constant partition key and a
+`<tenant>#<id>` sort key that `CreateUser` has written since the D6 release, and
+nothing before it wrote at all. A profile written earlier is found by every
+other route and is invisible to exactly this one: the users tab under-reports,
+and the failure does not look like one from outside. (The `first-user` policy
+read the same index and would have been wrong here for a second reason; RS-18
+refuses it, §16.1.) D6 declared the debt; this block ships the job that pays it:
 
 ```sh
 ./scripts/toolchain.sh go run ./cmd/migrate backfill-users \
