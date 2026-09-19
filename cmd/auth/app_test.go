@@ -676,7 +676,7 @@ func TestEnabledStoresTracksTheSchema(t *testing.T) {
 func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	t.Parallel()
 
-	sets := coreOptionSets(context.Background(), config.Defaults(), Options{}, nil, nil, discardLogger())
+	sets := coreOptionSets(context.Background(), config.Defaults(), Options{}, nil, nil, nil, discardLogger())
 
 	var names []string
 	var empty []string
@@ -701,7 +701,7 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	// The slots that contribute no option. Filling one means deleting its name
 	// from here in the same commit.
 	//
-	// **Two of these four are empty on purpose and two are still waiting**, and
+	// **Two of these three are empty on purpose and one is still waiting**, and
 	// the list cannot tell them apart, so this comment has to.
 	//
 	// `docs` and `ui` are the deliberate ones. Both blocks are wired, and both
@@ -714,10 +714,16 @@ func TestCoreOptionSetsAreOrderedAndReserved(t *testing.T) {
 	// this one. If either ever leaves this list it must be because upstream grew
 	// an option, not because somebody read an empty slot as unfinished work.
 	//
-	// `admin` and `tools` are the pending ones: their domains are still refused
-	// by internal/config/phases.go, and whether they contribute options is not
-	// yet known.
-	wantEmpty := []string{"docs", "ui", "admin", "tools"}
+	// `admin` is the pending one: its domain is still refused by
+	// internal/config/phases.go, and whether it contributes options is not yet
+	// known.
+	//
+	// `tools` left the list with D9a, and it is the counter-example to `docs`
+	// and `ui`: the block's router and facade reach the core through
+	// HTTPConfig.Tools exactly as those two do, but the block also owns the one
+	// thing that IS an auth.Option — the event bus, auth.WithEventBus — so the
+	// slot holds that and nothing else (tools.go, toolsOptions).
+	wantEmpty := []string{"docs", "ui", "admin"}
 	if strings.Join(empty, ",") != strings.Join(wantEmpty, ",") {
 		t.Errorf("unfilled core option slots are %v, want %v", empty, wantEmpty)
 	}
